@@ -100,3 +100,21 @@ class DiscoveryTests(unittest.TestCase):
     def test_duplicate_candidates_deduplicate_but_conflicts_fail(self):
         self.assertEqual(self.discover(FakeGamma(events=[make_event(),make_event()]),fast=False)[0].market_id,MARKET_ID)
         self.error(FakeGamma(events=[make_event(),make_event(markets=[make_market(clobTokenIds='["3","4"]')])]),"invalid_metadata")
+
+    def test_bch_only_fallback_returns_no_current_btc(self):
+        bch = make_event(id="2002",seriesSlug="bch-up-or-down-15m",title="Bitcoin Cash Up or Down?",
+                         markets=[make_market(id="1002",question="Bitcoin Cash Up or Down?")])
+        self.error(FakeGamma(events=[bch]),"no_current_market")
+
+    def test_btc_plus_bch_fallback_is_not_ambiguous(self):
+        bch = make_event(id="2002",seriesSlug="bch-up-or-down-15m",title="Bitcoin Cash Up or Down?",
+                         markets=[make_market(id="1002",question="Bitcoin Cash Up or Down?")])
+        result,source = self.discover(FakeGamma(events=[bch,make_event()]),fast=False)
+        self.assertEqual((result.market_id,source),(MARKET_ID,"filtered_list"))
+
+    def test_fractional_start_conflict_rejects_fast_path(self):
+        start = NOW-timedelta(minutes=5)+timedelta(microseconds=500000)
+        fast = make_event(slug="btc-updown-15m-1791593100",markets=[make_market(
+            eventStartTime=start.isoformat(),endDate=(start+timedelta(minutes=15)).isoformat())])
+        result,source = self.discover(FakeGamma(fast=fast))
+        self.assertEqual((result.market_id,source),(MARKET_ID,"filtered_list"))

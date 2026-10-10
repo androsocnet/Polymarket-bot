@@ -88,3 +88,38 @@ class ParsingTests(unittest.TestCase):
         wrong = "btc-updown-15m-1"
         self.assertIsNone(self.parse(slug=wrong))
         self.assertIsNone(parse_market(make_event(slug=wrong), make_market(), now=NOW))
+
+    def test_bitcoin_cash_is_not_btc_even_with_renamed_series(self):
+        for series in ("bch-up-or-down-15m","renamed-family","btc-up-or-down-15m"):
+            with self.subTest(series=series):
+                event = make_event(seriesSlug=series,title="Bitcoin Cash Up or Down?")
+                market = make_market(question="Bitcoin Cash Up or Down?")
+                self.assertIsNone(parse_market(event,market,now=NOW))
+
+    def test_other_asset_series_contradicts_btc_question(self):
+        event = make_event(seriesSlug="bch-up-or-down-15m")
+        self.assertIsNone(parse_market(event,make_market(),now=NOW))
+
+    def test_recognized_slug_requires_exact_start_instant(self):
+        start = NOW-timedelta(minutes=5)
+        slug = f"btc-updown-15m-{int(start.timestamp())}"
+        for field in ("event", "market"):
+            with self.subTest(field=field):
+                event = make_event(slug=slug) if field == "event" else make_event()
+                market = make_market(slug=slug) if field == "market" else make_market()
+                self.assertIsNotNone(parse_market(event,market,now=NOW))
+                fractional = start+timedelta(microseconds=500000)
+                market.update(eventStartTime=fractional.isoformat(),
+                              endDate=(fractional+timedelta(minutes=15)).isoformat())
+                self.assertIsNone(parse_market(event,market,now=NOW))
+
+    def test_deeply_nested_optional_prices_warn(self):
+        result = self.parse(outcomePrices="["*5000+"0"+"]"*5000)
+        self.assertTrue(result.warnings)
+        self.assertIsNone(result.up.metadata_price)
+        self.assertEqual(result.up.token_id,TOKEN_UP)
+
+    def test_deeply_nested_required_arrays_have_explicit_errors(self):
+        nested = "["*5000+"0"+"]"*5000
+        self.error("invalid_metadata",outcomes=nested)
+        self.error("unsupported_identifier_shape",clobTokenIds=nested)

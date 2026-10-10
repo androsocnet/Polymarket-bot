@@ -28,7 +28,7 @@ def _array(value: object, field: str, code: str = "invalid_metadata") -> list:
         if not isinstance(parsed, list) or len(parsed) != 2:
             raise ValueError("Expected two-entry JSON array")
         return parsed
-    except (ValueError, TypeError) as exc:
+    except (ValueError, TypeError, RecursionError) as exc:
         raise MarketDataError(code, f"Invalid {field}: expected a two-entry JSON-encoded array.") from exc
 
 def is_btc_family(event: dict[str, object], market: dict[str, object]) -> bool:
@@ -37,10 +37,14 @@ def is_btc_family(event: dict[str, object], market: dict[str, object]) -> bool:
     slugs = [event.get("seriesSlug")] + [s.get("slug") for s in series if isinstance(s, dict)]
     texts = [event.get("title"), market.get("question")] + [s.get("title") for s in series if isinstance(s, dict)]
     texts = [t for t in texts if isinstance(t, str)]
-    if any(re.search(r"\b(ethereum|eth|solana|sol|xrp|dogecoin|doge)\b", t, re.I) for t in texts):
+    if any(re.search(r"\b(ethereum|eth|solana|sol|xrp|dogecoin|doge|bch|bsv)\b|\bbitcoin\s+(cash|sv|gold)\b", t, re.I) for t in texts):
         return False
-    if any(isinstance(s, str) and re.match(r"^(eth|sol|xrp|doge)-", s) for s in slugs):
-        return False
+    for slug in slugs:
+        if not isinstance(slug, str):
+            continue
+        family = re.match(r"^([a-z0-9]+)-up-or-down(?:-|$)", slug, re.I)
+        if (family and family[1].lower() != "btc") or re.match(r"^(eth|sol|xrp|doge|bch|bsv)-", slug, re.I):
+            return False
     return ("btc-up-or-down-15m" in slugs or
             (any(re.search(r"\b(bitcoin|btc)\b", t, re.I) for t in texts) and
              isinstance(market.get("question"), str) and
@@ -60,7 +64,7 @@ def parse_market(event: dict[str, object], market: dict[str, object], *, now: da
     for row in (event, market):
         slug = row.get("slug", "")
         match = re.fullmatch(r"btc-updown-15m-(\d+)", slug) if isinstance(slug, str) else None
-        if match and int(match[1]) != int(start.timestamp()):
+        if match and (start.microsecond != 0 or int(match[1]) != int(start.timestamp())):
             return None
     event_id = _text(event.get("id"), "event id")
     market_id = _text(market.get("id"), "market id")

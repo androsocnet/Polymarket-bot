@@ -85,3 +85,11 @@ class CliTests(unittest.TestCase):
         self.assertEqual(self.run_cli(use_fast_path=False),0)
         self.assertEqual(self.gamma.slug_calls,[])
         self.assertIn("Discovery: filtered_list",self.out.getvalue())
+
+    def test_deeply_nested_optional_metadata_keeps_book_pricing(self):
+        nested = "["*5000+"0"+"]"*5000
+        self.gamma.fast = make_event(markets=[make_market(outcomePrices=nested)])
+        self.assertEqual(self.run_cli(),0)
+        self.assertEqual(self.err.getvalue(),"")
+        self.assertIn("best bid: 0.60",self.out.getvalue())
+        self.assertIn("Gamma outcomePrices unavailable or malformed",self.out.getvalue())
