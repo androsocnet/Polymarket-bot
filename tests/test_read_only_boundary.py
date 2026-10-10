@@ -57,7 +57,7 @@ class ReadOnlyBoundaryTests(unittest.TestCase):
         self.assertEqual(out.getvalue(),"")
         self.assertIn("book_identity_mismatch",err.getvalue())
 
-    def test_application_has_no_authenticated_or_order_request_surface(self):
+    def test_application_has_only_named_public_read_request_surface(self):
         root = Path(__file__).resolve().parents[1]/"src"
         raw_sites = []
         forbidden = []
@@ -70,7 +70,8 @@ class ReadOnlyBoundaryTests(unittest.TestCase):
                         forbidden.append((path.name,node.lineno))
                 if isinstance(node,ast.Constant) and isinstance(node.value,str):
                     if re.search(r"^https?://",node.value):
-                        self.assertIn(node.value,("https://gamma-api.polymarket.com","https://clob.polymarket.com"))
+                        self.assertIn(node.value,("https://gamma-api.polymarket.com","https://clob.polymarket.com",
+                                                  "https://data-api.polymarket.com", "https://clob.polymarket.com/books"))
                     if re.search(r"^/(order|orders|cancel|auth|api-key|balance|trade)(/|$)",node.value):
                         forbidden.append((path.name,node.lineno))
                 if isinstance(node,ast.Call) and isinstance(node.func,ast.Attribute):
@@ -80,5 +81,26 @@ class ReadOnlyBoundaryTests(unittest.TestCase):
         self.assertEqual(len(raw_sites),1)
         name,call = raw_sites[0]
         self.assertEqual(name,"http.py")
-        self.assertIsInstance(call.args[0],ast.Constant)
-        self.assertEqual(call.args[0].value,"GET")
+        self.assertIsInstance(call.args[0],ast.Name)
+        self.assertEqual(call.args[0].id,"method")
+
+    def test_recorder_post_is_only_fixed_clob_books_read(self):
+        from polymarket_bot.market_data.http import PublicGet
+        from polymarket_bot.market_data.models import MarketDataError
+        clock = FakeClock()
+        requests = []
+        def handle(request):
+            requests.append(request)
+            return httpx.Response(200,stream=httpx.ByteStream(b"[]"))
+        with httpx.Client(transport=httpx.MockTransport(handle), trust_env=False) as client:
+            reader = PublicGet(client, monotonic=clock.monotonic, sleep=clock.sleep,
+                               utcnow=clock.utcnow, max_attempts=2)
+            with self.assertRaises(MarketDataError):
+                reader.get_json("clob", "/books", deadline=2)
+            with self.assertRaises(MarketDataError):
+                reader.get_json("clob", "/orders", deadline=2)
+            self.assertEqual(requests, [])
+            reader.get_books((TOKEN_UP,TOKEN_DOWN), deadline=2)
+        self.assertEqual(len(requests), 1)
+        self.assertEqual((requests[0].method,requests[0].url.host,requests[0].url.path),
+                         ("POST","clob.polymarket.com","/books"))
