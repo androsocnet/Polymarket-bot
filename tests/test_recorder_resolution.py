@@ -6,7 +6,7 @@ from decimal import Decimal
 import httpx
 
 from polymarket_bot.market_data.parsing import parse_market
-from polymarket_bot.market_data.http import PublicGet
+from polymarket_bot.market_data.http import HttpAttempt, PublicGet
 from polymarket_bot.recorder.models import MarketRevision, RunConfig
 from polymarket_bot.recorder.resolution import parse_resolution, reconcile_due
 from polymarket_bot.recorder.store import RecorderStore, RecorderStoreError, decode_evidence
@@ -141,6 +141,23 @@ class ResolutionPersistenceTests(unittest.TestCase):
                            sleep=self.clock.sleep, utcnow=self.clock.utcnow,
                            max_attempts=1, on_attempt=attempts.append)
         return public, attempts, requests
+
+    def save_direct_final(self, payouts, ordinal):
+        """Exercise the public parser/writer interface without HTTP JSON token limits."""
+        from polymarket_bot.recorder.resolution import _revision_from_row
+        revision = _revision_from_row(self.store._one("SELECT * FROM markets WHERE market_id='1001'"))
+        row = {"condition_id": CONDITION, "status": "resolved", "payouts": payouts}
+        raw = json.dumps({"data": [row]}, separators=(",", ":")).encode()
+        learned = self.end_us + ordinal * 1_000_000
+        attempt = HttpAttempt("RESOLUTION", "GET", "/v2/resolutions",
+            ("condition=" + CONDITION,), 1, ordinal * 1_000_000_000,
+            ordinal * 1_000_000_000 + 1_000, learned - 1, learned,
+            200, "success", None, raw, True)
+        observation = parse_resolution(row, revision, raw_response=raw,
+            learned_wall_us=learned, learned_server_us=None)
+        self.assertIn(observation.classification, ("RESOLVED_DIRECTIONAL", "RESOLVED_OTHER"))
+        self.store.save_resolutions((observation,), requests=(attempt,))
+        return raw
 
     def test_resolution_independent_of_reference(self):
         from polymarket_bot.recorder.models import CHAINLINK_FEED_ID
@@ -290,6 +307,42 @@ class ResolutionPersistenceTests(unittest.TestCase):
         state = self.store._one("SELECT resolution_state,selected_resolution_id FROM markets")
         self.assertEqual(tuple(state.values()), ("CONFLICT", original))
         self.assertEqual(self.store._one("SELECT count(*) AS n FROM resolution_observations")["n"], 2)
+
+    def test_direct_large_bare_integer_equivalent_final_reloads(self):
+        first_raw = self.save_direct_final([10**20, 0], 1)
+        original = self.store._one("SELECT selected_resolution_id FROM markets")["selected_resolution_id"]
+        second_raw = self.save_direct_final([2 * 10**20, 0], 2)
+        market = self.store._one("SELECT resolution_state,selected_resolution_id FROM markets")
+        self.assertEqual(tuple(market.values()), ("RESOLVED_DIRECTIONAL", original))
+        rows = self.store._rows("SELECT * FROM resolution_observations ORDER BY resolution_id")
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["payouts_raw_json"], "[100000000000000000000,0]")
+        self.assertEqual([decode_evidence(row["raw_resolution_z"], row["raw_size_bytes"],
+            row["codec_version"]) for row in rows], [first_raw, second_raw])
+
+    def test_direct_large_bare_integer_changed_split_conflicts(self):
+        first_raw = self.save_direct_final([10**20, 10**20], 1)
+        original = self.store._one("SELECT selected_resolution_id FROM markets")["selected_resolution_id"]
+        second_raw = self.save_direct_final([10**20, 10**20 + 1], 2)
+        market = self.store._one("SELECT resolution_state,selected_resolution_id FROM markets")
+        self.assertEqual(tuple(market.values()), ("CONFLICT", original))
+        rows = self.store._rows("SELECT * FROM resolution_observations ORDER BY resolution_id")
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([decode_evidence(row["raw_resolution_z"], row["raw_size_bytes"],
+            row["codec_version"]) for row in rows], [first_raw, second_raw])
+
+    def test_corrupt_stored_payout_number_is_structured_and_atomic(self):
+        self.save_direct_final([1, 0], 1)
+        original = self.store._one("SELECT selected_resolution_id FROM markets")["selected_resolution_id"]
+        with self.store._connection:
+            self.store._connection.execute("UPDATE resolution_observations SET payouts_raw_json='[1e99999,0]'")
+        with self.assertRaises(RecorderStoreError) as caught:
+            self.save_direct_final([1, 0], 2)
+        self.assertEqual(caught.exception.code, "fatal_invariant")
+        self.assertEqual(self.store._one("SELECT count(*) AS n FROM request_attempts")["n"], 1)
+        self.assertEqual(self.store._one("SELECT count(*) AS n FROM resolution_observations")["n"], 1)
+        market = self.store._one("SELECT resolution_state,selected_resolution_id FROM markets")
+        self.assertEqual(tuple(market.values()), ("RESOLVED_DIRECTIONAL", original))
 
     def append_later_final(self, first_payouts, later_payouts):
         first_public, _, _ = self.public({"data": [{"condition_id": CONDITION,
