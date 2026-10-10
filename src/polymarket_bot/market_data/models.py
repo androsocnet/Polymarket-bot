@@ -37,3 +37,23 @@ class MarketDescriptor:
     @property
     def pricing_ready(self) -> bool:
         return self.accepting_orders is True and self.enable_order_book is True
+
+@dataclass(frozen=True)
+class BookLevel:
+    price: Decimal
+    size: Decimal
+
+@dataclass(frozen=True)
+class OutcomeBook:
+    token_id: str
+    condition_id: str
+    source_timestamp_raw: str
+    source_at: datetime
+    bids: tuple[BookLevel, ...]
+    asks: tuple[BookLevel, ...]
+    best_bid: Decimal | None
+    best_ask: Decimal | None
+    midpoint: Decimal | None
+    spread: Decimal | None
+    bid_size: Decimal | None
+    ask_size: Decimal | None
