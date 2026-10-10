@@ -111,3 +111,104 @@ def seed_writer_market(store, run_id):
              uncertainty_us,status) VALUES (1,?,?,?,?,?,?,?,?,?,?)""",
             (run_id, NOW_US // 1_000_000, 0, 0, NOW_US, NOW_US,
              0, NOW_US, 1_000_000, "VALID"))
+
+
+class RecorderFixture:
+    """Integer fake time, real PublicGet and SQLite; only HTTP is replaced."""
+
+    def __init__(self, *, offset_us=0, epoch_ns=9_000_000_000_000_007):
+        from datetime import timedelta
+        from polymarket_bot.recorder.store import RecorderStore
+        self.db = DatabaseFixture()
+        self.store = RecorderStore.open(self.db.path)
+        self.epoch_ns = epoch_ns
+        self.elapsed_ns = 0
+        self.initial_wall_us = NOW_US + offset_us
+        self.sleeps = []
+        self.requests = []
+        self.book_count = 0
+        self.hook = None
+        self.sleep_hook = None
+        self.timedelta = timedelta
+        self.client = httpx.Client(transport=httpx.MockTransport(self.respond),
+                                   trust_env=False, follow_redirects=False)
+        self.public = PublicGet(self.client, monotonic=self.monotonic,
+            monotonic_ns=self.monotonic_ns, utcnow=self.utcnow, sleep=self.sleep)
+
+    def monotonic_ns(self):
+        return self.epoch_ns + self.elapsed_ns
+
+    def monotonic(self):
+        return self.monotonic_ns() / 1_000_000_000
+
+    def wall_us(self):
+        return self.initial_wall_us + self.elapsed_ns // 1000
+
+    def utcnow(self):
+        return NOW + self.timedelta(microseconds=self.wall_us() - NOW_US)
+
+    def advance(self, seconds):
+        self.elapsed_ns += round(seconds * 1_000_000_000)
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.advance(seconds)
+        if self.sleep_hook:
+            self.sleep_hook(self)
+
+    def market_row(self):
+        from datetime import datetime, timezone
+        start = ((self.wall_us() + getattr(self, "server_shift_us", 0)) // 900_000_000) * 900_000_000
+        number = (start - WINDOW_START_US) // 900_000_000
+        condition = "0x" + ("ab" if number == 0 else "cd") * 32
+        token_up, token_down = str(int(TOKEN_UP) + number * 10), str(int(TOKEN_DOWN) + number * 10)
+        return make_market(id=str(1001 + number), conditionId=condition,
+            eventStartTime=datetime.fromtimestamp(start // 1_000_000, timezone.utc).isoformat(),
+            endDate=datetime.fromtimestamp(start // 1_000_000 + 900, timezone.utc).isoformat(),
+            clobTokenIds=json.dumps([token_up, token_down]))
+
+    def respond(self, request):
+        # Mutating reservation/terminal work must end before HTTP starts.
+        assert not self.store._connection.in_transaction
+        self.requests.append((request.method, request.url.path, self.monotonic_ns(),
+                              dict(request.extensions["timeout"]), bytes(request.content)))
+        if request.url.path == "/books":
+            self.book_count += 1
+            row = self.market_row()
+            tokens = json.loads(request.content)
+            payload = [make_book(asset_id=item["token_id"], market=row["conditionId"],
+                                timestamp=str(self.wall_us() // 1000)) for item in reversed(tokens)]
+        elif request.url.path == "/time":
+            payload = (self.wall_us() + getattr(self, "server_shift_us", 0)) // 1_000_000
+        elif request.url.path.startswith("/clob-markets/"):
+            row = self.market_row()
+            payload = {"condition_id": row["conditionId"],
+                       "t": [{"t": token} for token in json.loads(row["clobTokenIds"])]}
+        elif request.url.path.startswith("/events/slug/"):
+            payload = make_event(markets=[self.market_row()])
+        elif request.url.path == "/events":
+            payload = [make_event(markets=[self.market_row()])]
+        elif request.url.path.startswith("/markets/"):
+            payload = self.market_row()
+        elif request.url.path == "/v2/resolutions":
+            payload = {"data": []}
+        else:
+            raise AssertionError(request.url)
+        response = self.hook(request, payload, self) if self.hook else None
+        self.advance(0.01)
+        return response if response is not None else httpx.Response(200,
+            stream=httpx.ByteStream(json.dumps(payload).encode()))
+
+    def rows(self, sql, params=()):
+        import sqlite3
+        connection = sqlite3.connect(self.db.path)
+        connection.row_factory = sqlite3.Row
+        try:
+            return [dict(row) for row in connection.execute(sql, params)]
+        finally:
+            connection.close()
+
+    def close(self):
+        self.store.close()
+        self.client.close()
+        self.db.close()

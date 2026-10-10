@@ -753,8 +753,10 @@ class RecorderStore:
         else:
             self._insert("reference_associations", values)
 
-    def record_event(self, run_id: str, *, market_id: str | None, kind: str,
-                     started_us: int, ended_us: int | None, detail: dict) -> int:
+    def record_event(self, run_id: str, kind: str, *, market_id: str | None = None,
+                     started_us: int, ended_us: int | None = None,
+                     detail: dict | None = None) -> int:
+        detail = {} if detail is None else detail
         _integer(started_us, "started_us")
         if ended_us is not None:
             _integer(ended_us, "ended_us")
@@ -1014,11 +1016,66 @@ class RecorderStore:
             self._connection.execute("UPDATE recording_runs SET state=?,ended_wall_us=?,exit_reason=? WHERE run_id=?",
                                      (state, wall_us, reason, run_id))
 
-    def recover_interrupted(self, *, wall_us: int) -> None:
+    def covered_indices(self, market_id: str) -> set[int]:
+        return {row["slot_index"] for row in self._rows(
+            "SELECT slot_index FROM sample_slots WHERE market_id=?", (market_id,))}
+
+    def restart_context(self) -> tuple[int | None, tuple[dict, ...]]:
+        """Durable wall/window context only; never export old monotonic epochs."""
+        last = self._one("SELECT MAX(COALESCE(ended_wall_us,last_committed_wall_us,started_wall_us)) AS wall_us FROM recording_runs")
+        markets = self._rows("SELECT market_id,window_start_us,window_end_us,lifecycle FROM markets ORDER BY window_start_us")
+        return last["wall_us"], tuple(markets)
+
+    def paused_revision_id(self, revision: MarketRevision) -> int:
+        """Validate rediscovery without reviving an immutable invalidated identity."""
+        market = revision.market
+        known = self._one("SELECT * FROM markets WHERE market_id=?", (market.market_id,))
+        identity = dict(condition_id=market.condition_id, event_id=market.event_id,
+            window_start_us=_epoch_us(market.window_start), window_end_us=_epoch_us(market.window_end),
+            up_token_id=market.up.token_id, down_token_id=market.down.token_id,
+            up_outcome_index=revision.up_index, down_outcome_index=revision.down_index)
+        _require(known is not None and known["lifecycle"] == "INVALIDATED"
+                 and self._equal(known, identity), "Invalidated identity cannot be changed on restart.")
+        latest = self._one("SELECT revision_id FROM market_revisions WHERE market_id=? ORDER BY revision_id DESC LIMIT 1",
+                           (market.market_id,))
+        _require(latest is not None, "Invalidated identity lacks metadata evidence.")
+        return latest["revision_id"]
+
+    def save_control_attempts(self, run_id: str, attempts: tuple) -> None:
+        """Persist buffered calibration/discovery/metadata attempts after I/O."""
+        prepared = []
+        for attempt in attempts:
+            _require(attempt.method == "GET" and attempt.operation in (
+                "CLOB_TIME", "CLOB_CONFIG", "GAMMA_EVENTS", "GAMMA_EVENT", "GAMMA_MARKET"),
+                "Control attempt must be a public metadata/time GET.")
+            for name in ("started_wall_us", "ended_wall_us", "started_mono_ns", "ended_mono_ns"):
+                _integer(getattr(attempt, name), name)
+            _require(attempt.ended_mono_ns >= attempt.started_mono_ns,
+                     "Control attempt timing is reversed.")
+            blob, size, codec = encode_evidence(attempt.raw_body)
+            prepared.append(dict(run_id=run_id, operation=attempt.operation,
+                attempt_number=attempt.attempt_number, method=attempt.method, path=attempt.path,
+                selector_json=_json(attempt.selectors), started_wall_us=attempt.started_wall_us,
+                ended_wall_us=attempt.ended_wall_us, start_mono_ns=attempt.started_mono_ns,
+                end_mono_ns=attempt.ended_mono_ns,
+                latency_ns=attempt.ended_mono_ns-attempt.started_mono_ns,
+                http_status=attempt.http_status, result=attempt.result, error_code=attempt.error_code,
+                response_bytes=size, response_raw_z=blob, raw_size_bytes=size,
+                codec_version=codec, raw_complete=int(attempt.raw_complete)))
+        if prepared:
+            with self._transaction():
+                self._run(run_id)
+                for values in prepared:
+                    self._insert("request_attempts", values)
+
+    def recover_interrupted(self, *, wall_us: int, run_id: str | None = None,
+                            finish_runs: bool = True, reason: str = "RESTART_RECOVERY") -> None:
         """Finalize old reservations without projecting across monotonic epochs."""
         _integer(wall_us, "recovery_wall_us")
         with self._transaction():
-            slots = self._rows("SELECT * FROM sample_slots WHERE status='IN_PROGRESS' ORDER BY slot_id")
+            slots = self._rows("SELECT * FROM sample_slots WHERE status='IN_PROGRESS'"
+                + (" AND run_id=?" if run_id is not None else "") + " ORDER BY slot_id",
+                (run_id,) if run_id is not None else ())
             for slot in slots:
                 market = self._market_target(slot["market_id"], SlotTarget(slot["slot_index"], slot["scheduled_us"]))
                 self._revision(slot["market_id"], slot["metadata_revision_id"])
@@ -1035,9 +1092,11 @@ class RecorderStore:
                     status="DISABLED", origin="NOT_FETCHED", available_live=0,
                     learned_wall_us=wall_us, learned_server_us=None, attempt_count=0))
                 self._connection.execute("""UPDATE sample_slots SET status='INTERRUPTED',
-                    committed_wall_us=?,reason='RESTART_RECOVERY',reference_status='REFERENCE_INCOMPLETE'
-                    WHERE slot_id=?""", (wall_us, slot["slot_id"]))
+                    committed_wall_us=?,reason=?,reference_status='REFERENCE_INCOMPLETE'
+                    WHERE slot_id=?""", (wall_us, reason, slot["slot_id"]))
                 self._connection.execute("UPDATE recording_runs SET last_committed_wall_us=? WHERE run_id=?",
                                          (wall_us, slot["run_id"]))
-            self._connection.execute("""UPDATE recording_runs SET state='INTERRUPTED',ended_wall_us=?,
-                exit_reason='RESTART_RECOVERY' WHERE state='RUNNING'""", (wall_us,))
+            if finish_runs:
+                self._connection.execute("""UPDATE recording_runs SET state='INTERRUPTED',ended_wall_us=?,
+                    exit_reason=? WHERE state='RUNNING'""" + (" AND run_id=?" if run_id is not None else ""),
+                    (wall_us, reason, run_id) if run_id is not None else (wall_us, reason))

@@ -1,0 +1,333 @@
+"""Single-owner, fixed-cadence recorder coordinator."""
+from datetime import datetime, timedelta, timezone
+from dataclasses import replace
+import sqlite3
+from typing import Callable
+
+from polymarket_bot.market_data.gamma import GammaClient
+from polymarket_bot.market_data.models import MarketDataError
+from polymarket_bot.market_data.http import PublicGet
+from .books import collect_books
+from .clock import RecorderClock
+from .metadata import acquire_market, refresh_revision
+from .models import RunConfig, RunResult, SlotCommit
+from .reference import disabled_reference
+from .resolution import reconcile_due
+from .schedule import classify_wake, select_future_slot, slot_grid
+from .store import RecorderStore, RecorderStoreError
+
+
+class _StopRequested(Exception):
+    """Internal normal-stop signal raised before an actual HTTP attempt."""
+
+
+class Recorder:
+    def __init__(self, store: RecorderStore, public: PublicGet, *,
+                 monotonic_ns: Callable[[], int], wall_us: Callable[[], int],
+                 sleep: Callable[[float], None]):
+        self.store, self.public = store, public
+        self.monotonic_ns, self.wall_us, self.sleep = monotonic_ns, wall_us, sleep
+        self.clock = RecorderClock(monotonic_ns=monotonic_ns, wall_us=wall_us)
+        # Both transport timing representations derive from the same run epoch.
+        public.monotonic_ns = monotonic_ns
+        public.monotonic = lambda: monotonic_ns() / 1_000_000_000
+        public.utcnow = lambda: datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=wall_us())
+        public.sleep = sleep
+        self.gamma = GammaClient(public)
+
+    def _control(self, operation):
+        attempts = []
+        previous = self.public.on_attempt
+        self.public.on_attempt = attempts.append
+        try:
+            return operation()
+        finally:
+            self.public.on_attempt = previous
+            self.store.save_control_attempts(self.run_id, tuple(attempts))
+
+    def _now(self):
+        return self.clock.server_us_at(self.monotonic_ns())
+
+    def _wait(self, deadline_ns):
+        remaining = deadline_ns - self.monotonic_ns()
+        if remaining > 0:
+            self.sleep(remaining / 1_000_000_000)
+
+    def _calibrate(self, deadline):
+        try:
+            read = self._control(lambda: self.public.get_json("clob", "/time", deadline=deadline))
+            anchor = self.clock.calibrate(read)
+        except MarketDataError as exc:
+            self.next_clock_ns = self.monotonic_ns() + (60_000_000_000 if self.clock.usable() else 2_000_000_000)
+            if not self.clock.usable():
+                self.store.record_event(self.run_id, "CLOCK_PAUSE", started_us=self.wall_us(),
+                                        detail={"reason": exc.code})
+            return False
+        self.anchor_id = self.store.save_anchor(self.run_id, anchor)
+        self.next_clock_ns = anchor.midpoint_ns + 60_000_000_000
+        if anchor.status == "DISCONTINUITY":
+            self.next_clock_ns = self.monotonic_ns()
+            self.store.record_event(self.run_id, "CLOCK_PAUSE", started_us=self.wall_us(),
+                                    detail=anchor.diagnostic)
+            self.revision = None
+            self.clock_recovery_needed = True
+            self.miss_reason = "CLOCK_PAUSE"
+            return False
+        return True
+
+    def _housekeeping(self, target_ns, *, before_boundary=False):
+        """Serial logical jobs share the writer and stop at the armed target."""
+        deadline_ns = target_ns - 1_000_000
+        if self.monotonic_ns() >= deadline_ns:
+            return
+        if before_boundary or self.monotonic_ns() >= self.next_clock_ns:
+            if not self._calibrate(deadline_ns / 1_000_000_000) and not self.clock.usable():
+                return
+        if self.revision is None or self.monotonic_ns() >= deadline_ns:
+            return
+        if self.revalidate:
+            try:
+                candidate = self._control(lambda: acquire_market(self.gamma, self.public,
+                    clock=self.clock, deadline=deadline_ns / 1_000_000_000,
+                    use_fast_path=self.config.use_fast_path))
+            except MarketDataError as exc:
+                self.store.record_event(self.run_id, "DISCOVERY_GAP", started_us=self._now(),
+                                        detail={"reason": exc.code, "revalidation": True})
+                return
+            if candidate.market.market_id not in self.invalidated:
+                self.revision = candidate
+                self.revision_id = self.store.save_market_revision(self.run_id, candidate)
+            self.revalidate = False
+        if self.monotonic_ns() >= deadline_ns:
+            return
+        previous = self.revision
+        last = previous.last_refresh_attempt_us or previous.observed_us
+        if previous.market.market_id not in self.invalidated and self._now() >= last + 60_000_000:
+            self.revision = self._control(lambda: refresh_revision(previous, self.gamma, self.public,
+                clock=self.clock, deadline=deadline_ns / 1_000_000_000))
+            try:
+                self.revision_id = self.store.save_market_revision(self.run_id, self.revision)
+            except RecorderStoreError as exc:
+                if exc.code != "identity_conflict":
+                    raise
+                self.invalidated.add(previous.market.market_id)
+                self.revalidate = True
+                self.next_clock_ns = self.monotonic_ns()
+                self.store.record_event(self.run_id, "IDENTITY_CONFLICT", started_us=self._now(),
+                    market_id=previous.market.market_id, detail={"capture_paused": True})
+                return
+            warnings = self.revision.warnings
+            if any(warning.startswith("metadata_refresh_failed") for warning in warnings):
+                self.store.record_event(self.run_id, "DISCOVERY_GAP", started_us=self._now(),
+                    market_id=previous.market.market_id, detail={"warnings": warnings})
+        if self.monotonic_ns() >= deadline_ns:
+            return
+        previous_callback = self.public.on_attempt
+        self.public.on_attempt = None
+        try:
+            reconcile_due(self.public, self.store, now_us=self.wall_us(),
+                          deadline=deadline_ns / 1_000_000_000)
+        finally:
+            self.public.on_attempt = previous_callback
+
+    def _recover_known(self, *, reason="DOWNTIME", markets=None):
+        now = self._now()
+        for market in self.known_markets if markets is None else markets:
+            covered = self.store.covered_indices(market["market_id"])
+            for target in slot_grid(market["window_start_us"]):
+                if target.scheduled_us <= now and target.index not in covered:
+                    self.store.mark_missed(market["market_id"], target, run_id=self.run_id,
+                                          reason=reason, wall_us=self.wall_us())
+            if now >= market["window_end_us"]:
+                self.store.expire_market(market["market_id"], observed_us=now)
+        self.known_recovered = True
+
+    def run(self, config: RunConfig, *, should_stop: Callable[[], bool]) -> RunResult:
+        self.run_id, self.finalized = "", 0
+        try:
+            return self._execute_run(config, should_stop=should_stop)
+        except (RecorderStoreError, sqlite3.DatabaseError, OSError) as exc:
+            # Includes failure to close; no successful durability claim escapes.
+            return RunResult(self.run_id, "FAILED", 1, self.finalized,
+                exc.code if isinstance(exc, RecorderStoreError) else "storage_failure")
+
+    def _execute_run(self, config, *, should_stop):
+        if config.mode != "BOOK_ONLY":
+            self.store.close()
+            return RunResult("", "FAILED", 2, 0, "reference_runtime_unavailable")
+        original_attempts = self.public.max_attempts
+        original_guard = self.public.before_attempt
+        def stop_guard():
+            if should_stop():
+                raise _StopRequested
+        self.public.before_attempt = stop_guard
+        try:
+            return self._record(config, should_stop=should_stop)
+        except _StopRequested:
+            if self.run_id:
+                try:
+                    self.store.recover_interrupted(wall_us=self.wall_us(), run_id=self.run_id,
+                                                   finish_runs=False, reason="STOP_REQUESTED")
+                    self._shutdown("STOPPED", "STOP_REQUESTED")
+                except (RecorderStoreError, sqlite3.DatabaseError, OSError) as exc:
+                    return RunResult(self.run_id, "FAILED", 1, self.finalized,
+                        exc.code if isinstance(exc, RecorderStoreError) else "storage_failure")
+            return RunResult(self.run_id, "STOPPED", 0, self.finalized, "STOP_REQUESTED")
+        except KeyboardInterrupt:
+            try:
+                if self.run_id:
+                    self.store.recover_interrupted(wall_us=self.wall_us(), run_id=self.run_id,
+                                                   finish_runs=False, reason="KEYBOARD_INTERRUPT")
+                    self._shutdown("INTERRUPTED", "KEYBOARD_INTERRUPT")
+            except (RecorderStoreError, sqlite3.DatabaseError, OSError) as exc:
+                return RunResult(self.run_id, "FAILED", 1, self.finalized,
+                                 exc.code if isinstance(exc, RecorderStoreError) else "storage_failure")
+            return RunResult(self.run_id, "INTERRUPTED", 130, self.finalized, "KEYBOARD_INTERRUPT")
+        except (RecorderStoreError, sqlite3.DatabaseError, OSError) as exc:
+            # No further persistence or HTTP follows a failed writer/invariant.
+            return RunResult(self.run_id, "FAILED", 1, self.finalized,
+                             exc.code if isinstance(exc, RecorderStoreError) else "storage_failure")
+        finally:
+            self.public.max_attempts = original_attempts
+            self.public.before_attempt = original_guard
+            self.store.close()
+
+    def _shutdown(self, state, reason):
+        self.store.record_event(self.run_id, "SHUTDOWN", started_us=self.wall_us(),
+                                detail={"reason": reason})
+        self.store.finish_run(self.run_id, state=state, wall_us=self.wall_us(), reason=reason)
+
+    def _record(self, config, *, should_stop):
+        self.config = config
+        self.revalidate = False
+        previous_wall_us, self.known_markets = self.store.restart_context()
+        self.invalidated = {row["market_id"] for row in self.known_markets if row["lifecycle"] == "INVALIDATED"}
+        self.store.recover_interrupted(wall_us=self.wall_us())
+        self.public.max_attempts = min(self.public.max_attempts, config.max_attempts)
+        self.run_id = self.store.start_run(config, wall_us=self.wall_us(), app_revision=config.policy_revision)
+        self.store.record_event(self.run_id, "STARTUP", started_us=self.wall_us())
+        if previous_wall_us is not None:
+            self.store.record_event(self.run_id, "RESTART", started_us=previous_wall_us,
+                ended_us=self.wall_us(), detail={"monotonic_epoch": "NEW"})
+            if not self.known_markets:
+                self.store.record_event(self.run_id, "DISCOVERY_GAP", started_us=previous_wall_us,
+                    ended_us=self.wall_us(), detail={"unknown_windows": True, "reason": "DOWNTIME",
+                                                   "time_domain": "LOCAL_WALL"})
+        self.revision = None
+        self.next_clock_ns = self.monotonic_ns()
+        self.miss_reason = "BEFORE_START"
+        self.known_recovered = False
+        self.clock_recovery_needed = False
+        unknown_gap_recorded = False
+        while not should_stop():
+            if not self.clock.usable():
+                self.miss_reason = "CLOCK_PAUSE" if self.clock.anchor else "BEFORE_START"
+                if self.monotonic_ns() < self.next_clock_ns:
+                    self._wait(self.next_clock_ns)
+                    continue
+                if not self._calibrate(self.public.monotonic()+10):
+                    self.sleep(2)
+                    continue
+            if not self.known_recovered:
+                self._recover_known()
+            if self.clock_recovery_needed:
+                self._recover_known(reason="CLOCK_PAUSE", markets=self.store.restart_context()[1])
+                self.clock_recovery_needed = False
+            if self.revision is None:
+                started_us = self._now()
+                try:
+                    self.revision = self._control(lambda: acquire_market(self.gamma, self.public,
+                        clock=self.clock, deadline=self.public.monotonic()+10,
+                        use_fast_path=config.use_fast_path))
+                except MarketDataError as exc:
+                    self.store.record_event(self.run_id, "DISCOVERY_GAP", started_us=started_us,
+                        ended_us=self._now() if self.clock.usable() else None,
+                        detail={"reason": exc.code, "unknown_market": True,
+                                "time_domain": "SERVER"})
+                    self.sleep(2)
+                    continue
+                if self.revision.market.market_id in self.invalidated:
+                    self.revision_id = self.store.paused_revision_id(self.revision)
+                    self.revision = replace(self.revision, capture_ready=False)
+                    self.store.record_event(self.run_id, "IDENTITY_CONFLICT", started_us=self._now(),
+                        market_id=self.revision.market.market_id, detail={"persisted_invalidation": True})
+                else:
+                    self.revision_id = self.store.save_market_revision(self.run_id, self.revision)
+                if self.known_markets and not unknown_gap_recorded:
+                    known_end = max(row["window_end_us"] for row in self.known_markets)
+                    current_start = int(self.revision.market.window_start.timestamp()) * 1_000_000
+                    if current_start > known_end:
+                        self.store.record_event(self.run_id, "DISCOVERY_GAP", started_us=known_end,
+                            ended_us=current_start, detail={"unknown_windows": True,
+                                                           "reason": "DOWNTIME"})
+                    unknown_gap_recorded = True
+            market = self.revision.market
+            start_us = int(market.window_start.timestamp()) * 1_000_000
+            end_us = start_us + 900_000_000
+            now = self._now()
+            selection = select_future_slot(market, now_us=now,
+                terminal_indices=self.store.covered_indices(market.market_id))
+            grid = slot_grid(start_us)
+            for index in selection.missed:
+                self.store.mark_missed(market.market_id, grid[index], run_id=self.run_id,
+                                      reason=self.miss_reason, wall_us=self.wall_us())
+            self.miss_reason = "PROCESSING_OVERRUN" if self.revision.capture_ready else "METADATA_NOT_READY"
+            if now >= end_us:
+                self.store.expire_market(market.market_id, observed_us=now)
+                self.revision = None
+                self.miss_reason = "BEFORE_START"
+                continue
+            target = selection.target
+            if target is None:
+                self._housekeeping(self.clock.deadline_ns(end_us), before_boundary=True)
+                if self.revision is None or not self.clock.usable():
+                    continue
+                self._wait(self.clock.deadline_ns(end_us))
+                continue
+            target_ns = self.clock.deadline_ns(target.scheduled_us)
+            self._housekeeping(target_ns)
+            if (self.revision is None or self.revision.market.market_id != market.market_id
+                    or not self.clock.usable()):
+                continue
+            target_ns = self.clock.deadline_ns(target.scheduled_us)
+            if self.monotonic_ns() >= target_ns:
+                continue
+            self._wait(target_ns)
+            if should_stop():
+                break
+            if not self.clock.usable():
+                self.miss_reason = "CLOCK_PAUSE"
+                self.store.record_event(self.run_id, "CLOCK_PAUSE", started_us=self.wall_us(),
+                                        detail={"reason": "ANCHOR_EXPIRED_DURING_WAIT"})
+                continue
+            if classify_wake(target, now_us=self._now(), window_end_us=end_us) != "CAPTURE":
+                continue
+            if not self.revision.capture_ready:
+                self.store.mark_missed(market.market_id, target, run_id=self.run_id,
+                                      reason="METADATA_NOT_READY", wall_us=self.wall_us())
+                self.miss_reason = "METADATA_NOT_READY"
+                continue
+            started_ns = self.monotonic_ns()
+            slot_id = self.store.reserve_slot(market.market_id, target, run_id=self.run_id,
+                anchor_id=self.anchor_id, metadata_revision_id=self.revision_id, started_mono_ns=started_ns,
+                started_server_us=self._now())
+            anchor = self.clock.anchor
+            project = lambda moment_ns: anchor.server_us + (moment_ns-anchor.midpoint_ns)//1000
+            previous = self.public.on_attempt
+            self.public.on_attempt = None
+            try:
+                books = collect_books(self.public, market,
+                    deadline=self.clock.deadline_ns(min(target.scheduled_us+2_000_000, end_us))/1_000_000_000,
+                    receipt_server_us=lambda moment: project(round(moment*1_000_000_000)),
+                    uncertainty_us=self.clock.anchor.uncertainty_us)
+            finally:
+                self.public.on_attempt = previous
+            ended_ns = self.monotonic_ns()
+            reference = disabled_reference(market.market_id, target.scheduled_us,
+                learned_wall_us=self.wall_us(), learned_server_us=project(ended_ns))
+            self.store.finalize_slot(slot_id, SlotCommit(market.market_id, target, self.run_id,
+                self.anchor_id, self.revision_id, books, reference, started_ns, ended_ns),
+                committed_wall_us=self.wall_us())
+            self.finalized += 1
+        self._shutdown("STOPPED", "STOP_REQUESTED")
+        return RunResult(self.run_id, "STOPPED", 0, self.finalized, "STOP_REQUESTED")

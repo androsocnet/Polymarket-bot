@@ -235,6 +235,29 @@ class RecorderHttpTests(unittest.TestCase):
         self.assertEqual(self.attempts[0].result, "failure")
         self.assertEqual(self.attempts[0].error_code, "transport_error")
 
+    def test_stop_guard_precedes_http_and_attempt_evidence(self):
+        reader = self.tracked()
+        def stopped():
+            raise RuntimeError("stop before HTTP")
+        reader.before_attempt = stopped
+        with self.assertRaisesRegex(RuntimeError, "stop before HTTP"):
+            reader.get_books((TOKEN_UP, TOKEN_DOWN), deadline=2)
+        self.assertEqual(self.requests, [])
+        self.assertEqual(self.attempts, [])
+
+    def test_stop_guard_suppresses_retry_without_fabricated_attempt(self):
+        reader = self.tracked()
+        def stop_after_first():
+            if self.requests:
+                raise RuntimeError("stop retry")
+        reader.before_attempt = stop_after_first
+        self.handler = lambda request: httpx.Response(503, stream=httpx.ByteStream(b"busy"))
+        with self.assertRaisesRegex(RuntimeError, "stop retry"):
+            reader.get_books((TOKEN_UP, TOKEN_DOWN), deadline=2)
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(len(self.attempts), 1)
+        self.assertEqual(self.attempts[0].raw_body, b"busy")
+
 
 if __name__ == "__main__":
     unittest.main()

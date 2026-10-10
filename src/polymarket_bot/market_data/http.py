@@ -46,7 +46,8 @@ class PublicGet:
                  sleep: Callable[[float], None], utcnow: Callable[[], datetime],
                  max_attempts: int = 3, phase_timeout: float = 10.0,
                  monotonic_ns: Callable[[], int] | None = None,
-                 on_attempt: Callable[[HttpAttempt], None] | None = None):
+                 on_attempt: Callable[[HttpAttempt], None] | None = None,
+                 before_attempt: Callable[[], None] | None = None):
         if type(max_attempts) is not int or not 1 <= max_attempts <= 3:
             raise ValueError("max_attempts must be 1, 2, or 3")
         if not 0 < phase_timeout <= 10:
@@ -55,6 +56,7 @@ class PublicGet:
         self.max_attempts, self.phase_timeout = max_attempts, phase_timeout
         self.monotonic_ns = monotonic_ns or (lambda: int(self.monotonic() * 1_000_000_000))
         self.on_attempt = on_attempt
+        self.before_attempt = before_attempt
 
     def get_json(self, source: Literal["gamma", "clob", "data"], path: str, *,
                  params: dict[str, str | int] | None = None, deadline: float) -> JsonRead:
@@ -114,6 +116,8 @@ class PublicGet:
                      "GAMMA_EVENT" if path.startswith("/events/slug/") else
                      "GAMMA_MARKET")
         for attempt in range(self.max_attempts):
+            if self.before_attempt is not None:
+                self.before_attempt()
             remaining = self._remaining(deadline)
             start = self.monotonic()
             started_ns = self.monotonic_ns()

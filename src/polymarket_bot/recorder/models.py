@@ -65,6 +65,15 @@ class RunConfig:
 
 
 @dataclass(frozen=True)
+class RunResult:
+    run_id: str
+    state: str
+    exit_code: int
+    slots_finalized: int
+    reason: str
+
+
+@dataclass(frozen=True)
 class SlotTarget:
     index: int
     scheduled_us: int
