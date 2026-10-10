@@ -1,5 +1,7 @@
 """Deterministic public CLOB responses for recorder tests."""
 import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import httpx
 
@@ -48,3 +50,16 @@ class BookFixture:
 
 def down_book(**overrides):
     return make_book(asset_id=TOKEN_DOWN, **overrides)
+
+
+class DatabaseFixture:
+    """An absent database path in a disposable directory; no live services."""
+
+    def __init__(self):
+        fixture_root = Path(__file__).resolve().parents[1] / "data"
+        fixture_root.mkdir(exist_ok=True)
+        self.directory = TemporaryDirectory(dir=fixture_root, prefix="recorder-test-")
+        self.path = Path(self.directory.name) / "recorder.sqlite3"
+
+    def close(self):
+        self.directory.cleanup()
