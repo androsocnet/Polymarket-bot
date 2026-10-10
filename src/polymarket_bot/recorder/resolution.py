@@ -41,7 +41,8 @@ def _raw_payouts_json(value: object) -> str | None:
                 return None
             part = str(item)
         elif isinstance(item, Decimal):
-            if len(item.as_tuple().digits) > 128 or abs(item.as_tuple().exponent) > 128:
+            if (not item.is_finite() or len(item.as_tuple().digits) > 128
+                    or abs(item.as_tuple().exponent) > 128):
                 return None
             part = str(item)
         elif type(item) in (str, bool) or item is None:

@@ -13,7 +13,8 @@ import zlib
 from uuid import uuid4
 
 from polymarket_bot.market_data.models import MarketDataError
-from polymarket_bot.market_data.numeric import decimal_text, exact_decimal_context
+from polymarket_bot.market_data.numeric import (decimal_text, exact_decimal_context,
+                                                load_numeric_json, parse_decimal)
 from .models import (CHAINLINK_FEED_ID, CHAINLINK_FEED_NAME, ClockAnchor, RunConfig,
                      MarketRevision, ReferenceFetchDraft, ReferenceReportDraft,
                      ResolutionObservation, SlotCommit, SlotTarget)
@@ -498,10 +499,27 @@ class RecorderStore:
                 if observation.classification in ("RESOLVED_DIRECTIONAL", "RESOLVED_OTHER"):
                     selected_id = market["selected_resolution_id"]
                     if selected_id is not None:
-                        selected = self._one("SELECT classification,mapped_outcome FROM resolution_observations WHERE resolution_id=?",
+                        selected = self._one("SELECT classification,mapped_outcome,payouts_raw_json FROM resolution_observations WHERE resolution_id=?",
                                              (selected_id,))
-                        conflict = (selected["classification"], selected["mapped_outcome"]) != (
-                            observation.classification, observation.mapped_outcome)
+                        _require(selected is not None and selected["payouts_raw_json"] is not None
+                                 and observation.payouts is not None,
+                                 "Selected final resolution lacks payout evidence.")
+                        try:
+                            prior_raw = load_numeric_json(selected["payouts_raw_json"])
+                            _require(type(prior_raw) is list and len(prior_raw) == 2,
+                                     "Selected final payout vector is invalid.")
+                            prior_payouts = tuple(parse_decimal(value, field="selected resolution payout")
+                                                  for value in prior_raw)
+                            with exact_decimal_context():
+                                equivalent_payouts = (tuple(value > 0 for value in prior_payouts)
+                                    == tuple(value > 0 for value in observation.payouts)
+                                    and prior_payouts[0] * observation.payouts[1]
+                                    == prior_payouts[1] * observation.payouts[0])
+                        except MarketDataError as exc:
+                            raise RecorderStoreError("fatal_invariant", "Selected final payout evidence is invalid.") from exc
+                        conflict = ((selected["classification"], selected["mapped_outcome"]) !=
+                            (observation.classification, observation.mapped_outcome)
+                            or not equivalent_payouts)
                     else:
                         conflict = False
                     state = "CONFLICT" if prior_state == "CONFLICT" or conflict else observation.classification

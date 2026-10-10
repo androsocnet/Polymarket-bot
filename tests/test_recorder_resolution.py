@@ -77,6 +77,18 @@ class ResolutionParsingTests(unittest.TestCase):
         self.assertEqual((result.classification, result.mapped_outcome), ("INVALID", None))
         self.assertLess(len(json.dumps(result.provenance)), 300)
 
+    def test_direct_nonfinite_decimal_payout_is_bounded_invalid_evidence(self):
+        for value in (Decimal("NaN"), Decimal("sNaN"), Decimal("Infinity"),
+                      Decimal("-Infinity")):
+            for vector in ([value, Decimal(0)], [Decimal(0), value]):
+                with self.subTest(value=str(value), vector=str(vector)):
+                    result = parse_resolution({"condition_id": CONDITION, "status": "resolved",
+                                               "payouts": vector}, self.revision,
+                                              raw_response=b"{}", learned_wall_us=1_000_000,
+                                              learned_server_us=None)
+                    self.assertEqual((result.classification, result.mapped_outcome), ("INVALID", None))
+                    self.assertLess(len(json.dumps(result.provenance)), 300)
+
 
 class ResolutionPersistenceTests(unittest.TestCase):
     def setUp(self):
@@ -278,3 +290,51 @@ class ResolutionPersistenceTests(unittest.TestCase):
         state = self.store._one("SELECT resolution_state,selected_resolution_id FROM markets")
         self.assertEqual(tuple(state.values()), ("CONFLICT", original))
         self.assertEqual(self.store._one("SELECT count(*) AS n FROM resolution_observations")["n"], 2)
+
+    def append_later_final(self, first_payouts, later_payouts):
+        first_public, _, _ = self.public({"data": [{"condition_id": CONDITION,
+            "status": "resolved", "payouts": first_payouts}]})
+        self.assertEqual(reconcile_due(first_public, self.store, now_us=self.end_us, deadline=700), 1)
+        original = self.store._one("SELECT selected_resolution_id FROM markets")["selected_resolution_id"]
+        self.clock.advance(1)
+        later_public, attempts, _ = self.public({"data": [{"condition_id": CONDITION,
+            "status": "resolved", "payouts": later_payouts}]})
+        read = later_public.get_json("data", "/v2/resolutions",
+            params={"condition": CONDITION}, deadline=700)
+        from polymarket_bot.recorder.resolution import _revision_from_row
+        market = _revision_from_row(self.store._one("SELECT * FROM markets"))
+        observation = parse_resolution(read.payload["data"][0], market,
+            raw_response=read.raw_body, learned_wall_us=attempts[0].ended_wall_us,
+            learned_server_us=None)
+        self.store.save_resolutions((observation,), requests=tuple(attempts))
+        row = self.store._one("SELECT resolution_state,selected_resolution_id,resolution_next_due_us FROM markets")
+        evidence = self.store._rows("""SELECT payouts_raw_json,raw_resolution_z,raw_size_bytes,codec_version
+            FROM resolution_observations ORDER BY resolution_id""")
+        self.assertEqual(len(evidence), 2)
+        self.assertEqual(json.loads(decode_evidence(evidence[0]["raw_resolution_z"],
+            evidence[0]["raw_size_bytes"], evidence[0]["codec_version"]))["data"][0]["payouts"], first_payouts)
+        self.assertEqual(json.loads(decode_evidence(evidence[1]["raw_resolution_z"],
+            evidence[1]["raw_size_bytes"], evidence[1]["codec_version"]))["data"][0]["payouts"], later_payouts)
+        return row, original
+
+    def test_split_then_zero_final_conflicts(self):
+        row, original = self.append_later_final([1, 1], [0, 0])
+        self.assertEqual((row["resolution_state"], row["selected_resolution_id"],
+                          row["resolution_next_due_us"]), ("CONFLICT", original, None))
+
+    def test_changed_split_proportions_conflict(self):
+        row, original = self.append_later_final([1, 1], [1, 2])
+        self.assertEqual((row["resolution_state"], row["selected_resolution_id"],
+                          row["resolution_next_due_us"]), ("CONFLICT", original, None))
+
+    def test_proportional_nondirectional_finals_are_equivalent(self):
+        row, original = self.append_later_final([1, 1], [2, 2])
+        self.assertEqual((row["resolution_state"], row["selected_resolution_id"],
+                          row["resolution_next_due_us"]), ("RESOLVED_OTHER", original, None))
+
+    def test_large_close_split_ratios_remain_distinct(self):
+        large = 10**50
+        row, original = self.append_later_final([str(large + 1), str(large)],
+                                                [str(large), str(large)])
+        self.assertEqual((row["resolution_state"], row["selected_resolution_id"],
+                          row["resolution_next_due_us"]), ("CONFLICT", original, None))
