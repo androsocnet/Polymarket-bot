@@ -15,7 +15,8 @@ from uuid import uuid4
 from polymarket_bot.market_data.models import MarketDataError
 from polymarket_bot.market_data.numeric import decimal_text, exact_decimal_context
 from .models import (CHAINLINK_FEED_ID, CHAINLINK_FEED_NAME, ClockAnchor, RunConfig,
-                     MarketRevision, ReferenceFetchDraft, ReferenceReportDraft, SlotCommit, SlotTarget)
+                     MarketRevision, ReferenceFetchDraft, ReferenceReportDraft,
+                     ResolutionObservation, SlotCommit, SlotTarget)
 from .metadata import _selected_market
 
 
@@ -402,6 +403,121 @@ class RecorderStore:
             elif market["lifecycle"] == "INVALIDATED" and market["resolution_next_due_us"] is None:
                 self._connection.execute("""UPDATE markets SET resolution_next_due_us=?
                     WHERE market_id=?""", (market["window_end_us"], market_id))
+
+    def due_resolutions(self, now_us: int, *, limit: int = 20) -> tuple[MarketRevision, ...]:
+        """Read the persisted queue without inspecting reference availability."""
+        _integer(now_us, "resolution now")
+        _require(type(limit) is int and 1 <= limit <= 20, "Resolution batch limit must be 1..20.")
+        from .resolution import _revision_from_row
+        rows = self._rows("""SELECT * FROM markets WHERE lifecycle IN ('EXPIRED','INVALIDATED')
+            AND resolution_state IN ('PENDING','RETRY_WAIT')
+            AND resolution_next_due_us IS NOT NULL AND resolution_next_due_us<=?
+            ORDER BY resolution_next_due_us,window_end_us,market_id LIMIT ?""", (now_us, limit))
+        return tuple(_revision_from_row(row) for row in rows)
+
+    def save_resolutions(self, observations: tuple[ResolutionObservation, ...], *,
+                         requests: tuple) -> None:
+        """Append one batch's attempts and all condition-grain results atomically."""
+        _require(type(observations) is tuple and bool(observations)
+                 and len(observations) <= 20 and type(requests) is tuple and bool(requests),
+                 "Resolution batch requires observations and actual request evidence.")
+        conditions = tuple(obs.condition_id for obs in observations)
+        _require(len(set(conditions)) == len(conditions), "Resolution conditions must be distinct.")
+        selector = "condition=" + ",".join(conditions)
+        attempt_values = []
+        for attempt in requests:
+            _require(attempt.operation == "RESOLUTION" and attempt.method == "GET"
+                     and attempt.path == "/v2/resolutions" and attempt.selectors == (selector,)
+                     and type(attempt.raw_complete) is bool,
+                     "Resolution attempt must use the fixed public condition selector.")
+            for name in ("started_wall_us", "ended_wall_us", "started_mono_ns", "ended_mono_ns"):
+                _integer(getattr(attempt, name), name)
+            _require(attempt.ended_wall_us >= attempt.started_wall_us
+                     and attempt.ended_mono_ns >= attempt.started_mono_ns,
+                     "Resolution attempt times are reversed.")
+            _integer(attempt.attempt_number, "resolution attempt number", minimum=1)
+            _require(attempt.attempt_number <= 3, "Resolution HTTP retry policy exceeded.")
+            z, size, codec = encode_evidence(attempt.raw_body)
+            attempt_values.append(dict(operation="RESOLUTION", attempt_number=attempt.attempt_number,
+                method="GET", path="/v2/resolutions", selector_json=_json(attempt.selectors),
+                started_wall_us=attempt.started_wall_us, ended_wall_us=attempt.ended_wall_us,
+                start_mono_ns=attempt.started_mono_ns, end_mono_ns=attempt.ended_mono_ns,
+                latency_ns=attempt.ended_mono_ns-attempt.started_mono_ns,
+                http_status=attempt.http_status, result=attempt.result,
+                error_code=attempt.error_code, response_bytes=size,
+                response_raw_z=z, raw_size_bytes=size, codec_version=codec,
+                raw_complete=int(attempt.raw_complete)))
+        prepared = []
+        for observation in observations:
+            _require(isinstance(observation, ResolutionObservation), "Resolution observation record is required.")
+            _integer(observation.learned_wall_us, "resolution learned wall")
+            if observation.learned_server_us is not None:
+                _integer(observation.learned_server_us, "resolution learned server")
+            if observation.reported_us is not None:
+                _integer(observation.reported_us, "reported resolution time", minimum=0)
+            _require(observation.learned_wall_us >= requests[-1].ended_wall_us,
+                     "Resolution cannot be learned before request completion.")
+            _require(observation.classification in ("ABSENT", "PENDING", "INVALID",
+                     "RESOLVED_DIRECTIONAL", "RESOLVED_OTHER")
+                     and (observation.mapped_outcome in ("UP", "DOWN")
+                          if observation.classification == "RESOLVED_DIRECTIONAL"
+                          else observation.mapped_outcome is None),
+                     "Resolution classification and winner disagree.")
+            z, size, codec = encode_evidence(observation.raw_response)
+            prepared.append((observation, z, size, codec))
+        with self._transaction():
+            run = self._one("SELECT run_id FROM recording_runs WHERE state='RUNNING' ORDER BY started_wall_us DESC LIMIT 1")
+            _require(run is not None, "Resolution batch requires an active writer run.")
+            request_ids = [self._insert("request_attempts", dict(values, run_id=run["run_id"]))
+                           for values in attempt_values]
+            for observation, z, size, codec in prepared:
+                market = self._one("SELECT * FROM markets WHERE market_id=?", (observation.market_id,))
+                _require(market is not None and market["condition_id"] == observation.condition_id
+                         and market["lifecycle"] in ("EXPIRED", "INVALIDATED"),
+                         "Resolution observation has unknown or unexpired condition.")
+                payouts_json = observation.raw_payouts_json
+                if payouts_json is None and observation.payouts is not None:
+                    _require(len(observation.payouts) == 2,
+                             "Resolution payout vector must retain two entries.")
+                    payouts_json = "[" + ",".join(decimal_text(value) for value in observation.payouts) + "]"
+                reported_raw = observation.provenance.get("reported_time_raw")
+                if type(reported_raw) is not str or len(reported_raw) > 64:
+                    reported_raw = None
+                resolution_id = self._insert("resolution_observations", dict(
+                    market_id=observation.market_id, request_id=request_ids[-1],
+                    condition_id=observation.condition_id, status_raw=observation.raw_status,
+                    payouts_raw_json=payouts_json, provenance_json=_json(observation.provenance),
+                    reported_resolved_us=observation.reported_us, reported_time_raw=reported_raw,
+                    learned_wall_us=observation.learned_wall_us,
+                    learned_server_us=observation.learned_server_us,
+                    mapped_outcome=observation.mapped_outcome,
+                    classification=observation.classification,
+                    response_hash=sha256(observation.raw_response).hexdigest(),
+                    raw_resolution_z=z, raw_size_bytes=size, codec_version=codec))
+                prior_state = market["resolution_state"]
+                if observation.classification in ("RESOLVED_DIRECTIONAL", "RESOLVED_OTHER"):
+                    selected_id = market["selected_resolution_id"]
+                    if selected_id is not None:
+                        selected = self._one("SELECT classification,mapped_outcome FROM resolution_observations WHERE resolution_id=?",
+                                             (selected_id,))
+                        conflict = (selected["classification"], selected["mapped_outcome"]) != (
+                            observation.classification, observation.mapped_outcome)
+                    else:
+                        conflict = False
+                    state = "CONFLICT" if prior_state == "CONFLICT" or conflict else observation.classification
+                    next_due = None
+                    selected_id = selected_id if selected_id is not None else resolution_id
+                elif prior_state in ("RESOLVED_DIRECTIONAL", "RESOLVED_OTHER", "CONFLICT"):
+                    state, next_due, selected_id = prior_state, None, market["selected_resolution_id"]
+                else:
+                    state, selected_id = "RETRY_WAIT", None
+                    delay = min(30 * (2 ** min(market["resolution_attempts"], 10)), 21_600)
+                    next_due = max(observation.learned_wall_us,
+                                   market["resolution_next_due_us"] or observation.learned_wall_us) + delay * 1_000_000
+                self._connection.execute("""UPDATE markets SET resolution_state=?,
+                    resolution_next_due_us=?,resolution_attempts=resolution_attempts+1,
+                    selected_resolution_id=? WHERE market_id=?""",
+                    (state, next_due, selected_id, observation.market_id))
 
     def save_reference_evidence(self, fetch: ReferenceFetchDraft,
                                 reports: tuple[ReferenceReportDraft, ...],

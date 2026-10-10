@@ -27,6 +27,22 @@ class MarketRevision:
 
 
 @dataclass(frozen=True)
+class ResolutionObservation:
+    market_id: str
+    condition_id: str
+    raw_status: str | None
+    payouts: tuple[Decimal, ...] | None
+    reported_us: int | None
+    learned_wall_us: int
+    learned_server_us: int | None
+    classification: str
+    mapped_outcome: str | None
+    raw_response: bytes
+    provenance: dict
+    raw_payouts_json: str | None = None
+
+
+@dataclass(frozen=True)
 class RunConfig:
     mode: str = "BOOK_ONLY"
     use_fast_path: bool = True
