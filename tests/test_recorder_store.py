@@ -417,6 +417,63 @@ class StoreTests(unittest.TestCase):
         self.assertEqual((attempts[1]["ended_server_us"], attempts[2]["ended_server_us"]),
                          (NOW_US + 200_000, NOW_US + 300_000))
 
+    def test_fallback_expiry_before_down_attempt_persists_valid_partial(self):
+        fixture = BookFixture(batch=[], status=404,
+                              singles={TOKEN_UP: (200, make_book()), TOKEN_DOWN: (200, down_book())})
+        self.addCleanup(fixture.close)
+        actual_get = fixture.public.get_json
+
+        def expire_before_down_transport(source, path, *, params, deadline):
+            # DOWN passed the collector's can_start; the real transport now refuses to start.
+            if params["token_id"] == TOKEN_DOWN:
+                fixture.clock.advance(deadline - fixture.clock.monotonic())
+            return actual_get(source, path, params=params, deadline=deadline)
+
+        fixture.public.get_json = expire_before_down_transport
+        books = fixture.collect()
+        self.assertEqual(fixture.requests, [("POST", "/books"), ("GET", "/book")])
+        self.assertEqual([(attempt.operation, attempt.selectors) for attempt in books.attempts],
+                         [("BOOK_BATCH", (TOKEN_UP, TOKEN_DOWN)), ("BOOK_SINGLE", ("token_id=" + TOKEN_UP,))])
+        slot = self.reserve()
+        commit = self.commit(books, ended_mono_ns=2_000_000_000)
+        commit = replace(commit, reference=replace(commit.reference,
+                         learned_wall_us=NOW_US + 2_000_000, learned_server_us=NOW_US + 2_000_000))
+        try:
+            self.finalize(slot, commit)
+        except RecorderStoreError as exc:
+            self.fail(f"No-attempt fallback expiry must durably preserve PARTIAL: {exc.code}: {exc}")
+        self.assertEqual(self.rows("sample_slots")[0]["status"], "PARTIAL")
+        results = {row["outcome"]: row for row in self.rows("book_observations")}
+        self.assertEqual(set(results), {"UP", "DOWN"})
+        attempts = self.rows("request_attempts", "ORDER BY request_id")
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual((results["UP"]["status"], results["UP"]["request_id"], results["UP"]["best_bid_text"]),
+                         ("VALID", attempts[1]["request_id"], "0.60"))
+        self.assertEqual((results["DOWN"]["status"], results["DOWN"]["request_id"], results["DOWN"]["best_bid_text"]),
+                         ("LATE", None, None))
+        self.assertIsNone(books.down.attempt_index)
+        for saved, original in zip(attempts, books.attempts):
+            self.assertEqual(decode_evidence(saved["response_raw_z"], saved["raw_size_bytes"],
+                                            saved["codec_version"]), original.raw_body)
+
+    def test_started_failed_down_fallback_keeps_its_own_attempt(self):
+        fixture = BookFixture(batch=[], status=404,
+                              singles={TOKEN_UP: (200, make_book()), TOKEN_DOWN: (404, b'{"error":"missing"}')})
+        self.addCleanup(fixture.close)
+        books = fixture.collect()
+        slot = self.reserve()
+        self.finalize(slot, self.commit(books, ended_mono_ns=300_000_000))
+        attempts = self.rows("request_attempts", "ORDER BY request_id")
+        results = {row["outcome"]: row for row in self.rows("book_observations")}
+        self.assertEqual(self.rows("sample_slots")[0]["status"], "PARTIAL")
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual((results["UP"]["status"], results["UP"]["request_id"]),
+                         ("VALID", attempts[1]["request_id"]))
+        self.assertEqual((results["DOWN"]["status"], results["DOWN"]["request_id"]),
+                         ("UNAVAILABLE", attempts[2]["request_id"]))
+        self.assertEqual(decode_evidence(attempts[2]["response_raw_z"], attempts[2]["raw_size_bytes"],
+                                        attempts[2]["codec_version"]), b'{"error":"missing"}')
+
     def test_no_attempt_failure_remains_missing_and_truncated_bytes_stay_diagnostic(self):
         slot = self.reserve()
         commit = self.commit()

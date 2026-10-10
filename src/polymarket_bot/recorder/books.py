@@ -77,14 +77,21 @@ def collect_books(public: PublicGet, market: MarketDescriptor, *, deadline: floa
     def individual(label, token):
         if not can_start():
             return failed(label, token, "LATE", "deadline_exhausted", None)
+        first_attempt = len(attempts)
+
+        def last_matching_attempt():
+            return next((index for index in range(len(attempts) - 1, first_attempt - 1, -1)
+                         if attempts[index].operation == "BOOK_SINGLE"
+                         and attempts[index].selectors == ("token_id=" + token,)), None)
+
         try:
             read = public.get_json("clob", "/book", params={"token_id": token}, deadline=deadline)
         except MarketDataError as exc:
-            index = len(attempts) - 1 if attempts else None
+            index = last_matching_attempt()
             status = ("LATE" if not can_start() else
                       "UNAVAILABLE" if exc.code in ("transport_error", "rate_limited") else "INVALID")
             return failed(label, token, status, exc.code, index)
-        index = len(attempts) - 1
+        index = last_matching_attempt()
         return validate(label, token, read.payload, read, index, batch=False)
 
     public.on_attempt = observe
