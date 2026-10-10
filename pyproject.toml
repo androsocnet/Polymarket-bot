@@ -4,7 +4,9 @@ version = "0.1.0"
 description = "Scaffolding for a BTC 15-minute Up/Down paper-trading bot"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "httpx>=0.28.1",
+]
 
 [tool.uv]
 # Run as a simple application; no package build tools are needed yet.
