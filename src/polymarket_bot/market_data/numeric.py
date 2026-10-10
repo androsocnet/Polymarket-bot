@@ -17,7 +17,11 @@ def _invalid(field: str) -> MarketDataError:
 def parse_decimal(value: object, *, field: str) -> Decimal:
     if isinstance(value, Decimal):
         raw = str(value)
-    elif type(value) in (str, int):
+    elif type(value) is int:
+        if value.bit_length() > 426:
+            raise _invalid(field)
+        raw = str(value)
+    elif type(value) is str:
         raw = str(value)
     else:
         raise _invalid(field)
@@ -30,8 +34,10 @@ def parse_decimal(value: object, *, field: str) -> Decimal:
     if sum(c.isdigit() for c in coefficient) > 128:
         raise _invalid(field)
     exponent = match[1]
-    if exponent is not None and (len(exponent.lstrip("+-")) > 3 or abs(int(exponent)) > 128):
-        raise _invalid(field)
+    if exponent is not None:
+        significant = exponent.lstrip("+-").lstrip("0")
+        if len(significant) > 3 or int(significant or "0") > 128:
+            raise _invalid(field)
     try:
         result = Decimal(raw.strip())
         if not result.is_finite() or (result and abs(result.adjusted()) > 128):
@@ -43,6 +49,8 @@ def parse_decimal(value: object, *, field: str) -> Decimal:
 
 def parse_integer(value: object, *, field: str, minimum: int, maximum: int) -> int:
     if type(value) not in (str, int):
+        raise _invalid(field)
+    if type(value) is int and value.bit_length() > 67:
         raise _invalid(field)
     raw = str(value)
     if len(raw) > 20 or not re.fullmatch(r"-?(?:0|[1-9][0-9]*)", raw):

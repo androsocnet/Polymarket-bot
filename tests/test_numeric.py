@@ -26,6 +26,24 @@ class NumericTests(unittest.TestCase):
         self.assertEqual(numeric.parse_decimal("0.00000000000000000000000000001", field="x"),
                          Decimal("0.00000000000000000000000000001"))
 
+    def test_zero_padded_exponent_within_value_budget(self):
+        self.assertEqual(numeric.parse_decimal("1e0128", field="probe"), Decimal("1e128"))
+        self.assertEqual(numeric.parse_decimal("1e" + "0" * 250 + "128", field="probe"),
+                         Decimal("1e128"))
+        self.assertEqual(numeric.parse_decimal("1e-" + "0" * 249 + "128", field="probe"),
+                         Decimal("1e-128"))
+
+    def test_oversized_python_integer_for_decimal_helper_is_structured_error(self):
+        huge = 10 ** 5000
+        self.invalid(huge)
+
+    def test_oversized_python_integer_for_integer_helper_is_structured_error(self):
+        huge = 10 ** 5000
+        with self.assertRaises(MarketDataError) as caught:
+            numeric.parse_integer(huge, field="probe", minimum=0, maximum=2**63-1)
+        self.assertEqual(caught.exception.code, "invalid_numeric")
+        self.assertLess(len(str(caught.exception)), 100)
+
     def test_nonfinite_and_wrong_types(self):
         for value in ("NaN", "sNaN", "Infinity", True, False, 0.2, Decimal("NaN")):
             with self.subTest(value=repr(value)):
