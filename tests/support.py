@@ -41,3 +41,21 @@ class FakeClock:
         self.advance(seconds)
     def advance(self, seconds): self.value += seconds
     def utcnow(self): return NOW + timedelta(seconds=self.value)
+
+class FakeGamma:
+    def __init__(self, events=None, fast=None, refresh=None):
+        self.events = [make_event()] if events is None else events
+        self.fast = make_event() if fast is None else fast
+        self.refresh = refresh
+        self.slug_calls, self.list_calls, self.refresh_calls = [], [], []
+    def event_by_slug(self, slug, *, deadline):
+        self.slug_calls.append((slug, deadline))
+        if isinstance(self.fast, BaseException): raise self.fast
+        return self.fast
+    def list_events(self, *, end_min, end_max, offset, deadline):
+        self.list_calls.append((end_min, end_max, offset, deadline))
+        return self.events[offset:offset+100]
+    def market_by_id(self, market_id, *, deadline):
+        self.refresh_calls.append((market_id, deadline))
+        if self.refresh is not None: return self.refresh
+        return next(m for e in self.events for m in e["markets"] if m["id"] == market_id)
