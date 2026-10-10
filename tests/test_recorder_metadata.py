@@ -1,6 +1,7 @@
 """Recorder metadata uses strict discovery and preserves source evidence."""
 import json
 import unittest
+from dataclasses import replace
 from datetime import timedelta
 
 import httpx
@@ -137,6 +138,24 @@ class MetadataTests(unittest.TestCase):
         self.assertEqual(store._one("SELECT count(*) AS n FROM market_revisions")["n"], 1)
         self.assertEqual(store._one("SELECT observed_us FROM market_revisions")["observed_us"], prior.observed_us)
 
+    def test_changed_content_returning_to_prior_value_appends_revision(self):
+        first_market = make_market(description="A")
+        gamma_a, public_a, _, _, _, _, _ = self.transport(market=first_market)
+        first = acquire_market(gamma_a, public_a, clock=self.clock, deadline=120, use_fast_path=True)
+        second_market = make_market(description="B")
+        gamma_b, public_b, _, _, _, _, _ = self.transport(market=second_market)
+        second = acquire_market(gamma_b, public_b, clock=self.clock, deadline=120, use_fast_path=True)
+        store, run_id = self.database()
+        first_id = store.save_market_revision(run_id, first)
+        second_id = store.save_market_revision(run_id, second)
+        returned = replace(first, observed_us=second.observed_us + 1)
+        third_id = store.save_market_revision(run_id, returned)
+        self.assertEqual(len({first_id, second_id, third_id}), 3)
+        rows = store._rows("SELECT revision_id,observed_us,description,content_hash FROM market_revisions ORDER BY revision_id")
+        self.assertEqual([row["description"] for row in rows], ["A", "B", "A"])
+        self.assertEqual(rows[2]["observed_us"], returned.observed_us)
+        self.assertEqual(rows[2]["content_hash"], rows[0]["content_hash"])
+
     def test_refresh_conflict_does_not_rewrite_identity(self):
         market = make_market()
         gamma, public, _, _, _, _, _ = self.transport(market=market)
@@ -202,6 +221,27 @@ class MetadataTests(unittest.TestCase):
         self.assertEqual(refreshed.observed_us, prior.observed_us)
         self.assertIn("age_us=", " ".join(refreshed.warnings))
         self.assertEqual(refreshed.gamma_raw, prior.gamma_raw)
+
+    def test_clob_identity_conflict_saves_new_response_as_diagnostic(self):
+        config = {"t": [{"t": TOKEN_UP, "o": "Up"}, {"t": TOKEN_DOWN, "o": "Down"}]}
+        gamma, public, _, _, _, _, _ = self.transport(config=config)
+        prior = acquire_market(gamma, public, clock=self.clock, deadline=120, use_fast_path=True)
+        store, run_id = self.database()
+        store.save_market_revision(run_id, prior)
+        self.time.advance(61)
+        config["t"][1]["t"] = "9999"
+        conflicting_raw = json.dumps(config, separators=(",", ": ")).encode()
+        conflict = refresh_revision(prior, gamma, public, clock=self.clock, deadline=120)
+        self.assertFalse(conflict.capture_ready)
+        self.assertIn("identity_conflict", conflict.warnings)
+        self.assertEqual(conflict.clob_config_raw, conflicting_raw)
+        with self.assertRaises(RecorderStoreError):
+            store.save_market_revision(run_id, conflict)
+        row = store._one("SELECT clob_config_raw_z,raw_sizes_json FROM market_revisions ORDER BY revision_id DESC LIMIT 1")
+        self.assertEqual(decode_evidence(row["clob_config_raw_z"],
+                                         json.loads(row["raw_sizes_json"])["clob"], 1), conflicting_raw)
+        self.assertEqual(store._one("SELECT condition_id,lifecycle FROM markets")["condition_id"], CONDITION)
+        self.assertEqual(store._one("SELECT lifecycle FROM markets")["lifecycle"], "INVALIDATED")
 
     def test_failed_refresh_waits_for_next_metadata_interval(self):
         config = {"t": [{"t": TOKEN_UP, "o": "Up"}, {"t": TOKEN_DOWN, "o": "Down"}]}

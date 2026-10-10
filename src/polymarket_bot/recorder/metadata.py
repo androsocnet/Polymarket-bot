@@ -156,13 +156,22 @@ def refresh_revision(previous: MarketRevision, gamma, public, *, clock, deadline
                                    now_us, {}, previous.discovery_source)
         if _identity(candidate) != _identity(previous):
             raise MarketDataError("identity_conflict", "Pinned market identity changed.")
-        revision = _revision(parsed, previous.discovery_source, raw, public, clock, deadline)
+        public.on_attempt = observe
+        try:
+            revision = _revision(parsed, previous.discovery_source, raw, public, clock, deadline)
+        finally:
+            public.on_attempt = original_callback
         return replace(revision, capture_ready=(parsed.active and not parsed.closed and parsed.pricing_ready
                                                 and market_row.get("archived") is not True),
                        last_refresh_attempt_us=now_us)
     except MarketDataError as exc:
         if exc.code == "identity_conflict":
-            return replace(attempted, gamma_raw=raw, capture_ready=False,
+            config_path = "/clob-markets/" + previous.market.condition_id
+            config_attempts = [attempt for attempt in attempts if attempt.path == config_path
+                               and attempt.result == "success" and attempt.raw_complete]
+            config_raw = (config_attempts[-1].raw_body if config_attempts
+                          else previous.clob_config_raw)
+            return replace(attempted, gamma_raw=raw, clob_config_raw=config_raw, capture_ready=False,
                            warnings=previous.warnings + ("identity_conflict",))
         return replace(attempted, warnings=previous.warnings +
                        (f"metadata_refresh_failed:{exc.code}; age_us={now_us-previous.observed_us}",))

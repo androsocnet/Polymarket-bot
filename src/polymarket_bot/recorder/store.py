@@ -364,10 +364,10 @@ class RecorderStore:
                     "market_id", "event_id", "condition_id", "window_start_us", "window_end_us",
                     "up_token_id", "down_token_id", "up_outcome_index", "down_outcome_index")}):
                 conflict = True
-            prior = self._one("""SELECT revision_id FROM market_revisions
-                                  WHERE market_id=? AND content_hash=? ORDER BY revision_id DESC LIMIT 1""",
-                              (market.market_id, digest))
-            if prior is not None and not conflict:
+            prior = self._one("""SELECT revision_id,content_hash FROM market_revisions
+                                  WHERE market_id=? ORDER BY revision_id DESC LIMIT 1""",
+                              (market.market_id,))
+            if prior is not None and prior["content_hash"] == digest and not conflict:
                 return prior["revision_id"]
             revision_id = self._insert("market_revisions", dict(
                 market_id=market.market_id, observed_us=observed_us, run_id=run_id,
