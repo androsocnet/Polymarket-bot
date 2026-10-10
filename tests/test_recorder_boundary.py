@@ -89,6 +89,8 @@ class RecorderBoundaryTests(unittest.TestCase):
                   ("data", "/v2/resolutions", {"condition": CONDITION}))
         for options in ({"headers": {"Authorization": "Bearer secret"}},
                         {"headers": {"POLY-API-KEY": "secret"}},
+                        {"headers": {"POLY_PASSPHRASE": "sentinel"}},
+                        {"headers": {"POLY-PASSPHRASE": "sentinel"}},
                         {"auth": httpx.BasicAuth("user", "secret")}):
             with self.subTest(options=tuple(options)):
                 client, reader = self.reader(lambda request: requests.append(request) or httpx.Response(200, stream=httpx.ByteStream(b"{}")), **options)

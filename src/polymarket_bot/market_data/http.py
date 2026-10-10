@@ -108,7 +108,7 @@ class PublicGet:
                    deadline: float, params: dict[str, str | int] | None = None,
                    json_body: object = None, selectors: tuple[str, ...] = ()) -> JsonRead:
         if (self.client.auth is not None or any(
-                key.lower() in {"authorization", "cookie", "poly-api-key", "poly_api_key",
+                key.lower().replace("_", "-") in {"authorization", "cookie", "poly-api-key",
                                 "poly-signature", "poly-passphrase", "x-api-key"}
                 or "signature" in key.lower() for key in self.client.headers)):
             raise MarketDataError("transport_error", "Authenticated clients cannot make public market-data reads.")
