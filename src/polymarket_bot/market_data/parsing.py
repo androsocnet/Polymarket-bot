@@ -1,9 +1,8 @@
 """Strict normalization of Gamma's current BTC market metadata."""
-import json
 import re
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
 from .models import MarketDataError, MarketDescriptor, TokenOutcome
+from .numeric import load_numeric_json, parse_decimal, parse_integer
 
 def _invalid(message: str) -> MarketDataError:
     return MarketDataError("invalid_metadata", message)
@@ -11,6 +10,8 @@ def _invalid(message: str) -> MarketDataError:
 def _text(value: object, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise _invalid(f"Missing or invalid {field}.")
+    if field in ("event id", "market id", "event slug", "market slug") and len(value) > 256:
+        raise _invalid(f"Oversized {field}.")
     return value
 
 def _time(value: object, field: str) -> datetime:
@@ -24,11 +25,11 @@ def _time(value: object, field: str) -> datetime:
 
 def _array(value: object, field: str, code: str = "invalid_metadata") -> list:
     try:
-        parsed = json.loads(value) if isinstance(value, str) else None
+        parsed = load_numeric_json(value) if isinstance(value, str) else None
         if not isinstance(parsed, list) or len(parsed) != 2:
             raise ValueError("Expected two-entry JSON array")
         return parsed
-    except (ValueError, TypeError, RecursionError) as exc:
+    except (ValueError, TypeError, RecursionError, MarketDataError) as exc:
         raise MarketDataError(code, f"Invalid {field}: expected a two-entry JSON-encoded array.") from exc
 
 def is_btc_family(event: dict[str, object], market: dict[str, object]) -> bool:
@@ -63,9 +64,16 @@ def parse_market(event: dict[str, object], market: dict[str, object], *, now: da
         return None
     for row in (event, market):
         slug = row.get("slug", "")
+        if isinstance(slug, str) and len(slug) > 256:
+            raise _invalid("Oversized slug.")
         match = re.fullmatch(r"btc-updown-15m-(\d+)", slug) if isinstance(slug, str) else None
-        if match and (start.microsecond != 0 or int(match[1]) != int(start.timestamp())):
-            return None
+        if match:
+            try:
+                slug_time = parse_integer(match[1], field="slug timestamp", minimum=0, maximum=2**63-1)
+            except MarketDataError as exc:
+                raise _invalid("Invalid slug timestamp.") from exc
+            if start.microsecond != 0 or slug_time != int(start.timestamp()):
+                return None
     event_id = _text(event.get("id"), "event id")
     market_id = _text(market.get("id"), "market id")
     condition = _text(market.get("conditionId"), "conditionId")
@@ -79,15 +87,15 @@ def parse_market(event: dict[str, object], market: dict[str, object], *, now: da
         raise _invalid("Expected exactly one Up and one Down.")
     code = "unsupported_identifier_shape"
     tokens = _array(market.get("clobTokenIds"), "clobTokenIds", code)
-    if not all(isinstance(token, str) and re.fullmatch(r"[0-9]+", token) for token in tokens) or tokens[0] == tokens[1]:
+    if not all(isinstance(token, str) and len(token) <= 128 and re.fullmatch(r"[0-9]+", token) for token in tokens) or tokens[0] == tokens[1]:
         raise MarketDataError(code, "Expected two distinct decimal-string clobTokenIds; positionIds are metadata only.")
     warnings, prices = [], [None, None]
     try:
         raw_prices = _array(market.get("outcomePrices"), "outcomePrices")
-        prices = [Decimal(p) if isinstance(p, (str, int, Decimal)) and not isinstance(p, bool) else Decimal("NaN") for p in raw_prices]
+        prices = [parse_decimal(p, field="Gamma outcome price") for p in raw_prices]
         if any(not p.is_finite() or not 0 <= p <= 1 for p in prices):
             raise ValueError("Invalid metadata prices")
-    except (MarketDataError, InvalidOperation, ValueError):
+    except (MarketDataError, ValueError):
         prices = [None, None]
         warnings.append("Gamma outcomePrices unavailable or malformed; book pricing is unaffected.")
     mapped = {label: TokenOutcome(label.title(), token, price) for label, token, price in zip(labels, tokens, prices)}

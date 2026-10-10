@@ -87,6 +87,15 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(self.error("invalid_metadata").http_status, 200)
         self.assertTrue(stream.closed)
 
+    def test_numeric_json_and_header_bounds(self):
+        for body in (b'{"x":1e999999999999999999999999}', b'{"x":' + b'1' * 257 + b'}'):
+            with self.subTest(body=body[:30]):
+                self.handler = lambda r: httpx.Response(200, stream=httpx.ByteStream(body))
+                self.error("invalid_metadata")
+        self.handler = lambda r: httpx.Response(200, headers={"Content-Length":"9" * 5000},
+                                                 stream=httpx.ByteStream(b"{}"))
+        self.error("transport_error")
+
     def test_retry_budget_is_three_total_attempts(self):
         self.handler = lambda r: httpx.Response(503, stream=httpx.ByteStream(b""))
         self.error()

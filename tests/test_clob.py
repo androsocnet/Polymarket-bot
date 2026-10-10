@@ -23,6 +23,13 @@ class ClobTests(unittest.TestCase):
         self.error("book_identity_mismatch", asset_id=TOKEN_DOWN)
         self.error("book_identity_mismatch", market="0x"+"cd"*32)
 
+    def test_oversized_book_identifier_is_invalid_book(self):
+        token = "1" * 500
+        with self.assertRaises(MarketDataError) as caught:
+            parse_book(JsonRead(make_book(asset_id=token), 2.0, 2.1),
+                       token_id=token, condition_id=CONDITION)
+        self.assertEqual(caught.exception.code, "invalid_book")
+
     def test_empty_sides_never_use_gamma_or_half(self):
         for sides in ({"bids":[]}, {"asks":[]}, {"bids":[], "asks":[]}):
             book = self.parse(**sides)
@@ -51,6 +58,11 @@ class ClobTests(unittest.TestCase):
     def test_price_size_booleans_fail(self):
         self.error(bids=[{"price":True,"size":"1"}])
         self.error(bids=[{"price":"0.1","size":False}])
+
+    def test_extreme_exponent_is_domain_error(self):
+        for raw in ('1e1000000', '1e-1000000', '1e999999999999999999999'):
+            with self.subTest(raw=raw):
+                self.error(bids=[{'price': '0.60', 'size': raw}])
 
     def test_seconds_server_time_milliseconds_book_time(self):
         from polymarket_bot.market_data.clob import ServerClock

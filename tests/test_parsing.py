@@ -89,6 +89,9 @@ class ParsingTests(unittest.TestCase):
         self.assertIsNone(self.parse(slug=wrong))
         self.assertIsNone(parse_market(make_event(slug=wrong), make_market(), now=NOW))
 
+    def test_numeric_slug_out_of_range_is_metadata_error(self):
+        self.error("invalid_metadata", slug="btc-updown-15m-" + "9" * 40)
+
     def test_bitcoin_cash_is_not_btc_even_with_renamed_series(self):
         for series in ("bch-up-or-down-15m","renamed-family","btc-up-or-down-15m"):
             with self.subTest(series=series):

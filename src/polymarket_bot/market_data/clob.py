@@ -1,10 +1,11 @@
 """Public CLOB reads, explicit timestamp units, and book-derived quotes."""
 import re
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, DecimalException
 from typing import Callable
 from .http import JsonRead, PublicGet
 from .models import BookLevel, OutcomeBook, MarketDataError
+from .numeric import exact_decimal_context, parse_decimal
 
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
@@ -18,7 +19,7 @@ class ClobClient:
             raise MarketDataError("time_unavailable", f"CLOB server time failed: {exc.code}: {exc}",
                                   http_status=exc.http_status) from exc
     def get_book(self, token_id: str, *, deadline: float) -> JsonRead:
-        if not isinstance(token_id, str) or not re.fullmatch(r"[0-9]+", token_id):
+        if not isinstance(token_id, str) or len(token_id) > 128 or not re.fullmatch(r"[0-9]+", token_id):
             raise MarketDataError("unsupported_identifier_shape", "Invalid CLOB token_id.")
         try:
             return self.get.get_json("clob", "/book", params={"token_id":token_id}, deadline=deadline)
@@ -46,6 +47,8 @@ def parse_book(read: JsonRead, *, token_id: str, condition_id: str) -> OutcomeBo
     data = read.payload
     if not isinstance(data, dict):
         raise MarketDataError("invalid_book", "Expected a CLOB book object.")
+    if not isinstance(token_id, str) or len(token_id) > 128 or not re.fullmatch(r"[0-9]+", token_id):
+        raise MarketDataError("invalid_book", "Invalid CLOB book token identifier.")
     if data.get("asset_id") != token_id or data.get("market") != condition_id:
         raise MarketDataError("book_identity_mismatch", "CLOB book token/condition does not match Gamma.")
     try:
@@ -65,7 +68,8 @@ def parse_book(read: JsonRead, *, token_id: str, condition_id: str) -> OutcomeBo
                 values = [row.get("price"), row.get("size")]
                 if any(isinstance(v, bool) or not isinstance(v, (str, int, Decimal)) for v in values):
                     raise ValueError("Invalid Decimal shape")
-                price, size = map(Decimal, values)
+                price, size = (parse_decimal(values[0], field="book price"),
+                               parse_decimal(values[1], field="book size"))
                 if not price.is_finite() or not size.is_finite() or not 0 <= price <= 1 or size < 0:
                     raise ValueError("Invalid price or size")
                 result.append(BookLevel(price, size))
@@ -76,9 +80,10 @@ def parse_book(read: JsonRead, *, token_id: str, condition_id: str) -> OutcomeBo
         if bid is not None and ask is not None and bid > ask:
             raise ValueError("Crossed book")
         both = bid is not None and ask is not None
-        return OutcomeBook(token_id, condition_id, raw, source, bids, asks, bid, ask,
-                           (bid+ask)/Decimal(2) if both else None, ask-bid if both else None,
-                           sum((row.size for row in bids if row.price == bid and row.size > 0), Decimal(0)) if bid is not None else None,
-                           sum((row.size for row in asks if row.price == ask and row.size > 0), Decimal(0)) if ask is not None else None)
-    except (ValueError, TypeError, OverflowError, InvalidOperation) as exc:
-        raise MarketDataError("invalid_book", f"Invalid CLOB book: {exc}.") from exc
+        with exact_decimal_context():
+            return OutcomeBook(token_id, condition_id, raw, source, bids, asks, bid, ask,
+                               (bid+ask)/Decimal(2) if both else None, ask-bid if both else None,
+                               sum((row.size for row in bids if row.price == bid and row.size > 0), Decimal(0)) if bid is not None else None,
+                               sum((row.size for row in asks if row.price == ask and row.size > 0), Decimal(0)) if ask is not None else None)
+    except (ValueError, TypeError, OverflowError, DecimalException, MarketDataError) as exc:
+        raise MarketDataError("invalid_book", "Invalid CLOB book numeric or level evidence.") from exc

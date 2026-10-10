@@ -1,13 +1,12 @@
 """Fixed public GET surface; no generic HTTP client."""
 import re
-import json
 from dataclasses import dataclass
 from typing import Callable, Literal
 from datetime import datetime
-from decimal import Decimal
 from email.utils import parsedate_to_datetime
 import httpx
 from .models import MarketDataError
+from .numeric import load_numeric_json
 
 @dataclass(frozen=True)
 class JsonRead:
@@ -51,8 +50,11 @@ class PublicGet:
                             raise MarketDataError("transport_error", "Unexpected encoded response; identity encoding required.")
                         cap = 10 * 1024 * 1024
                         length = response.headers.get("Content-Length")
-                        if length and length.isdecimal() and int(length) > cap:
-                            raise MarketDataError("transport_error", "Response exceeds 10 MiB.")
+                        if length is not None:
+                            if len(length) > 20 or not length.isascii() or not length.isdecimal():
+                                raise MarketDataError("transport_error", "Invalid Content-Length header.")
+                            if int(length) > cap:
+                                raise MarketDataError("transport_error", "Response exceeds 10 MiB.")
                         body = bytearray()
                         for chunk in response.iter_raw():
                             self._remaining(deadline)
@@ -62,8 +64,8 @@ class PublicGet:
                             self._remaining(deadline)
                         self._remaining(deadline)
                         try:
-                            payload = json.loads(body, parse_float=Decimal)
-                        except (ValueError, UnicodeError, RecursionError) as exc:
+                            payload = load_numeric_json(body)
+                        except MarketDataError as exc:
                             raise MarketDataError("invalid_metadata", f"Invalid JSON from {source} GET {path}.",
                                                   http_status=status) from exc
                         self._remaining(deadline)
