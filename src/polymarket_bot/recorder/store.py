@@ -5,6 +5,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from decimal import Decimal, DecimalException
 import json
+from hashlib import sha256
 from pathlib import Path
 import re
 import sqlite3
@@ -14,7 +15,8 @@ from uuid import uuid4
 from polymarket_bot.market_data.models import MarketDataError
 from polymarket_bot.market_data.numeric import decimal_text, exact_decimal_context
 from .models import (CHAINLINK_FEED_ID, CHAINLINK_FEED_NAME, ClockAnchor, RunConfig,
-                     SlotCommit, SlotTarget)
+                     MarketRevision, SlotCommit, SlotTarget)
+from .metadata import _selected_market
 
 
 MAX_EVIDENCE_BYTES = 10 * 1024 * 1024
@@ -308,6 +310,116 @@ class RecorderStore:
                 anchor_mono_ns=anchor.midpoint_ns, anchor_server_us=anchor.server_us,
                 uncertainty_us=anchor.uncertainty_us, status=anchor.status,
                 diagnostic_json=_json(anchor.diagnostic) if anchor.diagnostic else None))
+
+    def save_market_revision(self, run_id: str, revision: MarketRevision) -> int:
+        """Keep market identity immutable and append only changed raw metadata."""
+        _require(isinstance(revision, MarketRevision), "Market revision is required.")
+        market = revision.market
+        _require(revision.up_index in (0, 1) and revision.down_index in (0, 1)
+                 and revision.up_index != revision.down_index,
+                 "Original outcome indices must be distinct.")
+        observed_us = revision.observed_us
+        _integer(observed_us, "observed_us")
+        start_us, end_us = _epoch_us(market.window_start), _epoch_us(market.window_end)
+        _require(end_us - start_us == 900_000_000,
+                 "Market window must be exactly 900 seconds.")
+        gamma_z, gamma_size, codec = encode_evidence(revision.gamma_raw)
+        clob_z = None
+        clob_size = None
+        if revision.clob_config_raw is not None:
+            clob_z, clob_size, _ = encode_evidence(revision.clob_config_raw)
+        raw_sizes = {"gamma": gamma_size, "clob": clob_size}
+        # Discovery can select an event envelope and refresh a market detail.
+        # Compare the selected market content, while retaining each actual raw body.
+        conflict = "identity_conflict" in revision.warnings
+        try:
+            selected = _selected_market(revision.gamma_raw, market.market_id)
+            canonical = json.dumps(selected, sort_keys=True, separators=(",", ":"), default=str).encode()
+        except MarketDataError:
+            if not conflict:
+                raise
+            canonical = revision.gamma_raw
+        digest = sha256(canonical + b"\x00" + (revision.clob_config_raw or b"")).hexdigest()
+        config = json.loads(revision.clob_config_raw.decode("utf-8"), parse_float=str) if revision.clob_config_raw else {}
+        _require(isinstance(config, dict), "CLOB config evidence must be an object.")
+        identity = dict(market_id=market.market_id, event_id=market.event_id,
+                        condition_id=market.condition_id, slug=market.slug,
+                        question=market.question, window_start_us=start_us,
+                        window_end_us=end_us, up_token_id=market.up.token_id,
+                        down_token_id=market.down.token_id,
+                        up_outcome_index=revision.up_index,
+                        down_outcome_index=revision.down_index)
+        with self._transaction():
+            self._run(run_id)
+            existing = self._one("SELECT * FROM markets WHERE market_id=?", (market.market_id,))
+            if existing is None:
+                _require(not conflict, "Cannot first acquire a conflicting market revision.")
+                self._insert("markets", dict(identity, first_seen_us=observed_us,
+                                             lifecycle="CURRENT", resolution_state="PENDING",
+                                             resolution_attempts=0))
+            else:
+                _require(existing["lifecycle"] != "INVALIDATED",
+                         "Invalidated market cannot resume metadata capture.")
+            if existing is not None and not self._equal(existing, {key: identity[key] for key in (
+                    "market_id", "event_id", "condition_id", "window_start_us", "window_end_us",
+                    "up_token_id", "down_token_id", "up_outcome_index", "down_outcome_index")}):
+                conflict = True
+            prior = self._one("""SELECT revision_id FROM market_revisions
+                                  WHERE market_id=? AND content_hash=? ORDER BY revision_id DESC LIMIT 1""",
+                              (market.market_id, digest))
+            if prior is not None and not conflict:
+                return prior["revision_id"]
+            revision_id = self._insert("market_revisions", dict(
+                market_id=market.market_id, observed_us=observed_us, run_id=run_id,
+                description=revision.description, resolution_source_url=revision.resolution_source_url,
+                active=int(market.active), closed=int(market.closed),
+                accepting_orders=None if market.accepting_orders is None else int(market.accepting_orders),
+                enable_order_book=None if market.enable_order_book is None else int(market.enable_order_book),
+                fee_config_json=_json({key: config[key] for key in ("mbf", "tbf", "fd") if key in config}),
+                tick_size_text=str(config["mts"]) if "mts" in config else None,
+                min_order_size_text=str(config["mos"]) if "mos" in config else None,
+                delay_config_json=_json({key: config[key] for key in ("oas", "itode", "ibce") if key in config}),
+                gamma_raw_z=gamma_z, clob_config_raw_z=clob_z,
+                raw_sizes_json=_json(raw_sizes), codec_version=codec, content_hash=digest))
+            if conflict:
+                self._connection.execute("UPDATE markets SET lifecycle='INVALIDATED' WHERE market_id=?",
+                                         (market.market_id,))
+        if conflict:
+            raise RecorderStoreError("identity_conflict", "Market identity changed; capture is invalidated.")
+        return revision_id
+
+    def expire_market(self, market_id: str, *, observed_us: int) -> None:
+        """Queue resolution at the window end independently of open flags."""
+        _integer(observed_us, "observed_us")
+        with self._transaction():
+            market = self._one("SELECT * FROM markets WHERE market_id=?", (market_id,))
+            _require(market is not None, "Cannot expire an unknown market.")
+            _require(observed_us >= market["window_end_us"], "Market has not expired.")
+            if market["lifecycle"] == "CURRENT":
+                self._connection.execute("""UPDATE markets SET lifecycle='EXPIRED',
+                    resolution_next_due_us=? WHERE market_id=?""",
+                    (market["window_end_us"], market_id))
+            elif market["lifecycle"] == "INVALIDATED" and market["resolution_next_due_us"] is None:
+                self._connection.execute("""UPDATE markets SET resolution_next_due_us=?
+                    WHERE market_id=?""", (market["window_end_us"], market_id))
+
+    def record_event(self, run_id: str, *, market_id: str | None, kind: str,
+                     started_us: int, ended_us: int | None, detail: dict) -> int:
+        _integer(started_us, "started_us")
+        if ended_us is not None:
+            _integer(ended_us, "ended_us")
+            _require(ended_us >= started_us, "Recorder event end precedes its start.")
+        _require(kind in ("STARTUP", "SHUTDOWN", "RESTART", "DISCOVERY_GAP",
+                          "CLOCK_PAUSE", "IDENTITY_CONFLICT", "STORAGE_FAILURE")
+                 and type(detail) is dict, "Invalid recorder event.")
+        with self._transaction():
+            self._run(run_id)
+            if market_id is not None:
+                _require(self._one("SELECT market_id FROM markets WHERE market_id=?", (market_id,)) is not None,
+                         "Recorder event market is unknown.")
+            return self._insert("recorder_events", dict(
+                run_id=run_id, market_id=market_id, kind=kind,
+                started_us=started_us, ended_us=ended_us, detail_json=_json(detail)))
 
     def reserve_slot(self, market_id: str, target: SlotTarget, *, run_id: str,
                      anchor_id: int, metadata_revision_id: int, started_mono_ns: int,

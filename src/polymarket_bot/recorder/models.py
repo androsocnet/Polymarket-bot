@@ -2,10 +2,27 @@
 from dataclasses import dataclass, field
 
 from polymarket_bot.market_data.http import HttpAttempt
-from polymarket_bot.market_data.models import OutcomeBook
+from polymarket_bot.market_data.models import MarketDescriptor, OutcomeBook
 
 CHAINLINK_FEED_ID = "0x0002ee6757e8822c00d273bc340fc24c9cafe123a4ff2ea1dbdb31944bc7d95f"
 CHAINLINK_FEED_NAME = "BTC/USD-Streams-TWAP-60s-mainnet-production"
+
+
+@dataclass(frozen=True)
+class MarketRevision:
+    market: MarketDescriptor
+    up_index: int
+    down_index: int
+    description: str
+    resolution_source_url: str
+    gamma_raw: bytes
+    clob_config_raw: bytes | None
+    observed_us: int
+    config: dict
+    discovery_source: str = ""
+    warnings: tuple[str, ...] = field(default_factory=tuple)
+    capture_ready: bool = True
+    last_refresh_attempt_us: int | None = None
 
 
 @dataclass(frozen=True)
