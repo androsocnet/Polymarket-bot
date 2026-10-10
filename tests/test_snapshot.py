@@ -102,3 +102,9 @@ class SnapshotTests(unittest.TestCase):
                 if clob.time_calls: self.clock.advance(121)
                 return super().get_time(deadline=deadline)
         self.error(FakeGamma(),SlowFinal(self.clock),"transport_error")
+
+    def test_collection_interval_preserves_monotonic_elapsed(self):
+        result = self.collect(FakeGamma(),FakeClob(self.clock))
+        elapsed = (result.collection_finished_at-result.collection_started_at).total_seconds()
+        self.assertAlmostEqual(elapsed,0.4)
+        self.assertGreaterEqual(result.collection_finished_at,result.down.request_finished_at)

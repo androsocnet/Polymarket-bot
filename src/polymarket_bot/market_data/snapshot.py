@@ -1,3 +1,4 @@
+from datetime import timedelta
 from typing import Callable
 from .gamma import GammaClient
 from .clob import ClobClient, ServerClock, parse_book
@@ -37,5 +38,6 @@ def collect_snapshot(gamma: GammaClient, clob: ClobClient, *, monotonic: Callabl
             raise MarketDataError("transport_error","120-second run deadline exhausted; no late snapshot.")
         if market.window_start <= validated < market.window_end:
             return MarketSnapshot(market,source,observations[0],observations[1],collection_start,
-                                  final.now(),validated,final.round_trip_seconds,bool(attempt))
+                                  collection_start+timedelta(seconds=monotonic()-started),
+                                  validated,final.round_trip_seconds,bool(attempt))
     raise MarketDataError("rollover_exhausted","Market rolled over twice; no snapshot published.")
