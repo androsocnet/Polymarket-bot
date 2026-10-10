@@ -117,6 +117,28 @@ class RecorderStore:
         self._lock_file = lock_file
         self._connection = connection
         self._write_failed = False
+        self._read_only = False
+        self._closed = False
+
+    @classmethod
+    def read_only(cls, path: Path) -> "RecorderStore":
+        """Open existing evidence without initialization or writer ownership."""
+        canonical = Path(os.path.normcase(str(Path(path).resolve())))
+        connection = None
+        try:
+            connection = sqlite3.connect(canonical.as_uri() + "?mode=ro", uri=True, timeout=0)
+            connection.execute("PRAGMA query_only=ON")
+            script = Path(__file__).with_name("schema.sql").read_text(encoding="utf-8")
+            cls._verify_existing(connection, script)
+            store = cls(canonical, None, connection)
+            store._read_only = True
+            return store
+        except (OSError, sqlite3.DatabaseError, RecorderStoreError) as exc:
+            if connection is not None:
+                connection.close()
+            if isinstance(exc, RecorderStoreError):
+                raise
+            raise RecorderStoreError("storage_failure", "Cannot read existing recorder database.") from exc
 
     @classmethod
     def open(cls, path: Path) -> "RecorderStore":
@@ -184,12 +206,14 @@ class RecorderStore:
             raise RecorderStoreError("database_integrity", "Recorder database foreign-key integrity check failed.")
 
     def close(self) -> None:
-        if self._lock_file is None:
+        if self._closed:
             return
         # Failed connection closure (for example a wrong thread) retains ownership.
         self._connection.close()
-        self._lock_file.close()
+        if self._lock_file is not None:
+            self._lock_file.close()
         self._lock_file = None
+        self._closed = True
 
     @contextmanager
     def _transaction(self):
@@ -207,12 +231,16 @@ class RecorderStore:
             raise
 
     def _check_writer(self) -> None:
+        if self._read_only:
+            raise RecorderStoreError("read_only", "Measurement reader cannot mutate evidence.")
         if self._write_failed:
             raise RecorderStoreError("storage_failure", "Writer stopped after a storage failure.")
         _require(self._lock_file is not None, "Recorder writer is closed.")
 
     def _rows(self, sql: str, params=()) -> list[dict]:
-        self._check_writer()
+        if not self._read_only:
+            self._check_writer()
+        _require(not self._closed, "Recorder reader is closed.")
         try:
             cursor = self._connection.execute(sql, params)
             keys = [column[0] for column in cursor.description]
@@ -222,11 +250,35 @@ class RecorderStore:
             raise RecorderStoreError("storage_failure", "Cannot read recorder transaction state.") from exc
 
     def _insert(self, table: str, values: dict) -> int:
+        self._check_writer()
         columns = ",".join(values)
         placeholders = ",".join("?" for _ in values)
         cursor = self._connection.execute(f"INSERT INTO {table} ({columns}) VALUES ({placeholders})",
                                           tuple(values.values()))
         return cursor.lastrowid
+
+    def save_checkpoint(self, *, run_id: str, wall_us: int, values: dict) -> int:
+        """Persist one pre-transaction physical/counter observation."""
+        self._check_writer()
+        _require(not self._connection.in_transaction, "Checkpoint requires a transaction gap.")
+        _integer(wall_us, "checkpoint wall")
+        with self._transaction():
+            self._run(run_id, running=False)
+            return self._insert("storage_checkpoints", dict(values, run_id=run_id, observed_wall_us=wall_us))
+
+    def update_checkpoint_physical(self, checkpoint_id: int, values: dict) -> None:
+        """Include the checkpoint row's own committed page overhead."""
+        self._check_writer()
+        _require(not self._connection.in_transaction, "Checkpoint readings must be outside a transaction.")
+        names = ("db_file_bytes","page_size","page_count","freelist_count","journal_bytes")
+        _require(set(values)==set(names), "Checkpoint physical fields are fixed.")
+        for name in names:
+            _integer(values[name],name,minimum=0)
+        with self._transaction():
+            cursor = self._connection.execute("UPDATE storage_checkpoints SET " +
+                ",".join(name+"=?" for name in names)+" WHERE checkpoint_id=?",
+                tuple(values[name] for name in names)+(checkpoint_id,))
+            _require(cursor.rowcount==1, "Checkpoint is unknown.")
 
     def _one(self, sql: str, params=()) -> dict | None:
         rows = self._rows(sql, params)
@@ -314,6 +366,7 @@ class RecorderStore:
 
     def save_market_revision(self, run_id: str, revision: MarketRevision) -> int:
         """Keep market identity immutable and append only changed raw metadata."""
+        self._check_writer()
         _require(isinstance(revision, MarketRevision), "Market revision is required.")
         market = revision.market
         _require(revision.up_index in (0, 1) and revision.down_index in (0, 1)
@@ -421,6 +474,7 @@ class RecorderStore:
     def save_resolutions(self, observations: tuple[ResolutionObservation, ...], *,
                          requests: tuple) -> None:
         """Append one batch's attempts and all condition-grain results atomically."""
+        self._check_writer()
         _require(type(observations) is tuple and bool(observations)
                  and len(observations) <= 20 and type(requests) is tuple and bool(requests),
                  "Resolution batch requires observations and actual request evidence.")
@@ -750,6 +804,7 @@ class RecorderStore:
         self._append_reference_association(values)
 
     def _append_reference_association(self, values: dict) -> None:
+        self._check_writer()
         existing = self._one("SELECT * FROM reference_associations WHERE market_id=? AND role=? "
                              "AND slot_id IS ? AND learned_wall_us=?",
                              (values["market_id"], values["role"], values["slot_id"], values["learned_wall_us"]))
@@ -761,6 +816,7 @@ class RecorderStore:
     def record_event(self, run_id: str, kind: str, *, market_id: str | None = None,
                      started_us: int, ended_us: int | None = None,
                      detail: dict | None = None) -> int:
+        self._check_writer()
         detail = {} if detail is None else detail
         _integer(started_us, "started_us")
         if ended_us is not None:
@@ -1057,6 +1113,7 @@ class RecorderStore:
 
     def save_control_attempts(self, run_id: str, attempts: tuple) -> None:
         """Persist buffered calibration/discovery/metadata attempts after I/O."""
+        self._check_writer()
         prepared = []
         for attempt in attempts:
             _require(attempt.method == "GET" and attempt.operation in (
@@ -1085,6 +1142,7 @@ class RecorderStore:
     def recover_interrupted(self, *, wall_us: int, run_id: str | None = None,
                             finish_runs: bool = True, reason: str = "RESTART_RECOVERY") -> None:
         """Finalize old reservations without projecting across monotonic epochs."""
+        self._check_writer()
         _integer(wall_us, "recovery_wall_us")
         with self._transaction():
             slots = self._rows("SELECT * FROM sample_slots WHERE status='IN_PROGRESS'"

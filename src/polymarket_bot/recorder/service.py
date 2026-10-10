@@ -9,6 +9,7 @@ from polymarket_bot.market_data.http import PublicGet
 from .books import collect_books
 from .clock import RecorderClock
 from .metadata import acquire_market, refresh_revision
+from .metrics import take_checkpoint
 from .models import RunConfig, RunResult, SlotCommit
 from .reference import disabled_reference
 from .resolution import reconcile_due
@@ -90,6 +91,9 @@ class Recorder:
         deadline_ns = target_ns - 1_000_000
         if self.monotonic_ns() >= deadline_ns:
             return
+        self._checkpoint_due(target_ns)
+        if self.monotonic_ns() >= deadline_ns:
+            return
         if before_boundary or self.monotonic_ns() >= self.next_clock_ns:
             if not self._calibrate(deadline_ns / 1_000_000_000) and not self.clock.usable():
                 return
@@ -133,6 +137,20 @@ class Recorder:
         if self.monotonic_ns() >= deadline_ns:
             return
         self._reconcile(deadline_ns)
+
+    def _checkpoint_due(self, target_ns=None):
+        """Admit hourly work only in a transaction gap with armed-target budget.
+
+        Actual storage overhead remains observable. The caller rechecks time
+        afterward, so a slow checkpoint cannot cause burst catch-up captures.
+        """
+        now_ns = self.monotonic_ns()
+        if now_ns < self.next_checkpoint_ns:
+            return
+        if target_ns is not None and now_ns >= target_ns-1_000_000:
+            return
+        take_checkpoint(self.store,run_id=self.run_id,wall_us=self.wall_us())
+        self.next_checkpoint_ns = self.monotonic_ns()+3_600_000_000_000
 
     def _save_revision(self, candidate):
         try:
@@ -237,6 +255,7 @@ class Recorder:
         self.store.record_event(self.run_id, "SHUTDOWN", started_us=self.wall_us(),
                                 detail={"reason": reason})
         self.store.finish_run(self.run_id, state=state, wall_us=self.wall_us(), reason=reason)
+        take_checkpoint(self.store,run_id=self.run_id,wall_us=self.wall_us())
 
     def _record(self, config, *, should_stop):
         self.config = config
@@ -246,6 +265,8 @@ class Recorder:
         self.store.recover_interrupted(wall_us=self.wall_us())
         self.public.max_attempts = min(self.public.max_attempts, config.max_attempts)
         self.run_id = self.store.start_run(config, wall_us=self.wall_us(), app_revision=config.policy_revision)
+        take_checkpoint(self.store,run_id=self.run_id,wall_us=self.wall_us())
+        self.next_checkpoint_ns = self.monotonic_ns()+3_600_000_000_000
         self.store.record_event(self.run_id, "STARTUP", started_us=self.wall_us())
         if previous_wall_us is not None:
             self.store.record_event(self.run_id, "RESTART", started_us=previous_wall_us,
@@ -261,6 +282,8 @@ class Recorder:
         self.clock_recovery_needed = False
         unknown_gap_recorded = False
         while not should_stop():
+            if self.revision is None or not self.clock.usable():
+                self._checkpoint_due()
             if not self.clock.usable():
                 self.miss_reason = "CLOCK_PAUSE" if self.clock.anchor else "BEFORE_START"
                 if self.monotonic_ns() < self.next_clock_ns:

@@ -13,6 +13,70 @@ from polymarket_bot.recorder.store import RecorderStore, RecorderStoreError
 
 
 class RecorderServiceTests(unittest.TestCase):
+    def test_checkpoint_baseline_precedes_capture_and_shutdown_precedes_close(self):
+        fixture = self.fixture()
+        def before_capture(request,payload,f):
+            if request.url.path=="/books":
+                self.assertEqual(f.store._connection.execute("SELECT COUNT(*) FROM storage_checkpoints").fetchone()[0],1)
+        fixture.hook = before_capture
+        result = self.run_recorder(fixture,pairs=1)
+        self.assertEqual(result.exit_code,0)
+        checkpoints = fixture.rows("SELECT * FROM storage_checkpoints ORDER BY checkpoint_id")
+        self.assertEqual(len(checkpoints),2)
+        self.assertEqual([row["committed_slot_count"] for row in checkpoints],[0,152])
+        self.assertEqual(checkpoints[-1]["db_file_bytes"],fixture.db.path.stat().st_size)
+
+    def test_hourly_checkpoint_overhead_cannot_burst_or_change_cadence(self):
+        fixture = self.fixture()
+        def long_gap(request,payload,f):
+            if request.url.path=="/books" and f.book_count==1:
+                f.advance(3601)
+        fixture.hook = long_gap
+        from polymarket_bot.recorder import service
+        self.assertTrue(hasattr(service,"take_checkpoint"),"Coordinator checkpoint integration is missing")
+        real_checkpoint = service.take_checkpoint
+        observed = []
+        def slow_checkpoint(store,*,run_id,wall_us):
+            self.assertFalse(store._connection.in_transaction)
+            real_checkpoint(store,run_id=run_id,wall_us=wall_us)
+            observed.append(fixture.monotonic_ns())
+            if len(observed)==2:
+                fixture.advance(3)
+        with patch.object(service,"take_checkpoint",side_effect=slow_checkpoint):
+            result = self.run_recorder(fixture,pairs=3)
+        self.assertEqual(result.exit_code,0)
+        checkpoints = fixture.rows("SELECT * FROM storage_checkpoints ORDER BY checkpoint_id")
+        self.assertEqual(len(checkpoints),3)
+        self.assertGreaterEqual(checkpoints[1]["observed_wall_us"]-checkpoints[0]["observed_wall_us"],3_600_000_000)
+        books = [row[2] for row in fixture.requests if row[1]=="/books"]
+        self.assertTrue(all(b-a>=2_000_000_000 for a,b in zip(books,books[1:])))
+        config = json.loads(fixture.rows("SELECT config_json FROM recording_runs")[0]["config_json"])
+        self.assertEqual(config["cadence_us"],2_000_000)
+
+    def test_checkpoint_deferred_when_armed_target_has_no_budget(self):
+        fixture = self.fixture()
+        from polymarket_bot.recorder.service import Recorder
+        recorder = Recorder(fixture.store,fixture.public,monotonic_ns=fixture.monotonic_ns,
+                            wall_us=fixture.wall_us,sleep=fixture.sleep)
+        self.assertTrue(hasattr(recorder,"_checkpoint_due"),"Budget-aware checkpoint scheduling is missing")
+        recorder.run_id = fixture.store.start_run(RunConfig(),wall_us=fixture.wall_us(),app_revision="fixture")
+        recorder.next_checkpoint_ns = fixture.monotonic_ns()
+        recorder._checkpoint_due(fixture.monotonic_ns()+500_000)
+        self.assertEqual(len(fixture.rows("SELECT * FROM storage_checkpoints")),0)
+        recorder._checkpoint_due(fixture.monotonic_ns()+2_000_000_000)
+        self.assertEqual(len(fixture.rows("SELECT * FROM storage_checkpoints")),1)
+
+    def test_restart_keeps_each_run_startup_baseline(self):
+        fixture = self.fixture()
+        self.run_recorder(fixture,pairs=1)
+        fixture.store = RecorderStore.open(fixture.db.path)
+        fixture.advance(4)
+        result = self.run_recorder(fixture,pairs=2)
+        self.assertEqual(result.exit_code,0)
+        rows = fixture.rows("SELECT run_id,COUNT(*) n,MIN(observed_wall_us) first FROM storage_checkpoints GROUP BY run_id")
+        self.assertEqual(len(rows),2)
+        self.assertTrue(all(row["n"]==2 for row in rows))
+
     def fixture(self, **kwargs):
         fixture = RecorderFixture(**kwargs)
         self.addCleanup(fixture.close)
