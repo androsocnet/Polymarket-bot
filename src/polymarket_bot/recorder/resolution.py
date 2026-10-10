@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 from dataclasses import replace
 from decimal import Decimal
 import json
+from typing import Callable
 
 from polymarket_bot.market_data.models import MarketDataError
 from polymarket_bot.market_data.numeric import parse_decimal
@@ -124,7 +125,7 @@ def _revision_from_row(row: dict) -> MarketRevision:
 
 
 def reconcile_due(public: PublicGet, store: RecorderStore, *, now_us: int,
-                  deadline: float) -> int:
+                  deadline: float, receipt_server_us: Callable[[int], int] | None = None) -> int:
     """Poll at most twenty persisted due conditions through the fixed public route."""
     due = store.due_resolutions(now_us)
     if not due:
@@ -158,6 +159,8 @@ def reconcile_due(public: PublicGet, store: RecorderStore, *, now_us: int,
         else:
             error_code = "invalid_resolution_envelope"
     learned_wall_us = attempts[-1].ended_wall_us
+    learned_server_us = (receipt_server_us(attempts[-1].ended_mono_ns)
+                         if receipt_server_us is not None else None)
     unrequested = rows is not None and any(
         type(row) is not dict or row.get("condition_id") not in conditions for row in rows)
     observations = []
@@ -185,6 +188,6 @@ def reconcile_due(public: PublicGet, store: RecorderStore, *, now_us: int,
                 if unrequested:
                     observation = replace(observation, provenance=observation.provenance |
                                           {"batch_diagnostic": "unrequested_condition"})
-        observations.append(observation)
+        observations.append(replace(observation, learned_server_us=learned_server_us))
     store.save_resolutions(tuple(observations), requests=tuple(attempts))
     return len(observations)

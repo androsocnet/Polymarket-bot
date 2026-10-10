@@ -1,6 +1,5 @@
 """Single-owner, fixed-cadence recorder coordinator."""
 from datetime import datetime, timedelta, timezone
-from dataclasses import replace
 import sqlite3
 from typing import Callable
 
@@ -61,7 +60,7 @@ class Recorder:
             self.next_clock_ns = self.monotonic_ns() + (60_000_000_000 if self.clock.usable() else 2_000_000_000)
             if not self.clock.usable():
                 self.store.record_event(self.run_id, "CLOCK_PAUSE", started_us=self.wall_us(),
-                                        detail={"reason": exc.code})
+                                        detail={"reason": exc.code, "time_domain": "LOCAL_WALL"})
             return False
         self.anchor_id = self.store.save_anchor(self.run_id, anchor)
         self.next_clock_ns = anchor.midpoint_ns + 60_000_000_000
@@ -75,6 +74,17 @@ class Recorder:
             return False
         return True
 
+    def _clock_ready_after_io(self, reason):
+        if self.clock.usable():
+            return True
+        self.miss_reason = "CLOCK_PAUSE"
+        self.clock_recovery_needed = True
+        self.revision = None
+        self.next_clock_ns = self.monotonic_ns()
+        self.store.record_event(self.run_id, "CLOCK_PAUSE", started_us=self.wall_us(),
+                                detail={"reason": reason, "time_domain": "LOCAL_WALL"})
+        return False
+
     def _housekeeping(self, target_ns, *, before_boundary=False):
         """Serial logical jobs share the writer and stop at the armed target."""
         deadline_ns = target_ns - 1_000_000
@@ -83,7 +93,10 @@ class Recorder:
         if before_boundary or self.monotonic_ns() >= self.next_clock_ns:
             if not self._calibrate(deadline_ns / 1_000_000_000) and not self.clock.usable():
                 return
-        if self.revision is None or self.monotonic_ns() >= deadline_ns:
+        if self.monotonic_ns() >= deadline_ns:
+            return
+        if self.revision is None:
+            self._reconcile(deadline_ns)
             return
         if self.revalidate:
             try:
@@ -91,30 +104,27 @@ class Recorder:
                     clock=self.clock, deadline=deadline_ns / 1_000_000_000,
                     use_fast_path=self.config.use_fast_path))
             except MarketDataError as exc:
+                if not self._clock_ready_after_io("ANCHOR_EXPIRED_DURING_REVALIDATION"):
+                    return
                 self.store.record_event(self.run_id, "DISCOVERY_GAP", started_us=self._now(),
                                         detail={"reason": exc.code, "revalidation": True})
+                self._reconcile(deadline_ns)
                 return
-            if candidate.market.market_id not in self.invalidated:
-                self.revision = candidate
-                self.revision_id = self.store.save_market_revision(self.run_id, candidate)
+            if not self._clock_ready_after_io("ANCHOR_EXPIRED_DURING_REVALIDATION"):
+                return
+            if not self._save_revision(candidate):
+                return
             self.revalidate = False
         if self.monotonic_ns() >= deadline_ns:
             return
         previous = self.revision
         last = previous.last_refresh_attempt_us or previous.observed_us
         if previous.market.market_id not in self.invalidated and self._now() >= last + 60_000_000:
-            self.revision = self._control(lambda: refresh_revision(previous, self.gamma, self.public,
+            candidate = self._control(lambda: refresh_revision(previous, self.gamma, self.public,
                 clock=self.clock, deadline=deadline_ns / 1_000_000_000))
-            try:
-                self.revision_id = self.store.save_market_revision(self.run_id, self.revision)
-            except RecorderStoreError as exc:
-                if exc.code != "identity_conflict":
-                    raise
-                self.invalidated.add(previous.market.market_id)
-                self.revalidate = True
-                self.next_clock_ns = self.monotonic_ns()
-                self.store.record_event(self.run_id, "IDENTITY_CONFLICT", started_us=self._now(),
-                    market_id=previous.market.market_id, detail={"capture_paused": True})
+            if not self._clock_ready_after_io("ANCHOR_EXPIRED_DURING_METADATA"):
+                return
+            if not self._save_revision(candidate):
                 return
             warnings = self.revision.warnings
             if any(warning.startswith("metadata_refresh_failed") for warning in warnings):
@@ -122,13 +132,44 @@ class Recorder:
                     market_id=previous.market.market_id, detail={"warnings": warnings})
         if self.monotonic_ns() >= deadline_ns:
             return
+        self._reconcile(deadline_ns)
+
+    def _save_revision(self, candidate):
+        try:
+            revision_id = self.store.save_market_revision(self.run_id, candidate)
+        except RecorderStoreError as exc:
+            if exc.code != "identity_conflict":
+                raise
+            market_id = candidate.market.market_id
+            first_conflict = market_id not in self.invalidated
+            self.invalidated.add(market_id)
+            self.revision, self.revision_id = self.store.paused_revision(market_id)
+            self.revalidate = first_conflict
+            if first_conflict:
+                self.next_clock_ns = self.monotonic_ns()
+            server_time_available = self.clock.usable()
+            self.store.record_event(self.run_id, "IDENTITY_CONFLICT",
+                started_us=self._now() if server_time_available else self.wall_us(),
+                market_id=market_id, detail={"capture_paused": True,
+                    "persisted_invalidation": not first_conflict,
+                    "time_domain": "SERVER" if server_time_available else "LOCAL_WALL"})
+            return False
+        self.revision, self.revision_id = candidate, revision_id
+        return True
+
+    def _reconcile(self, deadline_ns):
+        if self.monotonic_ns() >= deadline_ns or not self.clock.usable():
+            return
+        anchor = self.clock.anchor
+        project = lambda moment_ns: anchor.server_us + (moment_ns-anchor.midpoint_ns)//1000
         previous_callback = self.public.on_attempt
         self.public.on_attempt = None
         try:
-            reconcile_due(self.public, self.store, now_us=self.wall_us(),
-                          deadline=deadline_ns / 1_000_000_000)
+            reconcile_due(self.public, self.store, now_us=self._now(),
+                          deadline=deadline_ns / 1_000_000_000, receipt_server_us=project)
         finally:
             self.public.on_attempt = previous_callback
+        self._clock_ready_after_io("ANCHOR_EXPIRED_DURING_RESOLUTION")
 
     def _recover_known(self, *, reason="DOWNTIME", markets=None):
         now = self._now()
@@ -236,23 +277,22 @@ class Recorder:
             if self.revision is None:
                 started_us = self._now()
                 try:
-                    self.revision = self._control(lambda: acquire_market(self.gamma, self.public,
+                    candidate = self._control(lambda: acquire_market(self.gamma, self.public,
                         clock=self.clock, deadline=self.public.monotonic()+10,
                         use_fast_path=config.use_fast_path))
                 except MarketDataError as exc:
+                    self._clock_ready_after_io("ANCHOR_EXPIRED_DURING_DISCOVERY")
                     self.store.record_event(self.run_id, "DISCOVERY_GAP", started_us=started_us,
                         ended_us=self._now() if self.clock.usable() else None,
                         detail={"reason": exc.code, "unknown_market": True,
                                 "time_domain": "SERVER"})
-                    self.sleep(2)
+                    retry_ns = self.monotonic_ns() + 2_000_000_000
+                    self._housekeeping(retry_ns)
+                    self._wait(retry_ns)
                     continue
-                if self.revision.market.market_id in self.invalidated:
-                    self.revision_id = self.store.paused_revision_id(self.revision)
-                    self.revision = replace(self.revision, capture_ready=False)
-                    self.store.record_event(self.run_id, "IDENTITY_CONFLICT", started_us=self._now(),
-                        market_id=self.revision.market.market_id, detail={"persisted_invalidation": True})
-                else:
-                    self.revision_id = self.store.save_market_revision(self.run_id, self.revision)
+                if not self._clock_ready_after_io("ANCHOR_EXPIRED_DURING_DISCOVERY"):
+                    continue
+                self._save_revision(candidate)
                 if self.known_markets and not unknown_gap_recorded:
                     known_end = max(row["window_end_us"] for row in self.known_markets)
                     current_start = int(self.revision.market.window_start.timestamp()) * 1_000_000

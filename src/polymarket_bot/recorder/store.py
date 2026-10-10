@@ -1,7 +1,7 @@
 """One recorder connection and OS writer ownership; no generic SQL interface."""
 import os
 from contextlib import contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from decimal import Decimal, DecimalException
 import json
@@ -358,9 +358,9 @@ class RecorderStore:
                 self._insert("markets", dict(identity, first_seen_us=observed_us,
                                              lifecycle="CURRENT", resolution_state="PENDING",
                                              resolution_attempts=0))
-            else:
-                _require(existing["lifecycle"] != "INVALIDATED",
-                         "Invalidated market cannot resume metadata capture.")
+            elif existing["lifecycle"] == "INVALIDATED":
+                # Preserve newly observed raw metadata without ever reviving capture.
+                conflict = True
             if existing is not None and not self._equal(existing, {key: identity[key] for key in (
                     "market_id", "event_id", "condition_id", "window_start_us", "window_end_us",
                     "up_token_id", "down_token_id", "up_outcome_index", "down_outcome_index")}):
@@ -368,20 +368,23 @@ class RecorderStore:
             prior = self._one("""SELECT revision_id,content_hash FROM market_revisions
                                   WHERE market_id=? ORDER BY revision_id DESC LIMIT 1""",
                               (market.market_id,))
-            if prior is not None and prior["content_hash"] == digest and not conflict:
-                return prior["revision_id"]
-            revision_id = self._insert("market_revisions", dict(
-                market_id=market.market_id, observed_us=observed_us, run_id=run_id,
-                description=revision.description, resolution_source_url=revision.resolution_source_url,
-                active=int(market.active), closed=int(market.closed),
-                accepting_orders=None if market.accepting_orders is None else int(market.accepting_orders),
-                enable_order_book=None if market.enable_order_book is None else int(market.enable_order_book),
-                fee_config_json=_json({key: config[key] for key in ("mbf", "tbf", "fd") if key in config}),
-                tick_size_text=str(config["mts"]) if "mts" in config else None,
-                min_order_size_text=str(config["mos"]) if "mos" in config else None,
-                delay_config_json=_json({key: config[key] for key in ("oas", "itode", "ibce") if key in config}),
-                gamma_raw_z=gamma_z, clob_config_raw_z=clob_z,
-                raw_sizes_json=_json(raw_sizes), codec_version=codec, content_hash=digest))
+            if prior is not None and prior["content_hash"] == digest:
+                revision_id = prior["revision_id"]
+                if not conflict:
+                    return revision_id
+            else:
+                revision_id = self._insert("market_revisions", dict(
+                    market_id=market.market_id, observed_us=observed_us, run_id=run_id,
+                    description=revision.description, resolution_source_url=revision.resolution_source_url,
+                    active=int(market.active), closed=int(market.closed),
+                    accepting_orders=None if market.accepting_orders is None else int(market.accepting_orders),
+                    enable_order_book=None if market.enable_order_book is None else int(market.enable_order_book),
+                    fee_config_json=_json({key: config[key] for key in ("mbf", "tbf", "fd") if key in config}),
+                    tick_size_text=str(config["mts"]) if "mts" in config else None,
+                    min_order_size_text=str(config["mos"]) if "mos" in config else None,
+                    delay_config_json=_json({key: config[key] for key in ("oas", "itode", "ibce") if key in config}),
+                    gamma_raw_z=gamma_z, clob_config_raw_z=clob_z,
+                    raw_sizes_json=_json(raw_sizes), codec_version=codec, content_hash=digest))
             if conflict:
                 self._connection.execute("UPDATE markets SET lifecycle='INVALIDATED' WHERE market_id=?",
                                          (market.market_id,))
@@ -531,8 +534,10 @@ class RecorderStore:
                 else:
                     state, selected_id = "RETRY_WAIT", None
                     delay = min(30 * (2 ** min(market["resolution_attempts"], 10)), 21_600)
-                    next_due = max(observation.learned_wall_us,
-                                   market["resolution_next_due_us"] or observation.learned_wall_us) + delay * 1_000_000
+                    learned_us = (observation.learned_server_us if observation.learned_server_us is not None
+                                  else observation.learned_wall_us)
+                    next_due = max(learned_us,
+                                   market["resolution_next_due_us"] or learned_us) + delay * 1_000_000
                 self._connection.execute("""UPDATE markets SET resolution_state=?,
                     resolution_next_due_us=?,resolution_attempts=resolution_attempts+1,
                     selected_resolution_id=? WHERE market_id=?""",
@@ -1040,6 +1045,15 @@ class RecorderStore:
                            (market.market_id,))
         _require(latest is not None, "Invalidated identity lacks metadata evidence.")
         return latest["revision_id"]
+
+    def paused_revision(self, market_id: str) -> tuple[MarketRevision, int]:
+        """Return persisted immutable identity for paused coverage, never a candidate mapping."""
+        from .resolution import _revision_from_row
+        known = self._one("SELECT * FROM markets WHERE market_id=?", (market_id,))
+        _require(known is not None and known["lifecycle"] == "INVALIDATED",
+                 "Paused coverage requires a known invalidated market.")
+        revision = replace(_revision_from_row(known), capture_ready=False)
+        return revision, self.paused_revision_id(revision)
 
     def save_control_attempts(self, run_id: str, attempts: tuple) -> None:
         """Persist buffered calibration/discovery/metadata attempts after I/O."""

@@ -361,7 +361,12 @@ class RecorderServiceTests(unittest.TestCase):
         self.assertEqual(observation["classification"], "ABSENT")
         old = fixture.rows("SELECT * FROM markets WHERE market_id='1001'")[0]
         self.assertEqual((old["resolution_state"], old["resolution_attempts"]), ("RETRY_WAIT", 1))
-        self.assertGreaterEqual(old["resolution_next_due_us"], observation["learned_wall_us"]+30_000_000)
+        self.assertIsNotNone(observation["learned_server_us"])
+        self.assertEqual(observation["learned_wall_us"], attempts[0]["ended_wall_us"])
+        anchor = fixture.rows("SELECT * FROM clock_anchors ORDER BY anchor_id DESC")[0]
+        self.assertEqual(observation["learned_server_us"], anchor["anchor_server_us"]+
+            (attempts[0]["end_mono_ns"]-anchor["anchor_mono_ns"])//1000)
+        self.assertEqual(old["resolution_next_due_us"], observation["learned_server_us"]+30_000_000)
         self.assertEqual(len(fixture.rows("SELECT * FROM recording_runs")), 1)
 
     def test_resolution_overrun_skips_target_and_does_not_redispatch_due_job(self):
@@ -403,7 +408,9 @@ class RecorderServiceTests(unittest.TestCase):
         old = fixture.rows("SELECT * FROM markets WHERE market_id='1001'")[0]
         self.assertEqual(old["lifecycle"], "INVALIDATED")
         self.assertEqual(old["resolution_attempts"], 1)
-        self.assertTrue(fixture.rows("SELECT * FROM recorder_events WHERE kind='IDENTITY_CONFLICT'"))
+        conflicts = fixture.rows("SELECT * FROM recorder_events WHERE kind='IDENTITY_CONFLICT'")
+        self.assertTrue(conflicts)
+        self.assertTrue(all(row["started_us"] >= NOW_US+60_000_000 for row in conflicts))
         self.assertTrue(fixture.rows("SELECT * FROM sample_slots WHERE market_id='1002' AND status='COMPLETE'"))
         old_books = fixture.rows("SELECT s.scheduled_us FROM sample_slots s JOIN book_observations b USING(slot_id) WHERE s.market_id='1001'")
         self.assertTrue(all(row["scheduled_us"] < NOW_US+64_000_000 for row in old_books))
@@ -571,6 +578,138 @@ class RecorderServiceTests(unittest.TestCase):
         self.assertTrue(gaps)
         self.assertTrue(all(row["ended_us"] >= row["started_us"] for row in gaps))
         self.assertTrue(all(row["ended_us"] >= NOW_US+80_000_000 for row in gaps))
+
+    def test_resolution_server_due_and_receipt_backoff_survive_offset_restart(self):
+        fixture = self.fixture(offset_us=597_000_000)
+        self.run_recorder(fixture, pairs=1)
+        self.reopen(fixture, advance_us=0)
+        fixture.server_shift_us = 300_000_000
+        result = self.run_recorder(fixture, pairs=1)
+        self.assertEqual(result.exit_code, 0)
+        original = fixture.rows("SELECT * FROM resolution_observations")
+        self.assertEqual(len(original), 1, "Expired server-domain work is already due despite local wall lag.")
+        observation = original[0]
+        attempt = fixture.rows("SELECT * FROM request_attempts WHERE operation='RESOLUTION'")[0]
+        self.assertEqual(observation["learned_wall_us"], attempt["ended_wall_us"])
+        self.assertGreater(observation["learned_server_us"]-observation["learned_wall_us"], 299_000_000)
+        queue = fixture.rows("SELECT resolution_next_due_us,resolution_attempts FROM markets WHERE market_id='1001'")[0]
+        self.assertEqual(queue, {"resolution_next_due_us": observation["learned_server_us"]+30_000_000,
+                                 "resolution_attempts": 1})
+        self.reopen(fixture, advance_us=0)
+        self.run_recorder(fixture, pairs=1)
+        self.assertEqual(fixture.rows("SELECT resolution_next_due_us,resolution_attempts FROM markets WHERE market_id='1001'")[0], queue)
+        self.assertFalse([row for row in fixture.requests if row[1] == "/v2/resolutions"])
+        self.reopen(fixture, advance_us=31_000_000)
+        def failed_resolution(request, payload, f):
+            if request.url.path == "/v2/resolutions":
+                return httpx.Response(503, stream=httpx.ByteStream(b"resolution unavailable"))
+        fixture.hook = failed_resolution
+        self.assertEqual(self.run_recorder(fixture, pairs=1).exit_code, 0)
+        observations = fixture.rows("SELECT * FROM resolution_observations ORDER BY resolution_id")
+        self.assertEqual(observations[:1], original)
+        self.assertEqual(observations[1]["classification"], "INVALID")
+        self.assertGreater(observations[1]["learned_server_us"], queue["resolution_next_due_us"])
+        retried = fixture.rows("SELECT resolution_next_due_us,resolution_attempts FROM markets WHERE market_id='1001'")[0]
+        self.assertEqual(retried, {"resolution_next_due_us": observations[1]["learned_server_us"]+60_000_000,
+                                   "resolution_attempts": 2})
+
+    def test_expired_resolution_progresses_during_outage_and_ambiguity(self):
+        for mode in ("outage", "ambiguity"):
+            with self.subTest(mode=mode):
+                fixture = self.fixture(offset_us=597_000_000)
+                self.run_recorder(fixture, pairs=1)
+                self.reopen(fixture, advance_us=10_000_000)
+                started_wall = fixture.wall_us()
+                def gap(request, payload, f):
+                    if request.url.path.startswith("/events"):
+                        if mode == "outage":
+                            return httpx.Response(503, stream=httpx.ByteStream(b"Gamma unavailable"))
+                        events = payload if type(payload) is list else [payload]
+                        for event in events:
+                            event["markets"].append(dict(event["markets"][0], id="1999"))
+                fixture.hook = gap
+                result = self.run_recorder(fixture, should_stop=lambda: fixture.wall_us() >= started_wall+5_000_000)
+                self.assertEqual(result.exit_code, 0)
+                self.assertEqual(fixture.book_count, 0)
+                self.assertEqual(fixture.rows("SELECT * FROM market_revisions WHERE run_id=?", (result.run_id,)), [])
+                observations = fixture.rows("SELECT classification FROM resolution_observations")
+                self.assertEqual(observations, [{"classification": "ABSENT"}])
+                requests = [row for row in fixture.requests if row[1] == "/v2/resolutions"]
+                self.assertEqual(len(requests), 1)
+                self.assertTrue(all(0 < value <= 2 for value in requests[0][3].values()))
+                discovery = [row for row in fixture.requests if row[1].startswith("/events/slug/")]
+                self.assertGreaterEqual((discovery[-1][2]-discovery[0][2])/1e9, 2)
+
+    def test_first_identity_conflict_on_restart_preserves_pin_and_rolls_over(self):
+        fixture = self.fixture()
+        self.run_recorder(fixture, pairs=1)
+        original = fixture.rows("SELECT up_token_id,down_token_id,condition_id FROM markets WHERE market_id='1001'")[0]
+        self.reopen(fixture, advance_us=590_000_000)
+        def conflict(request, payload, f):
+            if f.market_row()["id"] != "1001":
+                return
+            if request.url.path.startswith("/events/slug/"):
+                row = payload["markets"][0]
+                row["clobTokenIds"] = json.dumps([str(int(token)+100) for token in json.loads(row["clobTokenIds"])])
+            elif request.url.path.startswith("/clob-markets/"):
+                for row in payload["t"]:
+                    row["t"] = str(int(row["t"])+100)
+        fixture.hook = conflict
+        result = self.run_recorder(fixture, pairs=1)
+        self.assertEqual((result.exit_code, result.state), (0, "STOPPED"))
+        self.assertEqual(fixture.rows("SELECT up_token_id,down_token_id,condition_id FROM markets WHERE market_id='1001'")[0], original)
+        self.assertEqual(fixture.rows("SELECT lifecycle FROM markets WHERE market_id='1001'")[0]["lifecycle"], "INVALIDATED")
+        self.assertTrue(fixture.rows("SELECT * FROM recorder_events WHERE kind='IDENTITY_CONFLICT' AND run_id=?", (result.run_id,)))
+        revision = fixture.rows("SELECT * FROM market_revisions WHERE market_id='1001' ORDER BY revision_id DESC")[0]
+        raw = decode_evidence(revision["gamma_raw_z"], json.loads(revision["raw_sizes_json"])["gamma"], revision["codec_version"])
+        self.assertIn(str(int(original["up_token_id"])+100).encode(), raw)
+        self.assertTrue(fixture.rows("SELECT * FROM sample_slots WHERE market_id='1002' AND status='COMPLETE'"))
+        self.assertFalse([row for row in fixture.requests if row[1] == "/books" and original["up_token_id"].encode() in row[4]])
+        self.assertTrue(fixture.rows("SELECT * FROM resolution_observations WHERE market_id='1001'"))
+
+    def test_revalidation_gap_does_not_starve_unrelated_expired_queue(self):
+        fixture = self.fixture(offset_us=597_000_000)
+        self.run_recorder(fixture)
+        self.reopen(fixture, advance_us=60_000_000)
+        started_wall = fixture.wall_us()
+        conflict_seen = []
+        def gap_after_conflict(request, payload, f):
+            if request.url.path == "/markets/1002":
+                payload["conditionId"] = "0x"+"ff"*32
+                conflict_seen.append(f.monotonic_ns())
+            elif request.url.path.startswith("/events") and conflict_seen:
+                return httpx.Response(503, stream=httpx.ByteStream(b"revalidation unavailable"))
+        fixture.hook = gap_after_conflict
+        result = self.run_recorder(fixture, should_stop=lambda: fixture.wall_us() >= started_wall+70_000_000)
+        self.assertEqual(result.exit_code, 0)
+        self.assertTrue(conflict_seen)
+        self.assertTrue(fixture.rows("SELECT * FROM recorder_events WHERE kind='DISCOVERY_GAP' AND run_id=?", (result.run_id,)))
+        old = fixture.rows("SELECT * FROM markets WHERE market_id='1001'")[0]
+        self.assertEqual(old["resolution_attempts"], 3,
+                         "Revalidation must spend remaining allowance on independent old due work.")
+        self.assertFalse([row for row in fixture.requests if row[1] == "/books" and row[2] >= conflict_seen[0]])
+
+    def test_metadata_overrun_past_anchor_expiry_pauses_and_recalibrates(self):
+        fixture = self.fixture()
+        def blocking_metadata(request, payload, f):
+            if request.url.path == "/time" and 0 < f.elapsed_ns < 126_000_000_000:
+                return httpx.Response(503, stream=httpx.ByteStream(b"clock unavailable"))
+            if request.url.path == "/markets/1001" and f.elapsed_ns < 126_000_000_000:
+                f.advance(65)
+        fixture.hook = blocking_metadata
+        result = self.run_recorder(fixture, should_stop=lambda: fixture.elapsed_ns >= 132_000_000_000)
+        self.assertEqual((result.exit_code, result.state), (0, "STOPPED"))
+        self.assertEqual(fixture.rows("SELECT state FROM recording_runs WHERE run_id=?", (result.run_id,))[0]["state"], "STOPPED")
+        pauses = fixture.rows("SELECT * FROM recorder_events WHERE kind='CLOCK_PAUSE'")
+        self.assertTrue(pauses)
+        self.assertTrue(any(json.loads(row["detail_json"]).get("time_domain") == "LOCAL_WALL" for row in pauses))
+        anchors = fixture.rows("SELECT * FROM clock_anchors ORDER BY anchor_id")
+        self.assertGreaterEqual(len(anchors), 2)
+        fresh_ns = anchors[-1]["request_end_mono_ns"]
+        books = [row for row in fixture.requests if row[1] == "/books"]
+        self.assertTrue(any(row[2] >= fresh_ns for row in books))
+        self.assertFalse([row for row in books if 120_005_000_000 < row[2]-fixture.epoch_ns < fresh_ns-fixture.epoch_ns])
+        self.assertTrue(fixture.rows("SELECT * FROM sample_slots WHERE reason='CLOCK_PAUSE'"))
 
 
 if __name__ == "__main__":
