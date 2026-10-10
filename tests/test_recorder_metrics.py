@@ -176,9 +176,11 @@ class RecorderMetricsTests(unittest.TestCase):
         from polymarket_bot.recorder.models import CHAINLINK_FEED_ID
         from tests.support import MARKET_ID
         import zlib
-        request_id = self.request(store,run_id,operation="REFERENCE")
+        request_id = self.request(store,run_id,operation="REFERENCE_LATEST" if origin=="LIVE_LATEST" else "REFERENCE_LOOKUP")
         target = NOW_US if role=="SLOT_CURRENT" else NOW_US+(-300_000_000 if role=="OPENING" else 600_000_000)
         with store._connection:
+            store._connection.execute("UPDATE request_attempts SET started_wall_us=?,ended_wall_us=?,ended_server_us=? WHERE request_id=?",
+                                      (min(NOW_US,learned),learned,learned,request_id))
             fetch = store._connection.execute("""INSERT INTO reference_fetches
                 (request_id,feed_id,purpose,origin,target_us,status) VALUES (?,?,?,?,?,'AVAILABLE')""",
                 (request_id,CHAINLINK_FEED_ID,role,origin,target)).lastrowid
@@ -196,6 +198,31 @@ class RecorderMetricsTests(unittest.TestCase):
                 VALUES (?,?,?,?,?,'AVAILABLE',?,?,?,?,?,?, 'policy-v1',1)""",
                 (MARKET_ID,CHAINLINK_FEED_ID,role,slot_id if role=="SLOT_CURRENT" else None,
                  target,fetch,report,origin,learned,learned,int(origin=="LIVE_LATEST")))
+        return fetch,report
+
+    def test_repeated_latest_fetch_uses_its_own_receipt_for_deduplicated_report(self):
+        metrics = self.metrics()
+        store,run_id = self.fixture()
+        with store._connection:
+            store._connection.execute("UPDATE recording_runs SET mode='REFERENCE_REQUIRED',reference_activation='VERIFIED',activation_evidence_json='{}'")
+        slot = self.slot(store,run_id,150,"COMPLETE")
+        original_fetch,report_id = self.reference(store,run_id,slot,learned=NOW_US-2_000_000)
+        later_fetch,_ = self.reference(store,run_id,slot,learned=NOW_US+500_000)
+        with store._connection:
+            store._connection.execute("UPDATE reference_reports SET valid_from_seconds=?,observations_seconds=? WHERE report_id=?",
+                ((NOW_US-2_000_000)//1_000_000,(NOW_US-2_000_000)//1_000_000,report_id))
+            store._connection.execute("UPDATE reference_associations SET report_id=? WHERE fetch_id=?",(report_id,later_fetch))
+        measured = metrics.measure(store,start_us=NOW_US,end_us=NOW_US+2_000_000)
+        self.assertEqual(measured.reference_coverage["live_slots"],1)
+        self.assertEqual(measured.reference_coverage["paired_slots"],1)
+        stored = store._one("SELECT first_fetch_id,first_received_server_us FROM reference_reports WHERE report_id=?",(report_id,))
+        self.assertEqual((stored["first_fetch_id"],stored["first_received_server_us"]),(original_fetch,NOW_US-2_000_000))
+        with store._connection:
+            # A timely original receipt does not make a later fetch timely.
+            store._connection.execute("UPDATE request_attempts SET ended_server_us=? WHERE request_id=(SELECT request_id FROM reference_fetches WHERE fetch_id=?)",
+                (NOW_US+2_000_000,later_fetch))
+        late = metrics.measure(store,start_us=NOW_US,end_us=NOW_US+3_000_000)
+        self.assertEqual(late.reference_coverage["live_slots"],0)
 
     def test_live_reference_requires_verified_timely_original_provenance(self):
         metrics = self.metrics()
@@ -318,6 +345,66 @@ class RecorderMetricsTests(unittest.TestCase):
         report = metrics.measure(store,start_us=NOW_US,end_us=NOW_US+3_000_000)
         self.assertEqual(report.bytes_per_terminal_slot,1000)
         self.assertEqual(report.denominators["physical_terminal_slots"],1)
+
+    def test_complete_baseline_timestamp_tie_is_inferred_from_zero_baseline_count(self):
+        metrics = self.metrics()
+        store,run_id = self.fixture()
+        self.checkpoint(store,run_id,NOW_US,40000,terminals=0)
+        self.slot(store,run_id,150,"COMPLETE",committed=NOW_US)
+        self.checkpoint(store,run_id,NOW_US+3_000_000,41000,terminals=1)
+        report = metrics.measure(store,start_us=NOW_US,end_us=NOW_US+3_000_000)
+        self.assertEqual(report.denominators["physical_complete_slots"],1)
+        self.assertEqual(report.bytes_per_complete_slot,1000)
+        self.assertFalse(report.diagnostics["physical_complete_order_ambiguous"])
+
+    def test_complete_endpoint_mixed_ties_are_unavailable(self):
+        metrics = self.metrics()
+        for endpoint in ("BASELINE","END"):
+            with self.subTest(endpoint=endpoint):
+                store,run_id = self.fixture()
+                baseline = 1 if endpoint=="BASELINE" else 0
+                self.checkpoint(store,run_id,NOW_US,40000,terminals=baseline)
+                tie = NOW_US if endpoint=="BASELINE" else NOW_US+3_000_000
+                self.slot(store,run_id,150,"COMPLETE",committed=tie)
+                self.slot(store,run_id,151,"MISSED",committed=tie)
+                self.checkpoint(store,run_id,NOW_US+3_000_000,41000,terminals=baseline+1)
+                report = metrics.measure(store,start_us=NOW_US,end_us=NOW_US+3_000_000)
+                self.assertEqual(report.bytes_per_terminal_slot,1000)
+                self.assertIsNone(report.denominators["physical_complete_slots"])
+                self.assertIsNone(report.bytes_per_complete_slot)
+                self.assertTrue(report.diagnostics["physical_complete_order_ambiguous"])
+                self.assertEqual(report.diagnostics["physical_complete_count_bounds"],(0,1))
+
+    def test_rollover_gap_excludes_discovery_outage_before_boundary(self):
+        metrics = self.metrics()
+        store,run_id = self.fixture()
+        store.record_event(run_id,"DISCOVERY_GAP",started_us=NOW_US+590_000_000,
+            ended_us=NOW_US+604_000_000,detail={"time_domain":"SERVER"})
+        report = metrics.measure(store,start_us=NOW_US,end_us=NOW_US+610_000_000)
+        self.assertEqual(report.rollover_gaps["duration_seconds"],4)
+        self.assertEqual(report.rollover_gaps["count"],1)
+        self.assertEqual(report.diagnostics["discovery_gaps"]["duration_seconds"],14)
+        self.assertEqual(report.rollover_gaps["intervals"][0]["time_domain"],"SERVER")
+
+    def test_open_rollover_gap_ends_at_validated_market_acquisition(self):
+        metrics = self.metrics()
+        store,run_id = self.fixture()
+        store.record_event(run_id,"DISCOVERY_GAP",started_us=NOW_US+590_000_000,
+                           detail={"unknown_market":True,"time_domain":"SERVER"})
+        with store._connection:
+            store._connection.execute("""INSERT INTO markets
+                (market_id,event_id,condition_id,slug,question,window_start_us,window_end_us,
+                 first_seen_us,up_token_id,down_token_id,up_outcome_index,down_outcome_index,
+                 lifecycle,resolution_state,resolution_attempts)
+                VALUES ('next','next-event','next-condition','next-market','Next window',
+                        ?,?,?, 'next-up','next-down',0,1,'CURRENT','PENDING',0)""",
+                (NOW_US+600_000_000,NOW_US+1_500_000_000,NOW_US+604_000_000))
+        report = metrics.measure(store,start_us=NOW_US,end_us=NOW_US+610_000_000)
+        self.assertEqual(report.rollover_gaps["duration_seconds"],4)
+        self.assertEqual(report.diagnostics["discovery_gaps"]["duration_seconds"],14)
+        interval = report.rollover_gaps["intervals"][0]
+        self.assertEqual((interval["started_us"],interval["ended_us"]),(NOW_US+600_000_000,NOW_US+604_000_000))
+        self.assertEqual(interval["end_evidence"],"VALIDATED_MARKET_ACQUISITION")
 
     def test_reader_refuses_idempotent_mutation_helpers(self):
         metrics = self.metrics()
