@@ -63,3 +63,51 @@ class DatabaseFixture:
 
     def close(self):
         self.directory.cleanup()
+
+
+NOW_US = int(NOW.timestamp()) * 1_000_000
+WINDOW_START_US = NOW_US - 300_000_000
+
+
+def paired_bundle(kind="complete"):
+    """Actual collector results with full original bytes, never fabricated quotes."""
+    up = make_book(bids=[{"price": "0.60", "size": "2.000000000000000000000000000000001"}]
+                   + [{"price": "0.59", "size": "0"} for _ in range(256)],
+                   tick_size="0.01", min_order_size="1.000", hash="up-hash")
+    down = down_book(timestamp=str(int(NOW.timestamp()) * 1000 + 100),
+                     bids=[{"price": "0.30", "size": "3"}], asks=[])
+    if kind == "partial":
+        down["bids"][0]["size"] = "NaN"
+    fixture = BookFixture(batch=[down, up], status=503 if kind == "failed" else 200)
+    try:
+        return fixture.collect()
+    finally:
+        fixture.close()
+
+
+def seed_writer_market(store, run_id):
+    """Until acquisition exists, seed known identities using only the owned writer."""
+    import zlib
+    from tests.support import MARKET_ID
+    connection = store._connection
+    with connection:
+        connection.execute("""INSERT INTO markets
+            (market_id,event_id,condition_id,slug,question,window_start_us,window_end_us,
+             first_seen_us,up_token_id,down_token_id,up_outcome_index,down_outcome_index,
+             lifecycle,resolution_state,resolution_attempts)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (MARKET_ID, "2001", CONDITION, "known-market", "Bitcoin Up or Down?",
+             WINDOW_START_US, WINDOW_START_US + 900_000_000, NOW_US,
+             TOKEN_UP, TOKEN_DOWN, 1, 0, "CURRENT", "PENDING", 0))
+        connection.execute("""INSERT INTO market_revisions
+            (revision_id,market_id,observed_us,run_id,description,resolution_source_url,
+             gamma_raw_z,raw_sizes_json,codec_version,content_hash)
+            VALUES (1,?,?,?,?,?,?,?,?,?)""",
+            (MARKET_ID, NOW_US, run_id, "known rules", "https://example.test/rules",
+             zlib.compress(b"{}"), '{"gamma":2}', 1, "fixture-revision"))
+        connection.execute("""INSERT INTO clock_anchors
+            (anchor_id,run_id,server_seconds,request_start_mono_ns,request_end_mono_ns,
+             request_start_wall_us,request_end_wall_us,anchor_mono_ns,anchor_server_us,
+             uncertainty_us,status) VALUES (1,?,?,?,?,?,?,?,?,?,?)""",
+            (run_id, NOW_US // 1_000_000, 0, 0, NOW_US, NOW_US,
+             0, NOW_US, 1_000_000, "VALID"))

@@ -70,8 +70,12 @@ class ReadOnlyBoundaryTests(unittest.TestCase):
                         forbidden.append((path.name,node.lineno))
                 if isinstance(node,ast.Constant) and isinstance(node.value,str):
                     if re.search(r"^https?://",node.value):
-                        self.assertIn(node.value,("https://gamma-api.polymarket.com","https://clob.polymarket.com",
-                                                  "https://data-api.polymarket.com", "https://clob.polymarket.com/books"))
+                        if node.value == "https://data.chain.link/streams/btc-usd-twap-60s-streams":
+                            # Inert feed provenance; executable request sites remain checked below.
+                            self.assertEqual(path, root/"polymarket_bot"/"recorder"/"store.py")
+                        else:
+                            self.assertIn(node.value,("https://gamma-api.polymarket.com","https://clob.polymarket.com",
+                                                      "https://data-api.polymarket.com", "https://clob.polymarket.com/books"))
                     if re.search(r"^/(order|orders|cancel|auth|api-key|balance|trade)(/|$)",node.value):
                         forbidden.append((path.name,node.lineno))
                 if isinstance(node,ast.Call) and isinstance(node.func,ast.Attribute):

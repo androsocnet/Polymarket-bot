@@ -1,8 +1,61 @@
 """Recorder outcome and request evidence records."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from polymarket_bot.market_data.http import HttpAttempt
 from polymarket_bot.market_data.models import OutcomeBook
+
+CHAINLINK_FEED_ID = "0x0002ee6757e8822c00d273bc340fc24c9cafe123a4ff2ea1dbdb31944bc7d95f"
+CHAINLINK_FEED_NAME = "BTC/USD-Streams-TWAP-60s-mainnet-production"
+
+
+@dataclass(frozen=True)
+class RunConfig:
+    mode: str = "BOOK_ONLY"
+    use_fast_path: bool = True
+    policy_revision: str = field(default="recorder-v1", init=False)
+    cadence_us: int = field(default=2_000_000, init=False)
+    window_us: int = field(default=900_000_000, init=False)
+    slot_count: int = field(default=450, init=False)
+    capture_deadline_us: int = field(default=2_000_000, init=False)
+    max_attempts: int = field(default=2, init=False)
+    max_response_bytes: int = field(default=10_485_760, init=False)
+    decimal_input_characters: int = field(default=256, init=False)
+    decimal_coefficient_digits: int = field(default=128, init=False)
+    decimal_exponent_limit: int = field(default=128, init=False)
+    arithmetic_precision: int = field(default=512, init=False)
+    anchor_refresh_us: int = field(default=60_000_000, init=False)
+    anchor_max_age_us: int = field(default=120_000_000, init=False)
+    future_source_allowance_us: int = field(default=5_000_000, init=False)
+    reference_max_age_us: int = field(default=5_000_000, init=False)
+    decoder_revision: str | None = field(default=None, init=False)
+
+
+@dataclass(frozen=True)
+class SlotTarget:
+    index: int
+    scheduled_us: int
+
+
+@dataclass(frozen=True)
+class ReferenceAssociationDraft:
+    market_id: str
+    role: str
+    target_us: int
+    status: str
+    origin: str
+    available_live: bool
+    learned_wall_us: int
+    learned_server_us: int | None
+    slot_id: int | None = None
+    fetch_id: int | None = None
+    report_id: int | None = None
+    selection_policy_revision: str | None = None
+    next_due_us: int | None = None
+    attempt_count: int = 0
+
+    @property
+    def feed_id(self) -> str:
+        return CHAINLINK_FEED_ID
 
 
 @dataclass(frozen=True)
@@ -23,3 +76,16 @@ class PairedBooks:
     up: OutcomeResult
     down: OutcomeResult
     attempts: tuple[HttpAttempt, ...]
+
+
+@dataclass(frozen=True)
+class SlotCommit:
+    market_id: str
+    target: SlotTarget
+    run_id: str
+    anchor_id: int
+    metadata_revision_id: int
+    books: PairedBooks
+    reference: ReferenceAssociationDraft
+    started_mono_ns: int
+    ended_mono_ns: int
