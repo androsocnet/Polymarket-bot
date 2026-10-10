@@ -15,7 +15,7 @@ from uuid import uuid4
 from polymarket_bot.market_data.models import MarketDataError
 from polymarket_bot.market_data.numeric import decimal_text, exact_decimal_context
 from .models import (CHAINLINK_FEED_ID, CHAINLINK_FEED_NAME, ClockAnchor, RunConfig,
-                     MarketRevision, SlotCommit, SlotTarget)
+                     MarketRevision, ReferenceFetchDraft, ReferenceReportDraft, SlotCommit, SlotTarget)
 from .metadata import _selected_market
 
 
@@ -403,6 +403,221 @@ class RecorderStore:
                 self._connection.execute("""UPDATE markets SET resolution_next_due_us=?
                     WHERE market_id=?""", (market["window_end_us"], market_id))
 
+    def save_reference_evidence(self, fetch: ReferenceFetchDraft,
+                                reports: tuple[ReferenceReportDraft, ...],
+                                associations: tuple) -> None:
+        """Persist supplied evidence atomically; this performs no retrieval.
+
+        Draft association hashes select reports from this fetch. Database IDs
+        are assigned here; supplied IDs must agree with any supplied hash.
+        First receipt/fetch and original slot coverage are never updated.
+        """
+        self._check_writer()
+        _require(isinstance(fetch, ReferenceFetchDraft) and fetch.feed_id == CHAINLINK_FEED_ID,
+                 "Reference fetch must pin the approved feed.")
+        _require(fetch.purpose in ("SLOT_CURRENT", "OPENING", "CLOSING", "REPAIR")
+                 and fetch.origin in ("LIVE_LATEST", "HISTORICAL_LOOKUP"), "Invalid reference fetch provenance.")
+        attempt = fetch.attempt
+        routes = {"REFERENCE_LATEST": "/api/v1/reports/latest",
+                  "REFERENCE_LOOKUP": "/api/v1/reports", "REFERENCE_PAGE": "/api/v1/reports/page"}
+        _require(attempt.operation in routes and attempt.method == "GET"
+                 and attempt.path == routes[attempt.operation]
+                 and attempt.selectors == ("feed_id=" + CHAINLINK_FEED_ID,),
+                 "Reference request must describe an approved exact-feed read.")
+        _require((fetch.origin == "LIVE_LATEST") == (attempt.operation == "REFERENCE_LATEST"),
+                 "Latest and historical provenance disagree with the request.")
+        for key in ("started_mono_ns", "ended_mono_ns", "started_wall_us", "ended_wall_us"):
+            _integer(getattr(attempt, key), key, minimum=0 if key.endswith("ns") else -(2**63))
+        _require(attempt.ended_mono_ns >= attempt.started_mono_ns, "Reference request times are reversed.")
+        _integer(attempt.attempt_number, "attempt_number", minimum=1)
+        _require(type(attempt.raw_complete) is bool, "Reference completeness must be boolean.")
+        for name in ("target_us", "received_server_us"):
+            if getattr(fetch, name) is not None:
+                _integer(getattr(fetch, name), name)
+        _require(fetch.raw_response is None or fetch.raw_response == attempt.raw_body,
+                 "Reference response differs from actual request evidence.")
+        if reports:
+            _require(attempt.raw_complete and attempt.result == "success" and attempt.http_status == 200
+                     and fetch.raw_response is not None, "Reports require complete successful retrieval evidence.")
+        request_blob, request_size, version = encode_evidence(attempt.raw_body)
+        request = dict(run_id=fetch.run_id, market_id=fetch.market_id, anchor_id=fetch.anchor_id,
+            operation=attempt.operation, attempt_number=attempt.attempt_number,
+            method=attempt.method, path=attempt.path, selector_json=_json(attempt.selectors),
+            started_wall_us=attempt.started_wall_us, ended_wall_us=attempt.ended_wall_us,
+            ended_server_us=fetch.received_server_us,
+            start_mono_ns=attempt.started_mono_ns, end_mono_ns=attempt.ended_mono_ns,
+            latency_ns=attempt.ended_mono_ns - attempt.started_mono_ns,
+            http_status=attempt.http_status, result=attempt.result, error_code=attempt.error_code,
+            response_bytes=request_size, response_raw_z=request_blob, raw_size_bytes=request_size,
+            codec_version=version, raw_complete=int(attempt.raw_complete))
+        fetch_values = dict(feed_id=CHAINLINK_FEED_ID, purpose=fetch.purpose, origin=fetch.origin,
+            target_us=fetch.target_us, status=fetch.status, error_code=fetch.error_code,
+            response_raw_z=None, raw_size_bytes=None, codec_version=None)
+        if fetch.raw_response is not None:
+            blob, size, codec = encode_evidence(fetch.raw_response)
+            fetch_values.update(response_raw_z=blob, raw_size_bytes=size, codec_version=codec)
+        report_values = []
+        for report in reports:
+            _require(isinstance(report, ReferenceReportDraft) and report.feed_id == CHAINLINK_FEED_ID
+                     and type(report.report_schema_version) is int and report.report_schema_version == 2,
+                     "Reference report identity/schema is not pinned.")
+            blob, size, codec = encode_evidence(report.raw_signed_report)
+            _require(report.report_hash == sha256(report.raw_signed_report).hexdigest(),
+                     "Reference hash does not match raw signed bytes.")
+            _require(report.first_received_wall_us == attempt.ended_wall_us
+                     and report.first_received_server_us == fetch.received_server_us,
+                     "Report receipt must be the actual retrieval end, independent of source fields.")
+            _require(report.decode_status in ("DECODED", "INVALID", "UNVERIFIED")
+                     and (report.decode_status == "DECODED" or report.decoded_price is None),
+                     "Invalid/unverified reference cannot populate a decoded price.")
+            for name in ("valid_from_seconds", "observations_seconds", "expires_at_seconds"):
+                value = getattr(report, name)
+                if value is not None:
+                    _integer(value, name, minimum=0)
+                    _require(value <= 253_402_300_799, "Unsupported reference source timestamp.")
+            if report.decode_status == "DECODED":
+                _require(report.decoded_price is not None and report.decoded_price > 0
+                         and report.decoder_revision is not None
+                         and all(getattr(report, name) is not None for name in
+                                 ("valid_from_seconds", "observations_seconds", "expires_at_seconds"))
+                         and report.valid_from_seconds <= report.observations_seconds <= report.expires_at_seconds,
+                         "Decoded report requires a positive price and valid source interval.")
+            report_values.append(dict(feed_id=CHAINLINK_FEED_ID, report_hash=report.report_hash,
+                valid_from_seconds=report.valid_from_seconds, observations_seconds=report.observations_seconds,
+                expires_at_seconds=report.expires_at_seconds, decoded_price_text=_decimal(report.decoded_price),
+                decoder_revision=report.decoder_revision, decode_status=report.decode_status,
+                verification_status=report.verification_status, first_received_wall_us=report.first_received_wall_us,
+                first_received_server_us=report.first_received_server_us, raw_report_z=blob,
+                raw_size_bytes=size, codec_version=codec))
+        with self._transaction():
+            self._run(fetch.run_id)
+            if fetch.market_id is not None:
+                _require(self._one("SELECT market_id FROM markets WHERE market_id=?", (fetch.market_id,)) is not None,
+                         "Reference fetch market is unknown.")
+            if fetch.anchor_id is not None:
+                anchor = self._anchor(fetch.run_id, fetch.anchor_id)
+                _require(fetch.received_server_us == self._server_us(anchor, attempt.ended_mono_ns),
+                         "Reference receipt contradicts the supplied window-clock anchor.")
+                request["started_server_us"] = self._server_us(anchor, attempt.started_mono_ns)
+            existing = self._one("SELECT * FROM request_attempts WHERE run_id=? AND operation=? "
+                "AND start_mono_ns=? AND end_mono_ns=? AND ended_wall_us=?",
+                (fetch.run_id, attempt.operation, attempt.started_mono_ns, attempt.ended_mono_ns, attempt.ended_wall_us))
+            if existing is not None:
+                _require(self._equal(existing, request), "Repeated reference request changes evidence.")
+                request_id = existing["request_id"]
+            else:
+                request_id = self._insert("request_attempts", request)
+            fetch_values["request_id"] = request_id
+            existing = self._one("SELECT * FROM reference_fetches WHERE request_id=?", (request_id,))
+            if existing is not None:
+                _require(self._equal(existing, fetch_values), "Repeated reference fetch changes evidence.")
+                fetch_id = existing["fetch_id"]
+            else:
+                fetch_id = self._insert("reference_fetches", fetch_values)
+            report_ids = {}
+            for values in report_values:
+                existing = self._one("SELECT * FROM reference_reports WHERE feed_id=? AND report_hash=?",
+                                     (CHAINLINK_FEED_ID, values["report_hash"]))
+                if existing is not None:
+                    immutable = {key: value for key, value in values.items() if not key.startswith("first_received_")}
+                    _require(self._equal(existing, immutable), "Duplicate signed bytes change decoded evidence.")
+                    report_id = existing["report_id"]
+                else:
+                    report_id = self._insert("reference_reports", values | dict(first_fetch_id=fetch_id))
+                report_ids[values["report_hash"]] = report_id
+            for association in associations:
+                self._save_reference_association(association, fetch, fetch_id, report_ids)
+
+    def save_reference_plan(self, association) -> None:
+        """Persist an inert, not-yet-fetched due plan without request evidence."""
+        with self._transaction():
+            self._validate_reference_target(association)
+            _require(association.origin == "NOT_FETCHED" and association.status in ("PENDING", "DISABLED")
+                     and association.available_live is False and association.fetch_id is None
+                     and association.report_id is None and association.report_hash is None,
+                     "Dormant reference plan cannot claim retrieval or availability.")
+            for name in ("learned_wall_us", "learned_server_us", "next_due_us"):
+                value = getattr(association, name)
+                if value is not None:
+                    _integer(value, name)
+            _integer(association.attempt_count, "reference attempt count", minimum=0)
+            values = asdict(association)
+            values.pop("report_hash")
+            values.update(feed_id=CHAINLINK_FEED_ID, available_live=0)
+            self._append_reference_association(values)
+
+    def _validate_reference_target(self, association) -> dict:
+        market = self._one("SELECT * FROM markets WHERE market_id=?", (association.market_id,))
+        _require(market is not None and association.feed_id == CHAINLINK_FEED_ID,
+                 "Reference association market/feed is unknown.")
+        _integer(association.target_us, "reference target_us")
+        if association.role == "SLOT_CURRENT":
+            slot = self._one("SELECT * FROM sample_slots WHERE slot_id=?", (association.slot_id,))
+            _require(slot is not None and slot["market_id"] == association.market_id
+                     and slot["scheduled_us"] == association.target_us, "Reference association slot/target mismatch.")
+        else:
+            _require(association.role in ("OPENING", "CLOSING") and association.slot_id is None,
+                     "Reference boundary role/slot is invalid.")
+            expected = market["window_start_us"] if association.role == "OPENING" else market["window_end_us"]
+            _require(association.target_us == expected, "Reference boundary must target exact market start/end.")
+        return market
+
+    def _save_reference_association(self, association, fetch, fetch_id, report_ids) -> None:
+        market = self._validate_reference_target(association)
+        _require(fetch.market_id is None or fetch.market_id == association.market_id,
+                 "Reference association belongs to another fetch market.")
+        _require(association.origin == fetch.origin and fetch.purpose in (association.role, "REPAIR"),
+                 "Reference association contradicts fetch purpose/origin.")
+        if fetch.origin == "HISTORICAL_LOOKUP" and fetch.target_us is not None:
+            _require(fetch.target_us == association.target_us, "Historical reference target differs from its association.")
+        _integer(association.learned_wall_us, "reference learned wall")
+        _require(association.learned_wall_us >= fetch.attempt.ended_wall_us,
+                 "Association cannot be learned before retrieval.")
+        if association.learned_server_us is not None:
+            _integer(association.learned_server_us, "reference learned server")
+            _require(fetch.received_server_us is not None and association.learned_server_us >= fetch.received_server_us,
+                     "Association cannot be learned before server receipt.")
+        _integer(association.attempt_count, "reference attempt count", minimum=0)
+        if association.next_due_us is not None:
+            _integer(association.next_due_us, "reference next due")
+        _require(association.fetch_id is None or association.fetch_id == fetch_id,
+                 "Association fetch ID disagrees with writer-assigned ID.")
+        report_id = association.report_id
+        if association.report_hash is not None:
+            linked = report_ids.get(association.report_hash)
+            _require(linked is not None and (report_id is None or report_id == linked),
+                     "Reference report hash/ID is unknown or inconsistent.")
+            report_id = linked
+        if report_id is not None:
+            _require(report_id in report_ids.values(), "Association report was not returned by this fetch.")
+        report = self._one("SELECT * FROM reference_reports WHERE report_id=?", (report_id,)) if report_id is not None else None
+        _require(association.status != "AVAILABLE" or (report is not None and report["decode_status"] == "DECODED"),
+                 "Available reference requires an unambiguous decoded returned report.")
+        _require(type(association.available_live) is bool, "Reference live availability must be boolean.")
+        if association.available_live:
+            _require(fetch.origin == "LIVE_LATEST" and association.status == "AVAILABLE"
+                     and report is not None and report["decode_status"] == "DECODED"
+                     and report["verification_status"] == "VERIFIED", "Live availability requires verified latest evidence.")
+            if association.role == "SLOT_CURRENT":
+                _require(fetch.received_server_us is not None
+                         and association.target_us <= fetch.received_server_us
+                         < min(association.target_us + 2_000_000, market["window_end_us"]),
+                         "A latest report outside its slot deadline cannot claim original live coverage.")
+        values = asdict(association)
+        values.pop("report_hash")
+        values.update(feed_id=CHAINLINK_FEED_ID, fetch_id=fetch_id, report_id=report_id,
+                      available_live=int(association.available_live))
+        self._append_reference_association(values)
+
+    def _append_reference_association(self, values: dict) -> None:
+        existing = self._one("SELECT * FROM reference_associations WHERE market_id=? AND role=? "
+                             "AND slot_id IS ? AND learned_wall_us=?",
+                             (values["market_id"], values["role"], values["slot_id"], values["learned_wall_us"]))
+        if existing is not None:
+            _require(self._equal(existing, values), "Repeated association changes learned evidence.")
+        else:
+            self._insert("reference_associations", values)
+
     def record_event(self, run_id: str, *, market_id: str | None, kind: str,
                      started_us: int, ended_us: int | None, detail: dict) -> int:
         _integer(started_us, "started_us")
@@ -592,6 +807,7 @@ class RecorderStore:
         books = [self._book_values(result, slot_id, list(range(len(attempts))))
                  for result in (commit.books.up, commit.books.down)]
         association = asdict(reference) | dict(slot_id=slot_id, feed_id=CHAINLINK_FEED_ID, available_live=0)
+        association.pop("report_hash")
         valid_count = sum(result.status == "VALID" for result in (commit.books.up, commit.books.down))
         terminal = dict(status=("FAILED", "PARTIAL", "COMPLETE")[valid_count],
             finished_server_us=self._server_us(anchor, commit.ended_mono_ns), committed_wall_us=committed_wall_us,

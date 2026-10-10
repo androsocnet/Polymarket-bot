@@ -1,5 +1,6 @@
 """Recorder outcome and request evidence records."""
 from dataclasses import dataclass, field
+from decimal import Decimal
 
 from polymarket_bot.market_data.http import HttpAttempt
 from polymarket_bot.market_data.models import MarketDescriptor, OutcomeBook
@@ -89,10 +90,46 @@ class ReferenceAssociationDraft:
     selection_policy_revision: str | None = None
     next_due_us: int | None = None
     attempt_count: int = 0
+    reason: str | None = None
+    report_hash: str | None = None
 
     @property
     def feed_id(self) -> str:
         return CHAINLINK_FEED_ID
+
+
+@dataclass(frozen=True)
+class ReferenceFetchDraft:
+    attempt: HttpAttempt
+    run_id: str
+    feed_id: str
+    purpose: str
+    origin: str
+    target_us: int | None
+    status: str
+    error_code: str | None
+    raw_response: bytes | None
+    received_server_us: int | None
+    market_id: str | None = None
+    anchor_id: int | None = None
+
+
+@dataclass(frozen=True)
+class ReferenceReportDraft:
+    feed_id: str
+    report_schema_version: int
+    raw_signed_report: bytes
+    report_hash: str
+    valid_from_seconds: int | None
+    observations_seconds: int | None
+    expires_at_seconds: int | None
+    decoded_price: Decimal | None
+    decoder_revision: str | None
+    decode_status: str
+    verification_status: str
+    first_received_wall_us: int
+    first_received_server_us: int | None
+    diagnostics: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
