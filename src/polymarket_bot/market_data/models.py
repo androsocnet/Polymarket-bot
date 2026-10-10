@@ -57,3 +57,22 @@ class OutcomeBook:
     spread: Decimal | None
     bid_size: Decimal | None
     ask_size: Decimal | None
+
+@dataclass(frozen=True)
+class BookObservation:
+    outcome: TokenOutcome
+    book: OutcomeBook
+    request_started_at: datetime
+    request_finished_at: datetime
+
+@dataclass(frozen=True)
+class MarketSnapshot:
+    market: MarketDescriptor
+    discovery_source: str
+    up: BookObservation
+    down: BookObservation
+    collection_started_at: datetime
+    collection_finished_at: datetime
+    validated_at: datetime
+    time_round_trip_seconds: float
+    rolled_over: bool

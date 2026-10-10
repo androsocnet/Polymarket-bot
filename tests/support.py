@@ -59,3 +59,29 @@ class FakeGamma:
         self.refresh_calls.append((market_id, deadline))
         if self.refresh is not None: return self.refresh
         return next(m for e in self.events for m in e["markets"] if m["id"] == market_id)
+
+class FakeClob:
+    def __init__(self, clock, times=None, books=None):
+        self.clock = clock
+        self.times = list(times) if times is not None else []
+        self.books = books if books is not None else {
+            TOKEN_UP: make_book(), TOKEN_DOWN: make_book(asset_id=TOKEN_DOWN,
+                timestamp=str(int(NOW.timestamp())*1000+100))}
+        self.time_calls, self.book_calls = [], []
+    def get_time(self, *, deadline):
+        from polymarket_bot.market_data.http import JsonRead
+        start = self.clock.monotonic()
+        self.time_calls.append(deadline)
+        value = self.times.pop(0) if self.times else int(NOW.timestamp())+int(start)
+        if isinstance(value, BaseException): raise value
+        self.clock.advance(0.1)
+        return JsonRead(value,start,self.clock.monotonic())
+    def get_book(self, token_id, *, deadline):
+        from polymarket_bot.market_data.http import JsonRead
+        start = self.clock.monotonic()
+        self.book_calls.append((token_id,deadline))
+        value = self.books[token_id]
+        if isinstance(value, list): value = value.pop(0)
+        if isinstance(value, BaseException): raise value
+        self.clock.advance(0.1)
+        return JsonRead(value,start,self.clock.monotonic())
