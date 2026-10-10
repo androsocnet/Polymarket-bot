@@ -34,3 +34,6 @@ logs/*
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Isolated feature checkouts
+.worktrees/
