@@ -2,9 +2,9 @@
 
 Date: 2026-10-10 (Asia/Jakarta)
 
-Status: Written specification awaiting user review. The conversational
-architecture and the user's final amendments are approved. This document
-requires separate approval before an implementation plan is written.
+Status: Approved by the user, including the numeric-hardening and Chainlink
+dormancy/authentication-clock amendments requested on 2026-10-10. Implementation
+planning is authorized; implementation and credential activation are not.
 
 ## 1. Purpose, authority and completion boundaries
 
@@ -65,7 +65,12 @@ review of the implementation plan and an execution choice.
 
 Future implementation may provide dormant, offline-tested Chainlink interfaces
 and decoding support. Runtime authentication is disabled until separately
-authorized. Long-term reference-dependent recording must refuse to start
+authorized. BOOK_ONLY must not load a Chainlink username/API identifier or HMAC
+secret, construct signed Chainlink requests, or contact authenticated report
+endpoints. This includes imports, startup configuration and environment/file
+lookups: do not eagerly construct a credential-bearing adapter and then disable
+its network calls. Dormant schema and pure offline report handling need no
+credentials. Long-term reference-dependent recording must refuse to start
 unless all of the following are recorded as verified:
 
 1. Entitlement to the exact mainnet TWAP feed.
@@ -172,6 +177,13 @@ and `/api/v1/reports/page` for the pinned approved feed. Their authentication
 belongs in a separate data-only adapter. Never persist/log credentials, signed
 authorization headers or secret-bearing debug strings. No account creation,
 purchase, key generation or onchain verification transaction is part of it.
+When later authorized, signing must follow Chainlink's then-current official
+authentication timestamp requirements, including units, freshness and clock
+source/skew handling, verified during activation-gate testing. Do not assume
+Polymarket CLOB server time is the correct Chainlink HMAC timestamp source.
+CLOB calibration remains the Polymarket/window timing authority unless a later
+reviewed design explicitly changes it. Signing-clock evidence and window-clock
+evidence remain distinct; this milestone implements no live signer or secret loader.
 
 ## 5. Discovery, clocks and window scheduling
 
@@ -284,6 +296,56 @@ cannot be recovered from memory after a crash; it becomes interrupted coverage.
 `MISSED` means no acquisition was started; `INTERRUPTED` means reserved work
 was interrupted before terminal commit. `IN_PROGRESS` is a reservation only.
 Reference status is independent and cannot change those book-success counts.
+
+### 6.1 External numeric hardening and failure containment
+
+Milestone 1's deferred extreme-Decimal edge case is an early prerequisite for
+the recorder, not an accepted long-running-process failure. All externally
+supplied numeric strings must pass bounded lexical and range validation before
+conversion, arithmetic or fixed-point formatting. Apply this to prices, sizes,
+fees, payouts and future decoded references, and use bounded field-specific
+integer validation for timestamps/counts. Numeric identifiers remain identifiers,
+with bounded length/format checks rather than Decimal conversion. JSON numeric
+tokens must also be bounded before conversion; never route them through float.
+
+Initial numeric safety policy, recorded in run configuration:
+
+- Decimal input: at most 256 characters before stripping permitted whitespace,
+  at most 128 coefficient digits, absolute explicit exponent at most 128, and
+  absolute adjusted exponent at most 128 for nonzero values. Validate exponent
+  text length before integer conversion. Reject nonfinite forms, invalid syntax,
+  booleans and unsupported field types.
+- Integer input: bounded textual length/digit count plus the field's semantic
+  range; timestamps must fit the database's signed 64-bit storage and supported
+  time conversion, counts must be nonnegative and bounded by the response budget.
+- Arithmetic: isolated local Decimal context with sufficient exact precision
+  for accepted inputs/aggregation, a maximum precision budget of 512 digits and
+  bounded exponent range. Detect inexact/rounded results and reject a calculation
+  that cannot be exact within that budget; do not change the process-global
+  Decimal context or silently clamp, round, replace or invent a value.
+
+These are defensive application limits, not claimed Polymarket/Chainlink feed
+limits. Valid values beyond them are explicitly unsupported evidence rather
+than altered prices. A change requires tests and a recorded policy revision.
+Bounded formatting and compression/diagnostics must not expand an attacker-sized
+exponent into an enormous string or a traceback.
+
+Contain Decimal InvalidOperation, Overflow, excessive exponent/precision,
+underflow/inexact/context failures and related expected conversion/arithmetic
+errors at the parsing/adapter boundary. Convert them into structured errors:
+an affected book is INVALID, a slot with no usable books is FAILED, an invalid
+reference report has decode_status=INVALID and an unavailable/ambiguous
+association as appropriate. Invalid metadata/resolution numbers become explicit
+diagnostics and cannot select a market or winner. One invalid batch element
+must not poison a separately valid outcome when the batch envelope can be parsed.
+
+Preserve bounded raw diagnostic evidence where permitted, with no usable price
+substitution. A malformed API payload must not terminate the recorder unless
+continuing threatens database integrity or violates another explicit fatal
+invariant. Distinguish an isolated malformed report from a demonstrated permanent
+decoder/activation-gate failure; only the latter invokes the fatal gate policy.
+Contain expected external-data failures specifically; do not hide programming
+defects, storage failures or process interruption behind a catch-all handler.
 
 ## 7. Explicit SQLite schema (version 1)
 
@@ -722,6 +784,7 @@ or hidden stale-value forward filling repairs coverage.
 | Empty bid/ask | Valid book, nullable side; midpoint/spread absent where necessary |
 | One outcome fails | Commit valid side and explicit other-side failure atomically |
 | Wrong token/condition | Reject association and quote use; preserve diagnostic evidence |
+| Malformed or extreme numeric field / Decimal arithmetic failure | INVALID affected observation or FAILED sample; bounded diagnostics, continue future slots, no invented or rounded price |
 | Rate limit/slow response | Bound retry to slot, mark failure/delay, skip passed slots |
 | Response cap exceeded | Explicit invalid/unavailable observation; no truncated payload presented as full depth |
 | Metadata outage | Preserve revision age; discovery cannot guess a new identity |
@@ -828,14 +891,23 @@ ordinary test uses external APIs or credentials. Required behaviors:
 - Batch reordered/missing/duplicated/extra entries; wrong condition/token,
   bounded fallback reasons, invalid/empty/crossed books, full raw evidence,
   independent timestamps, late replies and the non-atomic warning.
+- Huge positive/negative exponents, extreme digit counts, nonfinite values,
+  arithmetic/context edge cases and malformed numeric data in individual and
+  batch books; reference/metadata/resolution numeric failures are contained too.
+  Verify a valid other outcome and subsequent slots survive malformed payloads.
 - Decimal text round trips, no float loss, compression byte preservation and
   decompression caps; every started terminal sample has both outcome results.
 - Transaction failure rollback, idempotent writes, disk failure, exclusive
   writer ownership, interruption and recovery with no historical slot reacquisition.
-- Reference disabled makes zero authenticated requests; mode gate refuses
+- BOOK_ONLY never loads a Chainlink username/API identifier or HMAC secret,
+  constructs a signed request or contacts authenticated endpoints; assert this
+  using spies that fail if credential access or adapter construction is attempted.
+  Reference disabled makes zero authenticated requests; mode gate refuses
   reference-required startup; no backfill-as-live or boundary guessing.
 - Future offline report fixtures cover identity/schema/scale/timestamps,
   live/historical provenance, delayed arrival, conflicts and missing boundaries.
+  Future activation tests separately verify Chainlink's actual signing timestamp
+  contract; CLOB server time must not be implicitly wired into signing.
 - Resolution absence/pending/non-unit payout scale/reversed indices/split or
   malformed payouts/conflicts, independent queue persistence and no price inference.
 - Metric denominators, startup exclusion versus downtime inclusion, unknown
@@ -878,8 +950,13 @@ Self-review completed on 2026-10-10:
   cannot inflate success. Reference-disabled coverage is zero, not unknown success.
 - Existing milestone-1 CLI behavior is preserved; named recorder extensions
   override only its endpoint/deadline/persistence exclusions for this subsystem.
+- Extreme external numerics and expected Decimal failures are bounded and
+  contained before persistence or rendering; an isolated bad report is not a
+  permanent decoder failure. No clamping, rounding or substitute prices are allowed.
+- BOOK_ONLY excludes credential loading and signing as well as network activity;
+  later Chainlink signing-clock verification does not change CLOB window timing.
 
-This is the completed design specification, not an implementation plan. Review
-and approve this written artifact before invoking Superpowers writing-plans.
-Implementation and enabling Chainlink credentials require their subsequent
-separate approvals. Stop here for the user's review.
+The user approved this specification and explicitly authorized these amendments
+and subsequent Superpowers writing-plans. Record the amendment in its own
+documentation-only commit before creating that plan. Implementation and enabling
+Chainlink credentials still require their subsequent separate approvals.
