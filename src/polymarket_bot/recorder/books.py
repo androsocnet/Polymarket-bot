@@ -22,6 +22,7 @@ def collect_books(public: PublicGet, market: MarketDescriptor, *, deadline: floa
         raise ValueError("uncertainty_us must be nonnegative")
     attempts = []
     previous = public.on_attempt
+    previous_max_attempts = public.max_attempts
     end_us = _epoch_us(market.window_end)
 
     def observe(attempt):
@@ -37,10 +38,12 @@ def collect_books(public: PublicGet, market: MarketDescriptor, *, deadline: floa
         return OutcomeResult(label, token, market.condition_id, status, None,
                              index, code, quality or {}, {})
 
-    def validate(label, token, row, read, index, *, batch, extra_count=0):
+    def validate(label, token, row, read, index, *, batch, extra_count=0, malformed_count=0):
         quality = {"batch_not_guaranteed_atomic": True} if batch else {}
         if extra_count:
             quality["unexpected_token"] = min(extra_count, 10_000)
+        if malformed_count:
+            quality["malformed_batch_elements"] = min(malformed_count, 10_000)
         if not can_start():
             return failed(label, token, "LATE", "late_response", index, quality)
         try:
@@ -85,6 +88,7 @@ def collect_books(public: PublicGet, market: MarketDescriptor, *, deadline: floa
         return validate(label, token, read.payload, read, index, batch=False)
 
     public.on_attempt = observe
+    public.max_attempts = min(previous_max_attempts, 2)
     try:
         labels = (("UP", market.up.token_id), ("DOWN", market.down.token_id))
         if not can_start():
@@ -102,29 +106,36 @@ def collect_books(public: PublicGet, market: MarketDescriptor, *, deadline: floa
                                  for label, token in labels), tuple(attempts))
         index = len(attempts) - 1
         payload = read.payload
-        if (not isinstance(payload, list) or
-                any(not isinstance(row, dict) or
-                    not isinstance(row.get("asset_id"), str) or
-                    len(row["asset_id"]) > 128 for row in payload)):
+        if not isinstance(payload, list):
             return PairedBooks(*(failed(label, token, "INVALID", "invalid_batch_envelope", index)
                                  for label, token in labels), tuple(attempts))
+        rows = [row for row in payload if isinstance(row, dict) and
+                isinstance(row.get("asset_id"), str) and len(row["asset_id"]) <= 128]
+        malformed_count = len(payload) - len(rows)
         expected = {token for _, token in labels}
-        extras = sum(row.get("asset_id") not in expected for row in payload)
+        extras = sum(row["asset_id"] not in expected for row in rows)
         results = {}
         missing = []
         for label, token in labels:
-            matches = [row for row in payload if row.get("asset_id") == token]
+            matches = [row for row in rows if row["asset_id"] == token]
             if len(matches) > 1:
                 result = failed(label, token, "INVALID", "duplicate_token", index,
                                 {"batch_not_guaranteed_atomic": True})
             elif not matches:
-                missing.append((label, token))
-                continue
+                if malformed_count:
+                    result = failed(label, token, "INVALID", "invalid_batch_element", index,
+                                    {"batch_not_guaranteed_atomic": True,
+                                     "malformed_batch_elements": min(malformed_count, 10_000)})
+                else:
+                    missing.append((label, token))
+                    continue
             else:
-                result = validate(label, token, matches[0], read, index, batch=True, extra_count=extras)
+                result = validate(label, token, matches[0], read, index, batch=True,
+                                  extra_count=extras, malformed_count=malformed_count)
             results[label] = result
         for label, token in missing:
             results[label] = individual(label, token)
         return PairedBooks(results["UP"], results["DOWN"], tuple(attempts))
     finally:
+        public.max_attempts = previous_max_attempts
         public.on_attempt = previous

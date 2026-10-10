@@ -138,8 +138,12 @@ class BatchBookTests(unittest.TestCase):
         fixture = self.fixture(batch=[{"market": CONDITION}, down_book()],
                                singles={TOKEN_UP: (200, make_book())})
         pair = fixture.collect()
-        self.assertEqual((pair.up.status, pair.down.status), ("INVALID", "INVALID"))
-        self.assertEqual(pair.up.error_code, "invalid_batch_envelope")
+        self.assertEqual((pair.up.status, pair.down.status), ("INVALID", "VALID"))
+        self.assertEqual(pair.up.error_code, "invalid_batch_element")
+        self.assertIsNone(pair.up.book)
+        self.assertEqual(pair.up.attempt_index, 0)
+        self.assertEqual(pair.down.book.best_ask, Decimal("0.61"))
+        self.assertEqual(pair.down.quality["malformed_batch_elements"], 1)
         self.assertEqual(fixture.requests, [("POST", "/books")])
 
     def test_expired_market_never_starts_request(self):
@@ -171,6 +175,28 @@ class BatchBookTests(unittest.TestCase):
         self.assertIsNone(pair.up.book)
         self.assertEqual(pair.down.book.best_ask, Decimal("0.61"))
         self.assertEqual((pair.up.attempt_index, pair.down.attempt_index), (1, 0))
+
+    def test_collector_limits_retryable_batch_and_fallback_to_one_retry(self):
+        for status in (429, 503):
+            with self.subTest(status=status):
+                fixture = self.fixture(status=status, batch={})
+                fixture.public.max_attempts = 3
+                pair = fixture.collect()
+                self.assertEqual(len(pair.attempts), 2)
+                self.assertEqual(fixture.requests, [("POST", "/books"), ("POST", "/books")])
+                self.assertEqual((pair.up.status, pair.down.status), ("UNAVAILABLE", "UNAVAILABLE"))
+                self.assertEqual(fixture.public.max_attempts, 3)
+
+        fallback = self.fixture(status=404, batch={}, singles={
+            TOKEN_UP: (503, {}), TOKEN_DOWN: (200, down_book())})
+        fallback.public.max_attempts = 3
+        pair = fallback.collect()
+        self.assertEqual((pair.up.status, pair.down.status), ("UNAVAILABLE", "VALID"))
+        self.assertEqual(fallback.requests, [("POST", "/books"),
+                                             ("GET", "/book"), ("GET", "/book"),
+                                             ("GET", "/book")])
+        self.assertEqual((pair.up.attempt_index, pair.down.attempt_index), (2, 3))
+        self.assertEqual(fallback.public.max_attempts, 3)
 
 
 if __name__ == "__main__":
