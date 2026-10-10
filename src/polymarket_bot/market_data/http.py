@@ -107,6 +107,11 @@ class PublicGet:
     def _read_json(self, method: str, source: str, path: str, url: str, *,
                    deadline: float, params: dict[str, str | int] | None = None,
                    json_body: object = None, selectors: tuple[str, ...] = ()) -> JsonRead:
+        if (self.client.auth is not None or any(
+                key.lower() in {"authorization", "cookie", "poly-api-key", "poly_api_key",
+                                "poly-signature", "poly-passphrase", "x-api-key"}
+                or "signature" in key.lower() for key in self.client.headers)):
+            raise MarketDataError("transport_error", "Authenticated clients cannot make public market-data reads.")
         operation = ("BOOK_BATCH" if method == "POST" else
                      "BOOK_SINGLE" if path == "/book" else
                      "CLOB_TIME" if path == "/time" else

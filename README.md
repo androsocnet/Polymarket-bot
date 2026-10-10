@@ -1,134 +1,135 @@
-# Polymarket BTC 15-minute Market Data
+# Polymarket BTC 15-minute market data
 
-A Python project for a future paper-trading bot. This milestone reads public
-market data only: it finds the current BTC 15-minute Up/Down market, prints one
-snapshot, and exits.
+This project reads public BTC 15-minute Up/Down market data. `src/main.py` prints
+one snapshot and exits. `src/record.py` is a separate, explicitly `BOOK_ONLY`
+recorder that persists public market and book evidence in SQLite. The reference
+collector is disabled; every recorder run is `REFERENCE_INCOMPLETE`. Neither
+command trades or produces a strategy-complete dataset.
 
-There is no wallet, authentication, credential handling, order submission,
-strategy, signal, simulated trading engine, WebSocket, persistence, or BTC
-spot-price feed. No money is used. The application does not load `.env`.
+There is no wallet, Polymarket authentication, order/cancellation path, strategy,
+signal, simulated trading, WebSocket, BTC spot-feed substitution, or live
+Chainlink signer. No `.env` or credential file is loaded.
 
-## Setup
+## Setup and commands
 
-Use Python 3.12 or newer and uv. In PowerShell, from this checkout:
+Use Python 3.12 or newer and uv from this checkout. The only direct dependency
+is httpx; `uv.lock` pins its supporting packages.
 
 ```powershell
 uv sync --locked --cache-dir .uv-cache --no-python-downloads
+
+# One public snapshot; these retain the original snapshot interface.
 uv run --locked --cache-dir .uv-cache python src/main.py --jakarta
+uv run --locked --cache-dir .uv-cache python src/main.py --no-fast-path --debug
+
+# Help is offline and never opens a database or constructs an HTTP client.
+uv run --offline --locked --cache-dir .uv-cache python src/record.py --help
+uv run --offline --locked --cache-dir .uv-cache python src/record.py record --help
+uv run --offline --locked --cache-dir .uv-cache python src/record.py report --help
 ```
 
-uv creates a separate `.venv` environment. The only direct dependency is httpx;
-its supporting dependencies are pinned in `uv.lock`. If Python is not on PATH,
-pass an installed interpreter to `uv sync --python "C:\path\to\python.exe"`.
-The original setup used Python bundled with Codex. No additional interpreter
-is needed.
-
-Feature implementation is on the local `codex/read-only-market-data` branch
-in an isolated worktree. Run these commands there; main retains the scaffold.
-
-## Commands
+When a separate book-only run is authorized, its command is explicit:
 
 ```powershell
-# One snapshot, UTC internally and in the output
-uv run --locked --cache-dir .uv-cache python src/main.py
-
-# Also show Jakarta time
-uv run --locked --cache-dir .uv-cache python src/main.py --jakarta
-
-# Exercise discovery independently of the observed timestamp slug convention
-uv run --locked --cache-dir .uv-cache python src/main.py --no-fast-path --jakarta
-
-# Show optional Gamma metadata with explicit non-quote labels
-uv run --locked --cache-dir .uv-cache python src/main.py --debug
-
-# Show help without contacting any API
-uv run --offline --locked --cache-dir .uv-cache python src/main.py --help
+uv run --locked --cache-dir .uv-cache python src/record.py record --mode book-only --db data/recorder.sqlite3
 ```
 
-No market ID is hard-coded. The program uses CLOB server time, validates Gamma's
-BTC identity and exact 900-second window, and maps Up/Down by the outcome and
-clobTokenIds array indices. A timestamp slug is only a fast path. The independent
-fallback scans a bounded Gamma event list and refreshes the unique selection.
-It never chooses a future market just because that market is open.
+`--no-fast-path` forces independent filtered-list discovery. Omitting `--mode`
+refuses before opening the writer or HTTP client. `--mode reference-required`
+refuses with `activation_required`; the CLI has no credentials, signing, or
+activation option. `BOOK_ONLY / REFERENCE_INCOMPLETE` is printed on a run, and
+book coverage and verified live reference coverage remain separate.
 
-Only five public GET routes are permitted: Gamma event-by-slug, event list,
-market-by-ID; CLOB server time and token order book. Requests do not follow
-redirects or use ambient proxy/credential settings.
+An existing database can be measured offline. The UTC interval is half-open for
+scheduled slots; checkpoint and other evidence include their labelled time
+bounds. This example is a command template, not a claim that data was recorded:
 
-## Reading the prices
+```powershell
+uv run --offline --locked --cache-dir .uv-cache python src/record.py report --db data/recorder.sqlite3 --start 2026-10-10T00:00:00Z --end 2026-10-11T00:00:00Z
+```
 
-For each outcome:
+The report opens only an existing database in SQLite read-only mode. It neither
+initializes a schema nor takes writer ownership or contacts an API. JSON output
+labels decimal MB/day and GB/30 days, bytes per newly terminal or demonstrably
+COMPLETE slot, request latency in nanoseconds, and status/reference
+denominators. It includes mode, revisions, clock uncertainty, interruptions,
+restart downtime, discovery gaps, book-depth breakdown, resolution counts and
+raw/compressed evidence bytes. Rates or physical COMPLETE denominators that
+cannot be established are `null`, with diagnostic bounds or reasons. A storage
+projection describes the observed fixed workload and is not a guarantee.
 
-- **Best bid** is the highest positive-size resting bid.
-- **Best ask** is the lowest positive-size resting ask.
-- **Midpoint reference price** is the average of those prices, when both exist.
-- **Spread** is best ask minus best bid.
-- Sizes and depth summarize the returned book; they do not guarantee a fill.
+## Public data and evidence
 
-These are prices of the outcome tokens, not a BTC/USD spot-price feed. All
-price/size calculations use Decimal. Gamma outcomePrices is optional metadata,
-never a replacement for a missing or failed book quote.
+Discovery checks the current 900-second window against CLOB time, validates the
+market and independent Up/Down token mapping, and uses Gamma's timestamp slug
+only as a fast path. A bounded filtered-list fallback remains available. Public
+GET routes are limited to Gamma events/markets, CLOB time/book/config, and Data
+API resolutions. The sole POST is a public `POST /books` with a body constructed
+from exactly two validated token IDs. Requests use no ambient proxy or
+credential settings and never follow redirects.
 
-Empty sides are labeled `unavailable`; they are not replaced with 0, 0.5, the
-other outcome's complement, or metadata prices. A crossed or malformed book,
-or a token/condition mismatch, fails explicitly.
+Each outcome has independent book identity and source-time validation. The
+recorder tries the batch read and uses single-book GET fallback only for a batch
+404/405 or missing requested token, within the slot deadline. REST batch
+responses are **not guaranteed atomic**. Equal source timestamps do not make
+them atomic. An invalid or empty side is explicitly unavailable; it is never
+replaced by a complement, metadata price or guessed quote. All exact price and
+size arithmetic uses bounded Decimal inputs. Malformed numeric evidence is
+contained per observation, without rounding or clamping source values.
 
-Up and Down are separate REST reads. The output always warns:
+SQLite schema version 1 retains the full returned response bytes compressed as
+original evidence, alongside indexed book summaries and exact Decimal text.
+`data/` is the suggested location for the database; generated data and logs are
+ignored by Git. The recorder owns one SQLite writer and a canonical-path OS
+lock. It does not rotate, vacuum, delete depth, or adapt cadence automatically.
 
-> The Up and Down books were fetched separately; this REST snapshot is not atomic.
+The 450 scheduled slots per validated window are at `window_start + 2 × index`
+seconds for indices 0–449. The last is at +898 seconds. Monotonic scheduling
+selects the next future slot after a delay; it never bursts to catch up. A
+capture deadline is the earlier of its scheduled time +2 seconds and market
+end. Requests have bounded retries and a 10 MiB response ceiling. Clock anchors
+are refreshed about every minute; expired or discontinuous anchors pause
+sampling. Missing/partial/failed/interrupted slots and discovery gaps remain
+visible in storage and reports.
 
-Each book has its own source and retrieval timestamps. Source timestamp age
-alone may reflect an unchanged book. Book milliseconds and server seconds are
-interpreted separately; the 13-digit millisecond shape is an observed adapter
-assumption. Server time has whole-second precision and network-latency error;
-displayed times are estimates, not synchronized exchange guarantees. The
-collection duration uses monotonic elapsed time even when time samples differ.
+After a restart, the writer validates the existing schema and integrity,
+recovers interrupted runs/slots, creates a new clock anchor, verifies any reused
+market identity, records known downtime, then resumes only at a future slot.
+Unknown intervening markets are not invented. Resolution reconciliation stores
+raw status, payout and time separately from book prices. Original live reference
+availability remains distinct from any later historical repair: backfilled
+information cannot become a value that was known during the original window.
 
-## Failures and limits
+## Reference activation and limits
 
-Exit 0 means a valid current market and both book reads succeeded (possibly
-with empty sides). Exit 1 means discovery, parsing, identity, transport, or
-operational-readiness failure. An identified market without explicitly true
-acceptingOrders/enableOrderBook may be shown as an **incomplete** result with no
-quotes. Ctrl+C exits 130 without retrying.
+The pinned future reference is
+`BTC/USD-Streams-TWAP-60s-mainnet-production`, feed
+`0x0002ee6757e8822c00d273bc340fc24c9cafe123a4ff2ea1dbdb31944bc7d95f`.
+Reference-required collection remains unavailable until these six gates are
+verified and separately authorized:
 
-A rollover discards both books and permits one rediscovery. A second rollover
-fails. GET requests have 10-second phase timeouts, at most three attempts for
-connection/timeouts/429/5xx, 0.5/1-second backoff or valid Retry-After, a shared
-120-second run deadline, and a 10 MiB response cap. A synchronous blocking
-network phase can notice deadline expiry late; late results are rejected.
-Five full fallback pages fail as incomplete enumeration rather than guessing.
+1. Entitlement to that exact mainnet TWAP feed.
+2. Actual subscription price and a subscription decision.
+3. Credential availability and explicit permission to use them.
+4. Successful authenticated retrieval for that feed.
+5. Verified report decoding, schema and numeric scaling.
+6. Verified opening/closing boundary report selection applicable to Polymarket.
 
-## Offline tests
+Future Chainlink signing must follow its verified authentication timestamp
+contract, including units, freshness and source/skew. CLOB server time governs
+market-window sampling; it is not assumed to be the Chainlink signing clock.
+No pilot, subscription, credential use or 24-hour run is claimed here.
+
+## Offline tests and design
 
 ```powershell
 $env:PYTHONPATH = Join-Path (Get-Location) 'src'
 uv run --offline --locked --cache-dir .uv-cache python -m unittest discover -s tests -t . -v
 ```
 
-Tests use Python's built-in unittest, injected clocks, synthetic public API
-responses, and a socket guard. They do not sleep or contact Polymarket.
-Live smoke checks are the normal and forced-fallback commands above, invoked
-manually and separately. Live availability/schema diagnostics are reported
-honestly, never substituted with old IDs or fabricated prices.
-
-## Layout and version control
-
-`src/polymarket_bot/market_data/` contains metadata parsing, the small public
-GET helper, Gamma/CLOB clients, discovery, and snapshot coordination.
-`src/polymarket_bot/cli.py` formats the result; `src/main.py` is the entry point.
-`tests/` contains offline behavioral checks. `data/` and `logs/` retain only
-their placeholders; this application creates no output files.
-
-Keep `pyproject.toml` and `uv.lock` in Git. Environments, caches, generated
-bytecode, local environment files, and generated data/logs remain ignored.
-The original scaffold, design/plan, and feature changes have separate commits.
-RTK integration remains project-scoped.
-
-The approved [design](docs/superpowers/specs/2026-10-10-read-only-market-data-design.md)
-and [implementation plan](docs/superpowers/plans/2026-10-10-read-only-market-data.md)
-are retained as historical approval artifacts.
-
-Official references: [Gamma event list](https://docs.polymarket.com/api-reference/events/list-events),
-[CLOB book](https://docs.polymarket.com/api-reference/market-data/get-order-book),
-[CLOB server time](https://docs.polymarket.com/api-reference/data/get-server-time).
+Tests use synthetic public API responses, injected clocks and temporary SQLite
+databases under `data/`. A socket guard prevents live connections. See the
+[recorder design](docs/superpowers/specs/2026-10-10-market-data-recorder-design.md)
+for the evidence and activation rules. The earlier
+[snapshot design](docs/superpowers/specs/2026-10-10-read-only-market-data-design.md)
+remains relevant to `src/main.py`.
