@@ -13,7 +13,7 @@ from uuid import uuid4
 
 from polymarket_bot.market_data.models import MarketDataError
 from polymarket_bot.market_data.numeric import decimal_text, exact_decimal_context
-from .models import (CHAINLINK_FEED_ID, CHAINLINK_FEED_NAME, RunConfig,
+from .models import (CHAINLINK_FEED_ID, CHAINLINK_FEED_NAME, ClockAnchor, RunConfig,
                      SlotCommit, SlotTarget)
 
 
@@ -277,6 +277,37 @@ class RecorderStore:
                 VALUES (?,?, 'mainnet',?, '{}',60,2)""",
                 (CHAINLINK_FEED_ID, CHAINLINK_FEED_NAME, "https://data.chain.link/streams/btc-usd-twap-60s-streams"))
         return run_id
+
+    def save_anchor(self, run_id: str, anchor: ClockAnchor) -> int:
+        """Append run-scoped integer timing evidence, including discontinuities."""
+        with self._transaction():
+            self._run(run_id)
+            _require(isinstance(anchor, ClockAnchor), "Clock anchor record is required.")
+            for name in ("server_seconds", "request_start_mono_ns", "request_end_mono_ns",
+                         "midpoint_ns", "server_us", "uncertainty_us"):
+                _integer(getattr(anchor, name), name, minimum=0)
+            for name in ("request_start_wall_us", "request_end_wall_us"):
+                _integer(getattr(anchor, name), name)
+            _require(0 < anchor.server_seconds <= 253_402_300_799
+                     and anchor.server_us == anchor.server_seconds * 1_000_000,
+                     "Clock server seconds and microseconds are inconsistent.")
+            rtt_ns = anchor.request_end_mono_ns - anchor.request_start_mono_ns
+            _require(rtt_ns >= 0 and anchor.midpoint_ns == (
+                     anchor.request_start_mono_ns + anchor.request_end_mono_ns) // 2,
+                     "Clock anchor must use the request midpoint.")
+            _require(anchor.uncertainty_us == 1_000_000 + (rtt_ns + 1999) // 2000,
+                     "Clock uncertainty must include one second plus half RTT.")
+            _require(anchor.status in ("VALID", "DISCONTINUITY")
+                     and type(anchor.diagnostic) is dict, "Unsupported clock anchor status or diagnostic.")
+            return self._insert("clock_anchors", dict(run_id=run_id,
+                server_seconds=anchor.server_seconds,
+                request_start_mono_ns=anchor.request_start_mono_ns,
+                request_end_mono_ns=anchor.request_end_mono_ns,
+                request_start_wall_us=anchor.request_start_wall_us,
+                request_end_wall_us=anchor.request_end_wall_us,
+                anchor_mono_ns=anchor.midpoint_ns, anchor_server_us=anchor.server_us,
+                uncertainty_us=anchor.uncertainty_us, status=anchor.status,
+                diagnostic_json=_json(anchor.diagnostic) if anchor.diagnostic else None))
 
     def reserve_slot(self, market_id: str, target: SlotTarget, *, run_id: str,
                      anchor_id: int, metadata_revision_id: int, started_mono_ns: int,

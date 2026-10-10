@@ -37,6 +37,26 @@ class SlotTarget:
 
 
 @dataclass(frozen=True)
+class SlotSelection:
+    missed: tuple[int, ...]
+    target: SlotTarget | None
+
+
+@dataclass(frozen=True)
+class ClockAnchor:
+    server_seconds: int
+    request_start_mono_ns: int
+    request_end_mono_ns: int
+    request_start_wall_us: int
+    request_end_wall_us: int
+    midpoint_ns: int
+    server_us: int
+    uncertainty_us: int
+    status: str
+    diagnostic: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class ReferenceAssociationDraft:
     market_id: str
     role: str

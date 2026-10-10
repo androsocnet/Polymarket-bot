@@ -1,12 +1,13 @@
 """Offline contract tests for the recorder's narrowly scoped public reads."""
 import json
 import unittest
+from datetime import timedelta
 
 import httpx
 
 from polymarket_bot.market_data.http import JsonRead, PublicGet
 from polymarket_bot.market_data.models import MarketDataError
-from tests.support import CONDITION, FakeClock, TOKEN_DOWN, TOKEN_UP
+from tests.support import CONDITION, FakeClock, NOW, TOKEN_DOWN, TOKEN_UP
 from tests.test_http import TrackingStream
 
 
@@ -56,6 +57,39 @@ class RecorderHttpTests(unittest.TestCase):
         with self.assertRaises(MarketDataError):
             self.reader.get_json("clob", "/orders", deadline=2)
         self.assertEqual(self.requests, [])
+
+    def test_successful_time_read_retains_observed_request_clocks(self):
+        # A wall step during a request must remain visible; RTT reconstruction
+        # must not overwrite the two actual local wall observations.
+        wall = [NOW + timedelta(microseconds=1), NOW + timedelta(microseconds=7)]
+        self.handler = lambda request: httpx.Response(
+            200, stream=TrackingStream([b"1791583800"], self.clock, delay=0.125))
+        reader = PublicGet(self.client, monotonic=self.clock.monotonic,
+                         monotonic_ns=lambda: int(self.clock.value * 1_000_000_000) + 17,
+                         sleep=self.clock.sleep, utcnow=lambda: wall.pop(0), max_attempts=1)
+        read = reader.get_json("clob", "/time", deadline=2)
+        self.assertTrue(hasattr(read, "started_mono_ns"), "Read lacks observed request timing")
+        self.assertEqual((read.started_mono_ns, read.finished_mono_ns), (17, 125_000_017))
+        self.assertEqual((read.started_wall_us, read.finished_wall_us),
+                         (1_791_593_400_000_001, 1_791_593_400_000_007))
+
+    def test_time_read_after_retry_anchors_successful_attempt_not_operation_start(self):
+        attempts = []
+        def respond(request):
+            status = 503 if len(self.requests) == 1 else 200
+            return httpx.Response(status, stream=TrackingStream(
+                [b"1791593400"], self.clock, delay=0.1))
+        self.handler = respond
+        reader = PublicGet(self.client, monotonic=self.clock.monotonic,
+                         sleep=self.clock.sleep, utcnow=self.clock.utcnow,
+                         max_attempts=2, on_attempt=attempts.append)
+        read = reader.get_json("clob", "/time", deadline=2)
+        self.assertTrue(hasattr(read, "started_mono_ns"), "Read lacks successful attempt timing")
+        self.assertEqual((read.started_mono_ns, read.finished_mono_ns), (600_000_000, 700_000_000))
+        self.assertEqual((read.started_wall_us, read.finished_wall_us),
+                         (1_791_593_400_600_000, 1_791_593_400_700_000))
+        self.assertEqual(read.started_mono_ns, attempts[1].started_mono_ns)
+        self.assertEqual(read.finished_mono_ns, attempts[1].ended_mono_ns)
 
     def tracked(self):
         self.attempts = []

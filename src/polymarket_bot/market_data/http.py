@@ -2,7 +2,7 @@
 import re
 from dataclasses import dataclass
 from typing import Callable, Literal
-from datetime import datetime
+from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import httpx
 from .models import MarketDataError
@@ -14,6 +14,15 @@ class JsonRead:
     started_mono: float
     finished_mono: float
     raw_body: bytes = b""
+    started_mono_ns: int | None = None
+    finished_mono_ns: int | None = None
+    started_wall_us: int | None = None
+    finished_wall_us: int | None = None
+
+
+def _wall_us(value: datetime) -> int:
+    delta = value - datetime(1970, 1, 1, tzinfo=timezone.utc)
+    return (delta.days * 86400 + delta.seconds) * 1_000_000 + delta.microseconds
 
 @dataclass(frozen=True)
 class HttpAttempt:
@@ -108,7 +117,8 @@ class PublicGet:
             remaining = self._remaining(deadline)
             start = self.monotonic()
             started_ns = self.monotonic_ns()
-            started_wall_us = int(self.utcnow().timestamp() * 1_000_000)
+            started_wall_us = _wall_us(self.utcnow())
+            finished_ns = finished_wall_us = None
             retry_after = None
             retryable = False
             status = None
@@ -139,7 +149,11 @@ class PublicGet:
                             raise MarketDataError("invalid_metadata", f"Invalid JSON from {source} {method} {path}.",
                                                   http_status=status) from exc
                         self._remaining(deadline)
-                        return JsonRead(payload, start, self.monotonic(), bytes(body))
+                        finished_mono = self.monotonic()
+                        finished_ns = self.monotonic_ns()
+                        finished_wall_us = _wall_us(self.utcnow())
+                        return JsonRead(payload, start, finished_mono, bytes(body),
+                                        started_ns, finished_ns, started_wall_us, finished_wall_us)
             except MarketDataError as exc:
                 error = exc
                 retryable = False
@@ -155,8 +169,8 @@ class PublicGet:
                 if self.on_attempt is not None:
                     self.on_attempt(HttpAttempt(
                         operation, method, path, selectors, attempt + 1,
-                        started_ns, self.monotonic_ns(), started_wall_us,
-                        int(self.utcnow().timestamp() * 1_000_000), status,
+                        started_ns, finished_ns if finished_ns is not None else self.monotonic_ns(),
+                        started_wall_us, finished_wall_us if finished_wall_us is not None else _wall_us(self.utcnow()), status,
                         "success" if error is None else "failure",
                         None if error is None else error.code, bytes(body), raw_complete))
             if not retryable or attempt == self.max_attempts - 1:
