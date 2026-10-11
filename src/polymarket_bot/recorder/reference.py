@@ -176,6 +176,111 @@ def boundary_retry_due(target_us: int, *, attempt_count: int, now_us: int) -> in
     return now_us + delay_seconds * 1_000_000
 
 
+def decode_schema_v2_report(payload: object, *, price_scale: int | None,
+                            decoder_revision: str | None,
+                            receipt_wall_us: int,
+                            receipt_server_us: int | None) -> ReferenceReportDraft:
+    """Decode a Chainlink Data Streams API report response envelope.
+
+    Accepts both nested ``{"report": {...}}`` and flat ``{...}`` layouts.
+    Extracts raw signed report bytes from the hex ``fullReport`` field,
+    validates feed identity and timestamp interval, and applies exact Decimal
+    scaling when both *price_scale* and *decoder_revision* are supplied.
+
+    This function does NOT verify DON threshold ECDSA signatures.
+    """
+    receipt_wall_us = parse_integer(receipt_wall_us, field="receipt wall",
+                                    minimum=-(2**63), maximum=2**63 - 1)
+    if receipt_server_us is not None:
+        receipt_server_us = parse_integer(receipt_server_us, field="receipt server",
+                                         minimum=-(2**63), maximum=2**63 - 1)
+
+    raw_signed_report = b""
+    times = dict(valid_from_seconds=None, observations_seconds=None, expires_at_seconds=None)
+    price, status, diagnostics = None, "UNVERIFIED", ()
+
+    try:
+        if not isinstance(payload, dict):
+            raise MarketDataError("invalid_reference_payload", "Report payload must be a dict.")
+
+        report = payload.get("report", payload)
+        if not isinstance(report, dict):
+            raise MarketDataError("invalid_reference_payload", "Inner report must be a dict.")
+
+        raw_feed_id = str(report.get("feedId") or report.get("feed_id") or "").strip().lower()
+        if raw_feed_id != CHAINLINK_FEED_ID.lower():
+            raise MarketDataError("invalid_reference_identity", "Feed ID mismatch in report.")
+
+        full_report_hex = report.get("fullReport") or report.get("full_report")
+        if not isinstance(full_report_hex, str) or not full_report_hex:
+            raise MarketDataError("invalid_reference_payload", "Missing fullReport hex field.")
+
+        full_report_hex = full_report_hex.strip()
+        if full_report_hex.startswith("0x") or full_report_hex.startswith("0X"):
+            full_report_hex = full_report_hex[2:]
+
+        try:
+            raw_signed_report = bytes.fromhex(full_report_hex)
+        except ValueError as exc:
+            raise MarketDataError("invalid_reference_payload", "fullReport is not valid hex.") from exc
+
+        if len(raw_signed_report) > 10_485_760:
+            raise MarketDataError("invalid_reference", "Raw report exceeds the evidence budget.")
+
+        for api_key, field_name in (
+            (("validFromTimestamp", "valid_from_timestamp", "valid_from"), "valid_from_seconds"),
+            (("observationsTimestamp", "observations_timestamp", "observations"), "observations_seconds"),
+            (("expiresAt", "expires_at", "expires"), "expires_at_seconds"),
+        ):
+            raw_value = None
+            for key in api_key:
+                if key in report:
+                    raw_value = report[key]
+                    break
+            times[field_name] = parse_integer(raw_value, field=field_name, minimum=0, maximum=253_402_300_799)
+
+        if not times["valid_from_seconds"] <= times["observations_seconds"] <= times["expires_at_seconds"]:
+            raise MarketDataError("invalid_reference_interval", "Invalid report time interval.")
+
+        price_str = report.get("benchmarkPrice") or report.get("benchmark_price") or report.get("price")
+        if price_str is None:
+            raise MarketDataError("invalid_numeric", "Missing benchmark price in report.")
+
+        parsed = parse_decimal(price_str, field="reference price integer")
+        if (type(price_str) not in (int, str)
+                or re.fullmatch(r"[+]?[0-9]+", str(price_str)) is None or parsed <= 0):
+            raise MarketDataError("invalid_numeric", "Reference price is not a positive integer.")
+
+        if price_scale is not None:
+            if type(price_scale) is not int or not 0 <= price_scale <= 128:
+                raise MarketDataError("invalid_numeric", "Unsupported reference price scale.")
+        if decoder_revision is not None and (type(decoder_revision) is not str or not 0 < len(decoder_revision) <= 128):
+            raise MarketDataError("invalid_reference_decoder", "Unsupported decoder revision.")
+
+        if price_scale is not None and decoder_revision is not None:
+            with exact_decimal_context():
+                price = parsed / (Decimal(10) ** price_scale)
+            status = "DECODED"
+
+    except (MarketDataError, DecimalException) as exc:
+        price, status = None, "INVALID"
+        diagnostics = (exc.code if isinstance(exc, MarketDataError) else "invalid_numeric",)
+
+    report_hash = sha256(raw_signed_report).hexdigest() if raw_signed_report else sha256(b"").hexdigest()
+
+    return ReferenceReportDraft(
+        CHAINLINK_FEED_ID, 2, raw_signed_report, report_hash,
+        **times,
+        decoded_price=price,
+        decoder_revision=decoder_revision if type(decoder_revision) is str and len(decoder_revision) <= 128 else None,
+        decode_status=status,
+        verification_status="UNVERIFIED",
+        first_received_wall_us=receipt_wall_us,
+        first_received_server_us=receipt_server_us,
+        diagnostics=diagnostics,
+    )
+
+
 def reference_page_plan(*, reports_per_call: int = 100, calls: int = 2) -> tuple[int, ...]:
     """Bounded inert page sizes for later short-gap repair, with no requests."""
     if (type(reports_per_call) is not int or not 1 <= reports_per_call <= 100
