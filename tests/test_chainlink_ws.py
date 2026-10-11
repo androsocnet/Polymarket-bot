@@ -34,6 +34,64 @@ class ChainlinkLiveConsumerTests(unittest.TestCase):
         self.assertIsNone(kw['proxy'])
         self.assertEqual(kw['max_size'], 10 * 1024 * 1024)
 
+    def test_dependency_redirect_loop_never_opens_second_origin(self):
+        from websockets.sync.client import reconnect
+        from websockets.exceptions import InvalidStatus
+        from websockets.http11 import Response
+        from websockets.datastructures import Headers
+        for status in (300, 301, 302, 303, 307, 308):
+            for location in ('wss://evil.example/ws', '/other'):
+                calls = []
+                def opening(instance, deadline):
+                    calls.append(instance.uri)
+                    if len(calls) > 1:
+                        self.fail('redirect followed with signed headers')
+                    raise InvalidStatus(Response(status, 'Redirect', Headers({'Location': location}), b''))
+                consumer = self.consumer()
+                with self.subTest(status=status, location=location), patch.object(reconnect, 'open_connection', opening):
+                    with self.assertRaises(InvalidStatus):
+                        consumer._connect()
+                self.assertEqual(len(calls), 1)
+
+    def test_transient_handshake_statuses_retry_auth_terminal(self):
+        from websockets.exceptions import InvalidStatus
+        from websockets.http11 import Response
+        from websockets.datastructures import Headers
+        for status in (429, 500, 502, 503, 504, 401, 403):
+            calls, waits = [], []
+            def connector(*args, **kwargs):
+                calls.append(status)
+                raise InvalidStatus(Response(status, 'Rejected', Headers(), b''))
+            consumer = self.consumer(connector=connector)
+            def wait(delay):
+                waits.append(delay)
+                if len(waits) == 3:
+                    consumer._stop_event.set()
+            with patch.object(consumer._stop_event, 'wait', side_effect=wait):
+                consumer._run()
+            if status in (401, 403):
+                self.assertEqual(calls, [status])
+                self.assertEqual(waits, [])
+                self.assertIsNotNone(consumer._failure)
+            else:
+                self.assertEqual(waits, [1, 2, 4])
+                self.assertEqual(len(calls), 3)
+                self.assertIsNone(consumer._failure)
+
+    def test_digest_conflicts_rejected_before_timestamp_order(self):
+        consumer = self.consumer()
+        original = make_valid_report_payload()
+        consumer._handle_websocket_message(json.dumps(original).encode())
+        first = consumer.get_freshest_report(5, 160)
+        for field, value in (('observationsTimestamp', 161), ('benchmarkPrice', '7')):
+            altered = make_valid_report_payload()
+            altered['report'][field] = value
+            with self.subTest(field=field), self.assertRaises(MarketDataError):
+                consumer._handle_websocket_message(json.dumps(altered).encode())
+            self.assertEqual(consumer.get_freshest_report(5, 160), first)
+        consumer._handle_websocket_message(json.dumps(original, indent=2).encode())
+        self.assertEqual(consumer.get_freshest_report(5, 160), first)
+
     def test_numeric_validation_fail_closed(self):
         consumer = self.consumer()
         for field, value in (('observationsTimestamp', True), ('observationsTimestamp', 160.5),

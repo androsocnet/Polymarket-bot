@@ -6,8 +6,17 @@ import math
 import threading
 import time
 
-from websockets.exceptions import ConnectionClosed, InvalidHandshake
-from websockets.sync.client import connect
+from websockets.exceptions import ConnectionClosed, InvalidHandshake, InvalidStatus
+from websockets.sync.client import reconnect
+
+
+class _NoRedirectConnect(reconnect):
+    def process_redirect(self, exc):
+        return exc
+
+
+def connect(uri, **kwargs):
+    return _NoRedirectConnect(uri, **kwargs).connect()
 
 from polymarket_bot.market_data.models import MarketDataError
 from polymarket_bot.market_data.numeric import load_numeric_json
@@ -101,6 +110,10 @@ class ChainlinkLiveConsumer:
             try:
                 self._connect()
                 self._message_loop()
+            except InvalidStatus as exc:
+                if exc.response.status_code not in (429, 500, 502, 503, 504):
+                    self._failure = 'authentication_or_handshake'
+                    self._stop_event.set()
             except InvalidHandshake:
                 self._failure = 'authentication_or_handshake'
                 self._stop_event.set()
@@ -162,6 +175,14 @@ class ChainlinkLiveConsumer:
                       receipt_server_us=None, raw_message=raw, report_hash=digest,
                       verification_status='UNVERIFIED')
         with self._lock:
+            if self._latest_report is not None and digest == self._latest_report[0][1]:
+                previous = self._latest_report[2]
+                evidence_keys = ('receipt_wall_us', 'receipt_monotonic', 'receipt_server_us',
+                                 'raw_message', 'report_hash', 'verification_status')
+                if {k: v for k, v in fields.items() if k not in evidence_keys} != {
+                        k: v for k, v in previous.items() if k not in evidence_keys}:
+                    raise MarketDataError('reference_metadata_conflict', 'Signed report metadata changed.')
+                return
             if self._latest_report is None or key > self._latest_report[0]:
                 self._latest_report = (key, signed, fields, draft)
 

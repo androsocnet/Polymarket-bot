@@ -101,6 +101,47 @@ class ChainlinkRestClientTests(unittest.TestCase):
         reader._monotonic = lambda: clock[0]
         self.assertEqual(reader.get_latest_report(CHAINLINK_FEED_ID, 102)[0], b'signed-report')
 
+    def test_http_500_error_code(self):
+        reader = self.reader(lambda r: httpx.Response(500))
+        with self.assertRaises(MarketDataError) as caught:
+            reader.get_latest_report(CHAINLINK_FEED_ID, 102)
+        self.assertEqual(caught.exception.code, 'chainlink_http_error')
+        self.assertEqual(caught.exception.http_status, 500)
+
+    def test_http_401_error_code(self):
+        reader = self.reader(lambda r: httpx.Response(401))
+        with self.assertRaises(MarketDataError) as caught:
+            reader.get_latest_report(CHAINLINK_FEED_ID, 102)
+        self.assertEqual(caught.exception.code, 'chainlink_auth_failed')
+
+    def test_malformed_json_fail_closed(self):
+        reader = self.reader(lambda r: httpx.Response(200, content=b'{invalid'))
+        with self.assertRaises(MarketDataError):
+            reader.get_latest_report(CHAINLINK_FEED_ID, 102)
+
+    def test_transport_timeout_error_code(self):
+        def handler(request):
+            raise httpx.ReadTimeout('secret sentinel')
+        reader = self.reader(handler)
+        with self.assertRaises(MarketDataError) as caught:
+            reader.get_latest_report(CHAINLINK_FEED_ID, 102)
+        self.assertEqual(caught.exception.code, 'chainlink_timeout')
+        self.assertNotIn('sentinel', str(caught.exception))
+
+    def test_timestamp_query_exact_values(self):
+        def handler(request):
+            self.assertEqual(request.url.path, '/api/v1/reports')
+            self.assertEqual(dict(request.url.params), {'feedId': CHAINLINK_FEED_ID, 'timestamp': '1746000000'})
+            return httpx.Response(200, json=make_valid_report_payload())
+        self.reader(handler).get_report_at_timestamp(CHAINLINK_FEED_ID, 1746000000, 102)
+
+    def test_page_query_exact_values(self):
+        def handler(request):
+            self.assertEqual(request.url.path, '/api/v1/reports/page')
+            self.assertEqual(dict(request.url.params), {'feedId': CHAINLINK_FEED_ID, 'start': '100', 'end': '200', 'limit': '50'})
+            return httpx.Response(200, json={'reports': [make_valid_report_payload()]})
+        self.assertEqual(len(self.reader(handler).get_reports_page(CHAINLINK_FEED_ID, 100, 200, 50, 102)), 1)
+
     def test_invalid_parameters_never_send(self):
         reader = self.reader(lambda r: self.fail('sent invalid request'))
         for args in ((CHAINLINK_FEED_ID, True, 200, 1, 102), (CHAINLINK_FEED_ID, 0, 200, True, 102),
