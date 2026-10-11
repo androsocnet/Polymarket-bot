@@ -346,10 +346,10 @@ class RecorderStore:
                 VALUES (?,?, 'mainnet',?, '{}',60,2)""",
                 (CHAINLINK_FEED_ID, CHAINLINK_FEED_NAME, "https://data.chain.link/streams/btc-usd-twap-60s-streams"))
             if offline:
-                self._connection.execute('UPDATE reference_feeds SET price_scale=?,decoder_revision=?,catalog_metadata_json=?,verification_evidence_json=? WHERE feed_id=?',
+                self._connection.execute('UPDATE reference_feeds SET verified_us=NULL,price_scale=?,decoder_revision=?,catalog_metadata_json=?,verification_evidence_json=? WHERE feed_id=?',
                     (offline_reference.price_scale, offline_reference.decoder_revision,
                      _json(offline_reference.metadata.catalog_metadata),
-                     _json({'scope': 'MANAGED_PRODUCTION' if managed else 'SYNTHETIC_OFFLINE_ONLY', 'signed_binary_decoder_verified': False,
+                     _json({'scope': 'MANAGED_PRODUCTION' if managed else 'SYNTHETIC_OFFLINE_ONLY', 'signed_binary_decoder_verified': managed, 'structural_decoder_validation': asdict(offline_reference.authorization) if managed else None, 'discovery_calibration': 'PENDING',
                             'don_verified': False}), CHAINLINK_FEED_ID))
         return run_id
 

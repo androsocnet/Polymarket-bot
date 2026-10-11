@@ -758,7 +758,7 @@ class RecorderServiceTests(unittest.TestCase):
         fixture.advance(1)
         session = ManagedReferenceSession(evidence=ActivationEvidence(*([True]*6)), discovery=lambda d: {},
             credentials=lambda: ('id','secret'), monotonic_ns=fixture.monotonic_ns,
-            wall_us=fixture.wall_us, decoder_revision='abi')
+            wall_us=fixture.wall_us, decoder_revision='abi', authorization=__import__('tests.test_schema_v2_decoder', fromlist=['managed_authorization']).managed_authorization('abi'))
         session.consumer, session.price_scale, session.live = consumer, 8, consumer.get_freshest_report
         row = ReferenceAssociationDraft('test', 'SLOT_CURRENT', fixture.wall_us(), 'UNAVAILABLE',
             'NOT_FETCHED', False, fixture.wall_us(), fixture.wall_us())
@@ -796,7 +796,7 @@ class RecorderServiceTests(unittest.TestCase):
         session = ManagedReferenceSession(evidence=ActivationEvidence(*([True]*6)),
             discovery=lambda d: (_ for _ in ()).throw(ConnectionError('secret-startup')),
             credentials=lambda: self.fail('credentials'), monotonic_ns=fixture.monotonic_ns,
-            wall_us=fixture.wall_us, decoder_revision='abi')
+            wall_us=fixture.wall_us, decoder_revision='abi', authorization=__import__('tests.test_schema_v2_decoder', fromlist=['managed_authorization']).managed_authorization('abi'))
         recorder = Recorder(fixture.store, fixture.public, monotonic_ns=fixture.monotonic_ns,
             wall_us=fixture.wall_us, sleep=fixture.sleep, offline_reference=session)
         result = recorder.run(RunConfig(mode='REFERENCE_REQUIRED'), should_stop=lambda: False)
@@ -847,7 +847,7 @@ class RecorderServiceTests(unittest.TestCase):
                 'status': 'active', 'schemaVersion': 2, 'decimals': 8},
             credentials=lambda: ('synthetic-id', 'synthetic-secret'), rest_factory=rest_factory,
             live_factory=lambda *a: Live(), monotonic_ns=fixture.monotonic_ns,
-            wall_us=fixture.wall_us, decoder_revision='abi-v2')
+            wall_us=fixture.wall_us, decoder_revision='abi-v2', authorization=__import__('tests.test_schema_v2_decoder', fromlist=['managed_authorization']).managed_authorization('abi-v2'))
         recorder = Recorder(fixture.store, fixture.public, monotonic_ns=fixture.monotonic_ns,
             wall_us=fixture.wall_us, sleep=fixture.sleep, offline_reference=session)
         result = recorder.run(RunConfig(mode='REFERENCE_REQUIRED'), should_stop=lambda: fixture.book_count>=2)

@@ -183,6 +183,9 @@ def _references(store, eligible, slots, markets, runs, end_us):
             continue
         receipt, learned, target = row["fetch_received_server_us"],row["learned_server_us"],slot["scheduled_us"]
         proof = durable.get((row['slot_id'], row['learned_wall_us']))
+        activation = json.loads(run.get('activation_evidence_json') or '{}')
+        if activation.get('scope') == 'MANAGED_PRODUCTION' and proof is None:
+            continue
         if proof is not None and (not proof.get('available_live') or proof.get('durable_server_us') is None
                 or proof['durable_server_us'] >= min(target+2_000_000, market['window_end_us'])):
             continue

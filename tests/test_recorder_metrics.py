@@ -376,6 +376,22 @@ class RecorderMetricsTests(unittest.TestCase):
         late = metrics.measure(store,start_us=NOW_US,end_us=NOW_US+3_000_000)
         self.assertEqual(late.reference_coverage["live_slots"],0)
 
+    def test_managed_crash_after_available_requires_durable_proof(self):
+        metrics = self.metrics()
+        store, run_id = self.fixture()
+        slot = self.slot(store, run_id, 150, 'COMPLETE')
+        with store._connection:
+            store._connection.execute("UPDATE recording_runs SET mode='REFERENCE_REQUIRED',reference_activation='VERIFIED',activation_evidence_json=?",
+                ('{"scope":"MANAGED_PRODUCTION"}',))
+        self.reference(store, run_id, slot, learned=NOW_US, verified='UNVERIFIED')
+        report = metrics.measure(store, start_us=NOW_US, end_us=NOW_US+4_000_000)
+        self.assertEqual(report.reference_coverage['live_slots'], 0)
+        store.record_event(run_id, 'DISCOVERY_GAP', started_us=NOW_US+3_000_000,
+            detail={'reason': 'REFERENCE_DURABLE', 'slot_id': slot, 'learned_wall_us': NOW_US,
+                'available_live': True, 'durable_server_us': NOW_US+3_000_000})
+        report = metrics.measure(store, start_us=NOW_US, end_us=NOW_US+4_000_000)
+        self.assertEqual(report.reference_coverage['live_slots'], 0)
+
     def test_live_reference_requires_verified_timely_original_provenance(self):
         metrics = self.metrics()
         store, run_id = self.fixture()

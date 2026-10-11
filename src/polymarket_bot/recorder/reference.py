@@ -467,9 +467,20 @@ class OfflineReferenceSession:
         return row, fetch, reports, deadline
 
 
+@dataclass(frozen=True)
+class ManagedAuthorization:
+    authority: str
+    permission_record: str
+    feed_id: str
+    decoder_revision: str
+    decoder_validation_record: str
+    synthetic_only: bool = False
+
+
 class ManagedReferenceSession(OfflineReferenceSession):
     def __init__(self, *, evidence, discovery, credentials, monotonic_ns, wall_us,
-                 decoder_revision, rest_factory=None, live_factory=None):
+                 decoder_revision, rest_factory=None, live_factory=None, authorization=None):
+        self.authorization = authorization
         self.evidence, self.discovery, self.credentials = evidence, discovery, credentials
         self.monotonic_ns, self.wall_us = monotonic_ns, wall_us
         self.decoder_revision = decoder_revision
@@ -483,6 +494,12 @@ class ManagedReferenceSession(OfflineReferenceSession):
         if mode == 'BOOK_ONLY':
             return
         require_reference_activation(mode, self.evidence)
+        authority = self.authorization
+        if (not isinstance(authority, ManagedAuthorization) or authority.synthetic_only is not False
+                or authority.feed_id != CHAINLINK_FEED_ID or authority.decoder_revision != self.decoder_revision
+                or any(type(value) is not str or not 0 < len(value) <= 512 for value in
+                    (authority.authority, authority.permission_record, authority.decoder_validation_record))):
+            raise MarketDataError('activation_required', 'Trusted permission and structural decoder records required.')
         if self.started:
             return
         from .chainlink_discovery import verify_feed_identity

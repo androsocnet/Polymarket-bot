@@ -46,7 +46,23 @@ def build_schema_v2_report_payload(
     }, signed_report
 
 
+def managed_authorization(revision):
+    from polymarket_bot.recorder.reference import ManagedAuthorization
+    return ManagedAuthorization('offline-test-authority', 'injected-test-permission',
+        models.CHAINLINK_FEED_ID, revision, 'canonical-ABI-regression-suite')
+
+
 class SchemaV2DecoderTests(unittest.TestCase):
+    def test_managed_production_rejects_boolean_only_authority(self):
+        from polymarket_bot.recorder.reference import ManagedReferenceSession, ActivationEvidence
+        session = ManagedReferenceSession(evidence=ActivationEvidence(*([True]*6)),
+            discovery=lambda d: self.fail('Discovery without authority'),
+            credentials=lambda: self.fail('Credentials without authority'),
+            monotonic_ns=lambda: 0, wall_us=lambda: NOW_US, decoder_revision='abi')
+        with self.assertRaises(MarketDataError) as caught:
+            session.start('REFERENCE_REQUIRED', 2)
+        self.assertEqual(caught.exception.code, 'activation_required')
+
     def test_managed_lifecycle_gates_cleanup_and_idempotence(self):
         from polymarket_bot.recorder.reference import ManagedReferenceSession, ActivationEvidence
         calls = []
@@ -62,7 +78,7 @@ class SchemaV2DecoderTests(unittest.TestCase):
         session = ManagedReferenceSession(evidence=ActivationEvidence(*([True]*6)),
             discovery=lambda deadline: discovery, credentials=lambda: calls.append('credentials') or ('id', 'secret'),
             rest_factory=lambda *args: Rest(), live_factory=lambda *args: Live(),
-            monotonic_ns=lambda: 0, wall_us=lambda: NOW_US, decoder_revision='abi-v2')
+            monotonic_ns=lambda: 0, wall_us=lambda: NOW_US, decoder_revision='abi-v2', authorization=managed_authorization('abi-v2'))
         session.start('BOOK_ONLY', 2)
         self.assertEqual(calls, [])
         session.start('REFERENCE_REQUIRED', 2)
@@ -72,7 +88,7 @@ class SchemaV2DecoderTests(unittest.TestCase):
         denied = ManagedReferenceSession(evidence=ActivationEvidence(*([False]*6)),
             discovery=lambda d: self.fail('Discovery before permission'),
             credentials=lambda: self.fail('Credentials before permission'),
-            monotonic_ns=lambda: 0, wall_us=lambda: NOW_US, decoder_revision='abi-v2')
+            monotonic_ns=lambda: 0, wall_us=lambda: NOW_US, decoder_revision='abi-v2', authorization=managed_authorization('abi-v2'))
         with self.assertRaises(MarketDataError): denied.start('REFERENCE_REQUIRED', 2)
 
     def test_decoder_rejects_noncanonical_hex_before_allocation(self):
@@ -109,7 +125,7 @@ class SchemaV2DecoderTests(unittest.TestCase):
             discovery=lambda d: {'feedId': models.CHAINLINK_FEED_ID, 'name': models.CHAINLINK_FEED_NAME,
                 'status': 'active', 'schemaVersion': 2, 'decimals': 8},
             credentials=lambda: self.fail('Credentials loaded despite persisted pin conflict'),
-            monotonic_ns=lambda: 0, wall_us=lambda: NOW_US, decoder_revision='abi')
+            monotonic_ns=lambda: 0, wall_us=lambda: NOW_US, decoder_revision='abi', authorization=managed_authorization('abi'))
         with self.assertRaises(MarketDataError) as caught:
             session.start('REFERENCE_REQUIRED', 2, persisted_pin={'price_scale': 9, 'decoder_revision': 'abi'})
         self.assertEqual(caught.exception.code, 'identity_conflict')
@@ -127,7 +143,7 @@ class SchemaV2DecoderTests(unittest.TestCase):
                 'status': 'active', 'schemaVersion': 2, 'decimals': 8},
             credentials=lambda: ('id', 'secret'), rest_factory=lambda *a: Rest(),
             live_factory=lambda *a: Live(), monotonic_ns=lambda: 0, wall_us=lambda: NOW_US,
-            decoder_revision='abi')
+            decoder_revision='abi', authorization=managed_authorization('abi'))
         with self.assertRaises(MarketDataError): session.start('REFERENCE_REQUIRED', 2)
         session.stop()
         self.assertEqual(calls, ['live-stop', 'rest-close'])
