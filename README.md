@@ -40,9 +40,10 @@ refuses with `activation_required`; the CLI has no credentials, signing, or
 activation option. `BOOK_ONLY / REFERENCE_INCOMPLETE` is printed on a run, and
 book coverage and verified live reference coverage remain separate.
 
-An existing database can be measured offline. The UTC interval is half-open for
-scheduled slots; checkpoint and other evidence include their labelled time
-bounds. This example is a command template, not a claim that data was recorded:
+An existing database can be measured offline. Requested UTC bounds use local
+wall time. Scheduled slots use a separate half-open calibrated server interval;
+checkpoint and receipt evidence retain their labelled wall bounds. This example
+is a command template, not a claim that data was recorded:
 
 ```powershell
 uv run --offline --locked --cache-dir .uv-cache python src/record.py report --db data/recorder.sqlite3 --start 2026-10-10T00:00:00Z --end 2026-10-11T00:00:00Z
@@ -57,6 +58,12 @@ restart downtime, discovery gaps, book-depth breakdown, resolution counts and
 raw/compressed evidence bytes. Rates or physical COMPLETE denominators that
 cannot be established are `null`, with diagnostic bounds or reasons. A storage
 projection describes the observed fixed workload and is not a guarantee.
+Quality bounds use persisted valid clock anchors with compatible recorded
+uncertainty intervals. Counts and percentages are labelled calibrated point
+estimates, with eligible-slot and status-count bounds. Missing calibration or
+incompatible clock evidence produces `null` quality values with a diagnostic
+reason. This projection does not establish universal wall-clock accuracy or
+change recorded timestamps.
 
 ## Public data and evidence
 
@@ -72,7 +79,8 @@ Each outcome has independent book identity and source-time validation. The
 recorder tries the batch read and uses single-book GET fallback only for a batch
 404/405 or missing requested token, within the slot deadline. REST batch
 responses are **not guaranteed atomic**. Equal source timestamps do not make
-them atomic. An invalid or empty side is explicitly unavailable; it is never
+them atomic. An empty book can be valid with nullable quote summaries.
+Malformed observations carry explicit failures. Missing quotes are never
 replaced by a complement, metadata price or guessed quote. All exact price and
 size arithmetic uses bounded Decimal inputs. Malformed numeric evidence is
 contained per observation, without rounding or clamping source values.

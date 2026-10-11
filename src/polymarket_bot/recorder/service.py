@@ -21,6 +21,11 @@ class _StopRequested(Exception):
     """Internal normal-stop signal raised before an actual HTTP attempt."""
 
 
+def _epoch_us(value):
+    delta = value - datetime(1970, 1, 1, tzinfo=timezone.utc)
+    return (delta.days * 86400 + delta.seconds) * 1_000_000 + delta.microseconds
+
+
 class Recorder:
     def __init__(self, store: RecorderStore, public: PublicGet, *,
                  monotonic_ns: Callable[[], int], wall_us: Callable[[], int],
@@ -111,7 +116,7 @@ class Recorder:
                 if not self._clock_ready_after_io("ANCHOR_EXPIRED_DURING_REVALIDATION"):
                     return
                 self.store.record_event(self.run_id, "DISCOVERY_GAP", started_us=self._now(),
-                                        detail={"reason": exc.code, "revalidation": True})
+                                        detail={"reason": exc.code, "revalidation": True, "diagnostic_only": True})
                 self._reconcile(deadline_ns)
                 return
             if not self._clock_ready_after_io("ANCHOR_EXPIRED_DURING_REVALIDATION"):
@@ -133,7 +138,7 @@ class Recorder:
             warnings = self.revision.warnings
             if any(warning.startswith("metadata_refresh_failed") for warning in warnings):
                 self.store.record_event(self.run_id, "DISCOVERY_GAP", started_us=self._now(),
-                    market_id=previous.market.market_id, detail={"warnings": warnings})
+                    market_id=previous.market.market_id, detail={"warnings": warnings, "diagnostic_only": True})
         if self.monotonic_ns() >= deadline_ns:
             return
         self._reconcile(deadline_ns)
@@ -257,6 +262,17 @@ class Recorder:
         self.store.finish_run(self.run_id, state=state, wall_us=self.wall_us(), reason=reason)
         take_checkpoint(self.store,run_id=self.run_id,wall_us=self.wall_us())
 
+    def _start_discovery_gap(self, started_us, **detail):
+        if self.discovery_gap_id is None:
+            self.discovery_gap_start = started_us
+            self.discovery_gap_id = self.store.record_event(self.run_id, "DISCOVERY_GAP",
+                started_us=started_us, detail={"time_domain": "SERVER", "acquisition_gap": True, **detail})
+
+    def _finish_discovery_gap(self, observed_us):
+        if self.discovery_gap_id is not None and observed_us >= self.discovery_gap_start:
+            self.store.finish_discovery_gap(self.discovery_gap_id, run_id=self.run_id, ended_us=observed_us)
+            self.discovery_gap_id = None
+
     def _record(self, config, *, should_stop):
         self.config = config
         self.revalidate = False
@@ -280,7 +296,8 @@ class Recorder:
         self.miss_reason = "BEFORE_START"
         self.known_recovered = False
         self.clock_recovery_needed = False
-        unknown_gap_recorded = False
+        self.discovery_gap_id = None
+        self.discovery_gap_start = None
         while not should_stop():
             if self.revision is None or not self.clock.usable():
                 self._checkpoint_due()
@@ -294,6 +311,10 @@ class Recorder:
                     continue
             if not self.known_recovered:
                 self._recover_known()
+                if self.known_markets:
+                    known_end = max(row["window_end_us"] for row in self.known_markets)
+                    if known_end <= self._now():
+                        self._start_discovery_gap(known_end, unknown_windows=True, reason="DOWNTIME")
             if self.clock_recovery_needed:
                 self._recover_known(reason="CLOCK_PAUSE", markets=self.store.restart_context()[1])
                 self.clock_recovery_needed = False
@@ -305,28 +326,24 @@ class Recorder:
                         use_fast_path=config.use_fast_path))
                 except MarketDataError as exc:
                     self._clock_ready_after_io("ANCHOR_EXPIRED_DURING_DISCOVERY")
-                    self.store.record_event(self.run_id, "DISCOVERY_GAP", started_us=started_us,
-                        ended_us=self._now() if self.clock.usable() else None,
-                        detail={"reason": exc.code, "unknown_market": True,
-                                "time_domain": "SERVER"})
+                    if self.discovery_gap_id is None:
+                        self._start_discovery_gap(started_us, reason=exc.code, unknown_market=True)
+                    else:
+                        self.store.record_event(self.run_id, "DISCOVERY_GAP", started_us=started_us,
+                            ended_us=max(started_us,self._now()) if self.clock.usable() else None,
+                            detail={"reason": exc.code, "unknown_market": True,
+                                    "time_domain": "SERVER", "diagnostic_only": True})
                     retry_ns = self.monotonic_ns() + 2_000_000_000
                     self._housekeeping(retry_ns)
                     self._wait(retry_ns)
                     continue
                 if not self._clock_ready_after_io("ANCHOR_EXPIRED_DURING_DISCOVERY"):
                     continue
-                self._save_revision(candidate)
-                if self.known_markets and not unknown_gap_recorded:
-                    known_end = max(row["window_end_us"] for row in self.known_markets)
-                    current_start = int(self.revision.market.window_start.timestamp()) * 1_000_000
-                    if current_start > known_end:
-                        self.store.record_event(self.run_id, "DISCOVERY_GAP", started_us=known_end,
-                            ended_us=current_start, detail={"unknown_windows": True,
-                                                           "reason": "DOWNTIME"})
-                    unknown_gap_recorded = True
+                if self._save_revision(candidate):
+                    self._finish_discovery_gap(candidate.observed_us)
             market = self.revision.market
-            start_us = int(market.window_start.timestamp()) * 1_000_000
-            end_us = start_us + 900_000_000
+            start_us = _epoch_us(market.window_start)
+            end_us = _epoch_us(market.window_end)
             now = self._now()
             selection = select_future_slot(market, now_us=now,
                 terminal_indices=self.store.covered_indices(market.market_id))
@@ -337,6 +354,7 @@ class Recorder:
             self.miss_reason = "PROCESSING_OVERRUN" if self.revision.capture_ready else "METADATA_NOT_READY"
             if now >= end_us:
                 self.store.expire_market(market.market_id, observed_us=now)
+                self._start_discovery_gap(end_us, reason="ROLLOVER", prior_market_id=market.market_id)
                 self.revision = None
                 self.miss_reason = "BEFORE_START"
                 continue

@@ -187,6 +187,27 @@ class ResolutionPersistenceTests(unittest.TestCase):
         self.assertEqual(self.store._one("SELECT status FROM reference_associations")["status"], "DISABLED")
         self.assertEqual(reconcile_due(public, self.store, now_us=self.end_us + 10**9, deadline=700), 0)
 
+    def test_backward_wall_step_preserves_resolution_and_positive_monotonic_latency(self):
+        from polymarket_bot.recorder.resolution import _revision_from_row
+        revision = _revision_from_row(self.store._one("SELECT * FROM markets WHERE market_id='1001'"))
+        row = {"condition_id": CONDITION, "status": "resolved", "payouts": [1, 0]}
+        raw = json.dumps({"data": [row]}).encode()
+        attempt = HttpAttempt("RESOLUTION", "GET", "/v2/resolutions", ("condition="+CONDITION,),
+            1, 1_000_000_000, 1_100_000_000, self.end_us+2_000_000, self.end_us+1_000_000,
+            200, "success", None, raw, True)
+        for learned_delta in (0, -500_000):
+            observation = parse_resolution(row, revision, raw_response=raw,
+                learned_wall_us=attempt.ended_wall_us+learned_delta, learned_server_us=self.end_us+3_000_000)
+            self.store.save_resolutions((observation,), requests=(attempt,))
+        requests = self.store._rows("SELECT started_wall_us,ended_wall_us,latency_ns FROM request_attempts")
+        self.assertEqual([(r["started_wall_us"],r["ended_wall_us"],r["latency_ns"]) for r in requests],
+            [(self.end_us+2_000_000,self.end_us+1_000_000,100_000_000)]*2)
+        observations = self.store._rows("SELECT learned_wall_us,provenance_json FROM resolution_observations ORDER BY resolution_id")
+        self.assertEqual([r["learned_wall_us"] for r in observations], [self.end_us+1_000_000,self.end_us+500_000])
+        self.assertTrue(all("wall_clock_movement" in r["provenance_json"] for r in observations))
+        with self.assertRaises(RecorderStoreError):
+            self.store.save_resolutions((observation,), requests=(replace(attempt, ended_mono_ns=0),))
+
     def test_transport_failure_and_pending_are_persisted_for_retry(self):
         public, attempts, _ = self.public({"error": "unavailable"}, status=503)
         self.assertEqual(reconcile_due(public, self.store, now_us=self.end_us, deadline=700), 1)

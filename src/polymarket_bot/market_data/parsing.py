@@ -20,7 +20,7 @@ def _time(value: object, field: str) -> datetime:
         if parsed.tzinfo is None or parsed.utcoffset() is None:
             raise ValueError("Timezone required")
         return parsed.astimezone(timezone.utc)
-    except (ValueError, TypeError) as exc:
+    except (ValueError, TypeError, OverflowError) as exc:
         raise _invalid(f"Invalid aware UTC timestamp: {field}.") from exc
 
 def _array(value: object, field: str, code: str = "invalid_metadata") -> list:

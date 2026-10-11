@@ -126,6 +126,65 @@ class MetadataTests(unittest.TestCase):
         self.assertEqual(decode_evidence(saved["clob_config_raw_z"],
                                          json.loads(saved["raw_sizes_json"])["clob"], 1), raw_config)
 
+    def test_invalid_known_clob_numbers_pause_and_preserve_raw_diagnostics(self):
+        config = {"mts": "NaN", "mos": {"bad": "type"}, "mbf": "1e999999999999999",
+                  "tbf": True, "fd": {"r": "Infinity", "vendor": "opaque"}}
+        gamma, public, _, _, _, _, raw_config = self.transport(config=config)
+        revision = acquire_market(gamma, public, clock=self.clock, deadline=120, use_fast_path=True)
+        self.assertFalse(revision.capture_ready)
+        self.assertTrue(all(any("invalid_clob_numeric:"+field in w for w in revision.warnings)
+                            for field in ("mts", "mos", "mbf", "tbf", "fd.r")))
+        store, run_id = self.database()
+        store.save_market_revision(run_id, revision)
+        saved = store._one("SELECT * FROM market_revisions")
+        self.assertIsNone(saved["tick_size_text"])
+        self.assertIsNone(saved["min_order_size_text"])
+        self.assertEqual(json.loads(saved["fee_config_json"]), {"fd": {"vendor": "opaque"}})
+        self.assertEqual(decode_evidence(saved["clob_config_raw_z"],
+            json.loads(saved["raw_sizes_json"])["clob"], 1), raw_config)
+        self.assertEqual(store._one("SELECT lifecycle FROM markets")["lifecycle"], "CURRENT")
+        diagnostic = store._one("SELECT detail_json FROM recorder_events WHERE kind='DISCOVERY_GAP'")
+        self.assertIn("invalid_clob_numeric:mos", diagnostic["detail_json"])
+
+    def test_known_clob_numbers_store_exact_canonical_text(self):
+        config = {"mts": "1e-2", "mos": "1.000000000000000000000000000000001",
+                  "mbf": "0.000", "tbf": "2e1", "fd": {"r": "2e-2", "e": 3}}
+        gamma, public, _, _, _, _, _ = self.transport(config=config)
+        revision = acquire_market(gamma, public, clock=self.clock, deadline=120, use_fast_path=True)
+        self.assertTrue(revision.capture_ready)
+        store, run_id = self.database()
+        store.save_market_revision(run_id, revision)
+        saved = store._one("SELECT * FROM market_revisions")
+        self.assertEqual((saved["tick_size_text"], saved["min_order_size_text"]),
+                         ("0.01", "1.000000000000000000000000000000001"))
+        self.assertEqual(json.loads(saved["fee_config_json"]),
+                         {"mbf": "0.000", "tbf": "20", "fd": {"r": "0.02", "e": 3}})
+
+    def test_bounded_zero_sizes_and_signed_fees_do_not_invent_new_domain_rules(self):
+        config = {"mts": "0.000", "mos": 0, "mbf": "-1e-2", "tbf": 0, "fd": {"r": "-2e-2"}}
+        gamma, public, _, _, _, _, _ = self.transport(config=config)
+        revision = acquire_market(gamma, public, clock=self.clock, deadline=120, use_fast_path=True)
+        self.assertTrue(revision.capture_ready)
+        store, run_id = self.database()
+        store.save_market_revision(run_id, revision)
+        saved = store._one("SELECT * FROM market_revisions")
+        self.assertEqual((saved["tick_size_text"],saved["min_order_size_text"]),("0.000","0"))
+        self.assertEqual(json.loads(saved["fee_config_json"]),{"mbf":"-0.01","tbf":"0","fd":{"r":"-0.02"}})
+
+    def test_discovery_gap_closure_preserves_start_and_rejects_contradictions(self):
+        store, run_id = self.database()
+        gap = store.record_event(run_id,"DISCOVERY_GAP",started_us=NOW_US,
+            detail={"acquisition_gap":True,"time_domain":"SERVER"})
+        for event_id, owner, end in ((gap+1,run_id,NOW_US+1),(gap,"unknown",NOW_US+1),(gap,run_id,NOW_US-1)):
+            with self.assertRaises(RecorderStoreError):
+                store.finish_discovery_gap(event_id,run_id=owner,ended_us=end)
+        self.assertIsNone(store._one("SELECT ended_us FROM recorder_events WHERE event_id=?",(gap,))["ended_us"])
+        store.finish_discovery_gap(gap,run_id=run_id,ended_us=NOW_US+20_000)
+        with self.assertRaises(RecorderStoreError):
+            store.finish_discovery_gap(gap,run_id=run_id,ended_us=NOW_US+30_000)
+        saved = store._one("SELECT started_us,ended_us FROM recorder_events WHERE event_id=?",(gap,))
+        self.assertEqual((saved["started_us"],saved["ended_us"]),(NOW_US,NOW_US+20_000))
+
     def test_unchanged_refresh_preserves_first_observed_revision(self):
         gamma, public, _, _, _, _, _ = self.transport()
         prior = acquire_market(gamma, public, clock=self.clock, deadline=120, use_fast_path=True)

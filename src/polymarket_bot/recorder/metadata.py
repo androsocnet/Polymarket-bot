@@ -3,7 +3,7 @@ from dataclasses import replace
 
 from polymarket_bot.market_data.discovery import discover_current
 from polymarket_bot.market_data.models import MarketDataError, MarketDescriptor
-from polymarket_bot.market_data.numeric import load_numeric_json
+from polymarket_bot.market_data.numeric import decimal_text, load_numeric_json, parse_decimal
 from polymarket_bot.market_data.parsing import parse_market
 from .models import MarketRevision
 
@@ -57,17 +57,45 @@ def _validate_clob(config: object, market: MarketDescriptor) -> dict:
     return config
 
 
+def _normalize_clob_numbers(config: dict) -> tuple[dict, tuple[str, ...]]:
+    """Normalize named numeric configuration; unknown vendor fields stay raw data."""
+    normalized = dict(config)
+    warnings = []
+    def number(mapping, key, field, *, nonnegative=False):
+        if key not in mapping:
+            return
+        try:
+            value = parse_decimal(mapping[key], field="CLOB "+field)
+            if nonnegative and value < 0:
+                raise MarketDataError("invalid_numeric", "Unsupported CLOB numeric configuration.")
+            mapping[key] = decimal_text(value)
+        except MarketDataError:
+            del mapping[key]
+            warnings.append("invalid_clob_numeric:"+field)
+    for key in ("mts", "mos", "mbf", "tbf"):
+        number(normalized, key, key, nonnegative=key in ("mts", "mos"))
+    if "fd" in normalized:
+        if isinstance(normalized["fd"], dict):
+            normalized["fd"] = dict(normalized["fd"])
+            number(normalized["fd"], "r", "fd.r")
+        else:
+            del normalized["fd"]
+            warnings.append("invalid_clob_numeric:fd")
+    return normalized, tuple(warnings)
+
+
 def _revision(market: MarketDescriptor, source: str, raw: bytes, public, clock, deadline: float) -> MarketRevision:
     selected = _selected_market(raw, market.market_id)
     up_index, down_index = _index(selected, "up"), _index(selected, "down")
     config_read = public.get_json("clob", "/clob-markets/" + market.condition_id, deadline=deadline)
     config = _validate_clob(config_read.payload, market)
+    config, numeric_warnings = _normalize_clob_numbers(config)
     return MarketRevision(market, up_index, down_index,
                           selected.get("description") if isinstance(selected.get("description"), str) else "",
                           selected.get("resolutionSource") if isinstance(selected.get("resolutionSource"), str) else "",
                           raw, config_read.raw_body,
                           clock.server_us_at(clock.monotonic_ns()), config, source,
-                          market.warnings, market.pricing_ready)
+                          market.warnings + numeric_warnings, market.pricing_ready and not numeric_warnings)
 
 
 def acquire_market(gamma, public, *, clock, deadline: float, use_fast_path: bool) -> MarketRevision:
@@ -161,7 +189,7 @@ def refresh_revision(previous: MarketRevision, gamma, public, *, clock, deadline
             revision = _revision(parsed, previous.discovery_source, raw, public, clock, deadline)
         finally:
             public.on_attempt = original_callback
-        return replace(revision, capture_ready=(parsed.active and not parsed.closed and parsed.pricing_ready
+        return replace(revision, capture_ready=(revision.capture_ready and parsed.active and not parsed.closed and parsed.pricing_ready
                                                 and market_row.get("archived") is not True),
                        last_refresh_attempt_us=now_us)
     except MarketDataError as exc:

@@ -129,7 +129,14 @@ class RecorderMetricsTests(unittest.TestCase):
             self.slot(store, run_id, index, status)
         self.slot(store, run_id, 149, "MISSED")
         store.finish_run(run_id, state="STOPPED", wall_us=NOW_US+1_000_000, reason="pause")
-        store.start_run(RunConfig(), wall_us=NOW_US+10_000_000, app_revision="fixture-v2")
+        second_run = store.start_run(RunConfig(), wall_us=NOW_US+10_000_000, app_revision="fixture-v2")
+        with store._connection:
+            store._connection.execute("""INSERT INTO clock_anchors
+                (run_id,server_seconds,request_start_mono_ns,request_end_mono_ns,
+                 request_start_wall_us,request_end_wall_us,anchor_mono_ns,anchor_server_us,
+                 uncertainty_us,status) VALUES (?,?,0,0,?,?,0,?,1000000,'VALID')""",
+                (second_run,(NOW_US+10_000_000)//1_000_000,NOW_US+10_000_000,
+                 NOW_US+10_000_000,NOW_US+10_000_000))
         report = metrics.measure(store, start_us=NOW_US-2_000_000, end_us=NOW_US+12_000_000)
         self.assertEqual(report.denominators["eligible_scheduled_slots"], 5)
         self.assertEqual(report.denominators["in_progress_slots"], 1)
@@ -137,6 +144,130 @@ class RecorderMetricsTests(unittest.TestCase):
         self.assertEqual(report.denominators["terminal_slots"], 5)
         self.assertEqual(report.status_percentages, dict.fromkeys(("COMPLETE","PARTIAL","MISSED","FAILED","INTERRUPTED"),20))
         self.assertEqual(report.diagnostics["restart_downtime_seconds"], 9)
+
+    def test_calibrated_offsets_use_separate_quality_and_receipt_bounds(self):
+        from tests.recorder_support import RecorderFixture
+        from polymarket_bot.recorder.service import Recorder
+        for shift in (-300_000_000, 300_000_000):
+            with self.subTest(shift=shift):
+                fixture = RecorderFixture()
+                self.addCleanup(fixture.close)
+                fixture.server_shift_us = shift
+                def source_time(request, payload, f):
+                    if request.url.path == "/books":
+                        for book in payload:
+                            book["timestamp"] = str((f.wall_us()+shift)//1000)
+                fixture.hook = source_time
+                result = Recorder(fixture.store,fixture.public,monotonic_ns=fixture.monotonic_ns,
+                    wall_us=fixture.wall_us,sleep=fixture.sleep).run(RunConfig(),should_stop=lambda: fixture.book_count>=2)
+                self.assertEqual(result.exit_code, 0)
+                reader = RecorderStore.read_only(fixture.db.path)
+                self.addCleanup(reader.close)
+                report = self.metrics().measure(reader,start_us=NOW_US-300_000_000,end_us=NOW_US+5_000_000)
+                self.assertEqual(report.denominators["eligible_scheduled_slots"], 3)
+                self.assertEqual(report.denominators["complete_slots"], 2)
+                self.assertAlmostEqual(report.status_percentages["COMPLETE"], 200/3)
+                self.assertEqual(report.diagnostics["quality_interval_us"],
+                    (NOW_US+shift-5_000,NOW_US+shift+4_995_000))
+                self.assertEqual(report.diagnostics["quality_time_domain"], "SERVER")
+                early = self.metrics().measure(reader,start_us=NOW_US,end_us=NOW_US+20_000)
+                self.assertEqual(early.denominators["eligible_scheduled_slots"], 0,
+                    "Validated identity learned after the wall as-of bound must be excluded.")
+
+    def test_quality_projection_is_unavailable_without_compatible_calibration(self):
+        for case in ("MISSING", "BACKWARD_WALL", "DIFFERENT_OFFSETS"):
+            with self.subTest(case=case):
+                store, run_id = self.fixture()
+                if case == "MISSING":
+                    with store._connection:
+                        store._connection.execute("DELETE FROM clock_anchors")
+                elif case == "BACKWARD_WALL":
+                    with store._connection:
+                        store._connection.execute("UPDATE clock_anchors SET request_start_wall_us=request_end_wall_us+1000000")
+                else:
+                    with store._connection:
+                        store._connection.execute("""INSERT INTO clock_anchors
+                            (run_id,server_seconds,request_start_mono_ns,request_end_mono_ns,
+                             request_start_wall_us,request_end_wall_us,anchor_mono_ns,anchor_server_us,
+                             uncertainty_us,status) SELECT run_id,server_seconds+300,0,0,
+                             request_start_wall_us,request_end_wall_us,0,anchor_server_us+300000000,
+                             uncertainty_us,'VALID' FROM clock_anchors""")
+                report = self.metrics().measure(store,start_us=NOW_US,end_us=NOW_US+4_000_000)
+                self.assertIsNone(report.denominators["eligible_scheduled_slots"])
+                self.assertTrue(all(value is None for value in report.status_percentages.values()))
+                self.assertIsNone(report.diagnostics["quality_interval_us"])
+                self.assertTrue(report.diagnostics["quality_time_unavailable_reason"])
+                self.assertIsNone(report.rollover_gaps["count"])
+                self.assertIsNone(report.rollover_gaps["duration_seconds"])
+
+    def test_offset_restart_keeps_downtime_and_calibration_as_of(self):
+        for shift in (-300_000_000,300_000_000):
+            with self.subTest(shift=shift):
+                store, run_id = self.fixture()
+                for index in (150,151):
+                    self.slot(store, run_id, index, "COMPLETE", committed=NOW_US+3_000_000)
+                with store._connection:
+                    store._connection.execute("UPDATE markets SET window_start_us=window_start_us+?,window_end_us=window_end_us+?,first_seen_us=first_seen_us+?",(shift,shift,shift))
+                    store._connection.execute("UPDATE sample_slots SET scheduled_us=scheduled_us+?",(shift,))
+                    store._connection.execute("UPDATE clock_anchors SET server_seconds=server_seconds+?,anchor_server_us=anchor_server_us+?",(shift//1_000_000,shift))
+                store.finish_run(run_id,state="STOPPED",wall_us=NOW_US+4_000_000,reason="pause")
+                second = store.start_run(RunConfig(),wall_us=NOW_US+10_000_000,app_revision="restart")
+                with store._connection:
+                    store._connection.execute("""INSERT INTO clock_anchors
+                        (run_id,server_seconds,request_start_mono_ns,request_end_mono_ns,
+                         request_start_wall_us,request_end_wall_us,anchor_mono_ns,anchor_server_us,
+                         uncertainty_us,status) VALUES (?,?,0,0,?,?,0,?,1000000,'VALID')""",
+                        (second,(NOW_US+shift+10_000_000)//1_000_000,NOW_US+10_000_000,
+                         NOW_US+10_000_000,NOW_US+shift+10_000_000))
+                early = self.metrics().measure(store,start_us=NOW_US,end_us=NOW_US+2_000_000)
+                self.assertEqual(early.denominators["complete_slots"],0)
+                self.assertEqual(early.denominators["in_progress_slots"],1)
+                later = self.metrics().measure(store,start_us=NOW_US,end_us=NOW_US+12_000_000)
+                self.assertEqual(later.denominators["eligible_scheduled_slots"],6)
+                self.assertEqual(later.denominators["complete_slots"],2)
+                self.assertEqual(later.diagnostics["restart_downtime_seconds"],6)
+                with store._connection:
+                    store._connection.execute("UPDATE clock_anchors SET anchor_server_us=anchor_server_us+3000000 WHERE run_id=?",(second,))
+                # A later incompatible calibration cannot change an earlier as-of report.
+                earlier = self.metrics().measure(store,start_us=NOW_US,end_us=NOW_US+2_000_000)
+                self.assertEqual(earlier.denominators["in_progress_slots"],1)
+                ambiguous = self.metrics().measure(store,start_us=NOW_US,end_us=NOW_US+12_000_000)
+                self.assertIsNone(ambiguous.denominators["eligible_scheduled_slots"])
+
+    def test_ordinary_refresh_jitter_has_labelled_projection_and_count_bounds(self):
+        store, run_id = self.fixture()
+        with store._connection:
+            store._connection.execute("""INSERT INTO clock_anchors
+                (run_id,server_seconds,request_start_mono_ns,request_end_mono_ns,
+                 request_start_wall_us,request_end_wall_us,anchor_mono_ns,anchor_server_us,
+                 uncertainty_us,status) VALUES (?,?,1500000000,1500000000,?,?,1500000000,?,1000000,'VALID')""",
+                (run_id,(NOW_US+1_000_000)//1_000_000,NOW_US+1_500_000,NOW_US+1_500_000,NOW_US+1_000_000))
+        early = self.metrics().measure(store,start_us=NOW_US,end_us=NOW_US+1_000_000)
+        later = self.metrics().measure(store,start_us=NOW_US,end_us=NOW_US+5_000_000)
+        self.assertEqual(early.diagnostics["quality_projection_anchor_ids"],(1,))
+        self.assertIsNone(later.diagnostics["quality_time_unavailable_reason"])
+        self.assertEqual(later.diagnostics["quality_interval_us"],(NOW_US,NOW_US+4_500_000))
+        self.assertEqual(later.denominators["eligible_scheduled_slots"],3)
+        self.assertEqual(later.denominators["eligible_scheduled_slot_bounds"],(1,3))
+        self.assertEqual(later.diagnostics["quality_count_interpretation"],"Calibrated point estimates with recorded uncertainty bounds")
+        reversed_interval = self.metrics().measure(store,start_us=NOW_US+1_400_000,end_us=NOW_US+1_600_000)
+        self.assertIsNone(reversed_interval.diagnostics["quality_interval_us"])
+        self.assertEqual(reversed_interval.diagnostics["quality_time_unavailable_reason"],"REVERSED_PROJECTED_INTERVAL")
+
+    def test_offset_expiry_and_rollover_use_server_bounds(self):
+        for shift in (-300_000_000,300_000_000):
+            with self.subTest(shift=shift):
+                store, run_id = self.fixture()
+                with store._connection:
+                    store._connection.execute("UPDATE markets SET window_start_us=window_start_us+?,window_end_us=window_end_us+?,first_seen_us=first_seen_us+?",(shift,shift,shift))
+                    store._connection.execute("UPDATE clock_anchors SET server_seconds=server_seconds+?,anchor_server_us=anchor_server_us+?",(shift//1_000_000,shift))
+                store.record_event(run_id,"DISCOVERY_GAP",started_us=NOW_US+shift+600_000_000,
+                    ended_us=NOW_US+shift+604_000_000,detail={"time_domain":"SERVER"})
+                early = self.metrics().measure(store,start_us=NOW_US,end_us=NOW_US+599_000_000)
+                later = self.metrics().measure(store,start_us=NOW_US,end_us=NOW_US+610_000_000)
+                self.assertEqual(early.resolution_summary["tracked_expired_markets"],0)
+                self.assertEqual(later.resolution_summary["tracked_expired_markets"],1)
+                self.assertEqual(later.rollover_gaps["duration_seconds"],4)
 
     def test_unknown_windows_have_disclosed_gap_duration(self):
         metrics = self.metrics()
@@ -262,6 +393,24 @@ class RecorderMetricsTests(unittest.TestCase):
         self.assertEqual(report.reference_coverage["opening_count"],1)
         self.assertEqual(report.reference_coverage["closing_count"],1)
         self.assertEqual(report.reference_coverage["complete_market_windows"],0)
+
+    def test_later_boundary_conflict_invalidates_only_as_of_availability(self):
+        metrics = self.metrics()
+        store, run_id = self.fixture()
+        slot = self.slot(store, run_id, 150, "COMPLETE")
+        self.reference(store, run_id, slot, role="OPENING", origin="HISTORICAL_LOOKUP", learned=NOW_US+1_000_000)
+        from polymarket_bot.recorder.models import CHAINLINK_FEED_ID
+        with store._connection:
+            store._connection.execute("""INSERT INTO reference_associations
+                (market_id,feed_id,role,target_us,status,origin,learned_wall_us,learned_server_us,
+                 available_live,attempt_count,reason) VALUES ('1001',?,'OPENING',?,'CONFLICT',
+                 'HISTORICAL_LOOKUP',?,?,0,2,'contradictory boundary')""",
+                (CHAINLINK_FEED_ID,NOW_US-300_000_000,NOW_US+3_000_000,NOW_US+3_000_000))
+        early = metrics.measure(store, start_us=NOW_US, end_us=NOW_US+2_000_000)
+        later = metrics.measure(store, start_us=NOW_US, end_us=NOW_US+4_000_000)
+        self.assertEqual(early.reference_coverage["opening_count"], 1)
+        self.assertEqual(later.reference_coverage["opening_count"], 0)
+        self.assertEqual(store._one("SELECT COUNT(*) n FROM reference_associations")["n"], 2)
 
     def test_resolution_counts_are_as_of_learning_and_delays_use_server_time(self):
         metrics = self.metrics()
@@ -430,6 +579,7 @@ class RecorderMetricsTests(unittest.TestCase):
                 lambda:reader.save_control_attempts(run_id,()),
                 lambda:reader.recover_interrupted(wall_us=NOW_US),
                 lambda:reader.save_checkpoint(run_id=run_id,wall_us=NOW_US,values={}),
+                lambda:reader.finish_discovery_gap(1,run_id=run_id,ended_us=NOW_US),
                 lambda:reader.update_checkpoint_physical(1,{})):
             with self.assertRaises(RecorderStoreError) as raised:
                 mutation()

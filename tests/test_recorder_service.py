@@ -130,6 +130,39 @@ class RecorderServiceTests(unittest.TestCase):
             if path == "/books" and "9000000000000000000001" in body.decode():
                 self.assertLess(fixture.initial_wall_us + (ns-fixture.epoch_ns)//1000, NOW_US+600_000_000)
 
+    def test_rollover_gap_includes_successful_acquisition_and_retry_wait(self):
+        from polymarket_bot.recorder.metrics import measure
+        for fail_first in (False, True):
+            with self.subTest(fail_first=fail_first):
+                fixture = self.fixture(offset_us=597_000_000)
+                failures = []
+                def outage(request, payload, f):
+                    if (fail_first and f.book_count == 1 and request.url.path.startswith("/events/slug/")
+                            and not failures):
+                        failures.append(True)
+                        f.advance(10.2)
+                        return httpx.Response(503, stream=httpx.ByteStream(b"outage"))
+                fixture.hook = outage
+                result = self.run_recorder(fixture, pairs=2)
+                self.assertEqual(result.exit_code, 0)
+                old, new = fixture.rows("SELECT * FROM markets ORDER BY window_start_us")
+                expected_us = new["first_seen_us"]-old["window_end_us"]
+                self.assertEqual(expected_us, 12_230_000 if fail_first else 20_000)
+                reader = RecorderStore.read_only(fixture.db.path)
+                try:
+                    report = measure(reader, start_us=fixture.initial_wall_us,
+                                     end_us=fixture.wall_us()+1_000_000)
+                finally:
+                    reader.close()
+                self.assertIsNone(report.diagnostics["quality_time_unavailable_reason"])
+                self.assertEqual(report.rollover_gaps["count"], 1)
+                self.assertAlmostEqual(report.rollover_gaps["duration_seconds"], expected_us/1_000_000)
+                actual = [row for row in fixture.rows("SELECT * FROM recorder_events WHERE kind='DISCOVERY_GAP'")
+                          if not json.loads(row["detail_json"]).get("diagnostic_only")]
+                self.assertEqual(len(actual), 1)
+                self.assertEqual((actual[0]["started_us"], actual[0]["ended_us"]),
+                                 (old["window_end_us"], new["first_seen_us"]))
+
     def test_bad_numeric_payload_does_not_end_run(self):
         fixture = self.fixture()
         def malformed(request, payload, f):
@@ -142,6 +175,45 @@ class RecorderServiceTests(unittest.TestCase):
         slots = fixture.rows("SELECT slot_index,status FROM sample_slots WHERE status!='MISSED' ORDER BY slot_index")
         self.assertEqual([(row["slot_index"], row["status"]) for row in slots], [(151, "FAILED"), (152, "COMPLETE")])
         self.assertEqual([row["status"] for row in fixture.rows("SELECT status FROM book_observations WHERE slot_id=(SELECT slot_id FROM sample_slots WHERE slot_index=151)")], ["INVALID", "INVALID"])
+
+    def test_extreme_aware_gamma_timestamps_are_discovery_failures(self):
+        for timestamp in ("0001-01-01T00:00:00+23:59", "9999-12-31T23:59:59-23:59"):
+            with self.subTest(timestamp=timestamp):
+                fixture = self.fixture()
+                def invalid(request, payload, f):
+                    if request.url.path.startswith("/events/slug/"):
+                        payload["markets"][0]["eventStartTime"] = timestamp
+                    elif request.url.path == "/events":
+                        payload[0]["markets"][0]["eventStartTime"] = timestamp
+                fixture.hook = invalid
+                result = self.run_recorder(fixture, should_stop=lambda: fixture.elapsed_ns > 1_000_000_000)
+                self.assertEqual(result.exit_code, 0)
+                self.assertEqual(fixture.book_count, 0)
+                events = fixture.rows("SELECT detail_json FROM recorder_events WHERE kind='DISCOVERY_GAP'")
+                self.assertTrue(events)
+                self.assertIn("invalid_metadata", events[0]["detail_json"])
+
+    def test_fractional_fallback_window_keeps_exact_slot_identity(self):
+        fixture = self.fixture()
+        from datetime import datetime, timedelta
+        def fractional(request, payload, f):
+            if request.url.path == "/events":
+                payload[0]["slug"] = "fractional-event"
+                rows = payload[0]["markets"]
+            elif request.url.path.startswith("/markets/"):
+                rows = [payload]
+            else:
+                return
+            for row in rows:
+                row["slug"] = "fractional-market"
+                for field in ("eventStartTime", "endDate"):
+                    row[field] = (datetime.fromisoformat(row[field]) + timedelta(microseconds=500_000)).isoformat()
+        fixture.hook = fractional
+        result = self.run_recorder(fixture, pairs=2, config=RunConfig(use_fast_path=False))
+        self.assertEqual((result.exit_code, result.slots_finalized), (0, 2))
+        slots = fixture.rows("SELECT scheduled_us FROM sample_slots WHERE status='COMPLETE' ORDER BY slot_index")
+        self.assertEqual([row["scheduled_us"] for row in slots], [NOW_US+500_000, NOW_US+2_500_000])
+        self.assertEqual(fixture.rows("SELECT window_start_us FROM markets")[0]["window_start_us"], NOW_US-299_500_000)
 
     def test_partial_outcome_survives_independently(self):
         fixture = self.fixture()
@@ -448,6 +520,37 @@ class RecorderServiceTests(unittest.TestCase):
         self.assertEqual([row["slot_index"] for row in fixture.rows("SELECT slot_index FROM sample_slots WHERE market_id='1002' AND status='COMPLETE' ORDER BY slot_index")], [2, 3])
         self.assertEqual(fixture.rows("SELECT resolution_attempts FROM markets WHERE market_id='1001'")[0]["resolution_attempts"], 1)
 
+    def test_resolution_backward_wall_step_does_not_stop_book_capture(self):
+        fixture = self.fixture(offset_us=597_000_000)
+        def wall_step(request, payload, f):
+            if request.url.path == "/v2/resolutions":
+                f.initial_wall_us -= 1_000_000
+        fixture.hook = wall_step
+        result = self.run_recorder(fixture, pairs=3)
+        self.assertEqual((result.exit_code,result.slots_finalized),(0,3))
+        request = fixture.rows("SELECT * FROM request_attempts WHERE operation='RESOLUTION'")[0]
+        self.assertLess(request["ended_wall_us"],request["started_wall_us"])
+        self.assertGreater(request["latency_ns"],0)
+        evidence = fixture.rows("SELECT provenance_json FROM resolution_observations")[0]
+        self.assertTrue(json.loads(evidence["provenance_json"])["wall_clock_movement"]["request_backward"])
+        self.assertEqual(fixture.rows("SELECT COUNT(*) n FROM sample_slots WHERE status='COMPLETE'")[0]["n"],3)
+
+    def test_invalid_numeric_metadata_pauses_until_valid_revision(self):
+        fixture = self.fixture()
+        calls = []
+        def invalid_first(request, payload, f):
+            if request.url.path.startswith("/clob-markets/"):
+                calls.append(True)
+                payload["mts"] = "NaN" if len(calls)==1 else "1e-2"
+        fixture.hook = invalid_first
+        result = self.run_recorder(fixture,pairs=1)
+        self.assertEqual(result.exit_code,0)
+        first_book = next(row for row in fixture.requests if row[1]=="/books")
+        self.assertGreaterEqual(first_book[2]-fixture.epoch_ns,60_000_000_000)
+        revisions = fixture.rows("SELECT tick_size_text FROM market_revisions ORDER BY revision_id")
+        self.assertEqual([row["tick_size_text"] for row in revisions],[None,"0.01"])
+        self.assertTrue(fixture.rows("SELECT * FROM sample_slots WHERE reason='METADATA_NOT_READY'"))
+
     def test_metadata_overrun_skips_passed_slots_and_clamps_http(self):
         fixture = self.fixture()
         def slow(request, payload, f):
@@ -640,8 +743,10 @@ class RecorderServiceTests(unittest.TestCase):
         self.assertGreaterEqual(len(calls), 3, "Discontinuity requires prompt fresh calibration.")
         gaps = fixture.rows("SELECT * FROM recorder_events WHERE kind='DISCOVERY_GAP'")
         self.assertTrue(gaps)
-        self.assertTrue(all(row["ended_us"] >= row["started_us"] for row in gaps))
-        self.assertTrue(all(row["ended_us"] >= NOW_US+80_000_000 for row in gaps))
+        self.assertTrue(any(row["ended_us"] is None for row in gaps),
+                        "Without validated reacquisition the durable acquisition gap remains open.")
+        self.assertTrue(all(row["ended_us"] is None or row["ended_us"] >= row["started_us"] for row in gaps))
+        self.assertTrue(all(row["ended_us"] is None or row["ended_us"] >= NOW_US+80_000_000 for row in gaps))
 
     def test_resolution_server_due_and_receipt_backoff_survive_offset_restart(self):
         fixture = self.fixture(offset_us=597_000_000)

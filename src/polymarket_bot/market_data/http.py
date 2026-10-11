@@ -107,11 +107,6 @@ class PublicGet:
     def _read_json(self, method: str, source: str, path: str, url: str, *,
                    deadline: float, params: dict[str, str | int] | None = None,
                    json_body: object = None, selectors: tuple[str, ...] = ()) -> JsonRead:
-        if (self.client.auth is not None or any(
-                key.lower().replace("_", "-") in {"authorization", "cookie", "poly-api-key",
-                                "poly-signature", "poly-passphrase", "x-api-key"}
-                or "signature" in key.lower() for key in self.client.headers)):
-            raise MarketDataError("transport_error", "Authenticated clients cannot make public market-data reads.")
         operation = ("BOOK_BATCH" if method == "POST" else
                      "BOOK_SINGLE" if path == "/book" else
                      "CLOB_TIME" if path == "/time" else
@@ -123,6 +118,11 @@ class PublicGet:
         for attempt in range(self.max_attempts):
             if self.before_attempt is not None:
                 self.before_attempt()
+            if (self.client.auth is not None or self.client.cookies or self.client.params or any(
+                    key.lower().replace("_", "-") in {"authorization", "cookie", "poly-api-key",
+                                    "poly-signature", "poly-passphrase", "x-api-key"}
+                    or "signature" in key.lower() for key in self.client.headers)):
+                raise MarketDataError("transport_error", "Authenticated clients cannot make public market-data reads.")
             remaining = self._remaining(deadline)
             start = self.monotonic()
             started_ns = self.monotonic_ns()

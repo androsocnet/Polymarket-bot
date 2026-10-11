@@ -17,7 +17,7 @@ from polymarket_bot.market_data.numeric import decimal_text, exact_decimal_conte
 from .models import (CHAINLINK_FEED_ID, CHAINLINK_FEED_NAME, ClockAnchor, RunConfig,
                      MarketRevision, ReferenceFetchDraft, ReferenceReportDraft,
                      ResolutionObservation, SlotCommit, SlotTarget)
-from .metadata import _selected_market
+from .metadata import _normalize_clob_numbers, _selected_market
 
 
 MAX_EVIDENCE_BYTES = 10 * 1024 * 1024
@@ -396,6 +396,7 @@ class RecorderStore:
         digest = sha256(canonical + b"\x00" + (revision.clob_config_raw or b"")).hexdigest()
         config = json.loads(revision.clob_config_raw.decode("utf-8"), parse_float=str) if revision.clob_config_raw else {}
         _require(isinstance(config, dict), "CLOB config evidence must be an object.")
+        config, numeric_warnings = _normalize_clob_numbers(config)
         identity = dict(market_id=market.market_id, event_id=market.event_id,
                         condition_id=market.condition_id, slug=market.slug,
                         question=market.question, window_start_us=start_us,
@@ -438,6 +439,12 @@ class RecorderStore:
                     delay_config_json=_json({key: config[key] for key in ("oas", "itode", "ibce") if key in config}),
                     gamma_raw_z=gamma_z, clob_config_raw_z=clob_z,
                     raw_sizes_json=_json(raw_sizes), codec_version=codec, content_hash=digest))
+                if numeric_warnings:
+                    self._insert("recorder_events", dict(run_id=run_id, market_id=market.market_id,
+                        kind="DISCOVERY_GAP", started_us=observed_us,
+                        detail_json=_json({"warnings": numeric_warnings, "capture_paused": True,
+                                           "time_domain": "SERVER", "revision_id": revision_id,
+                                           "diagnostic_only": True, "reason": "INVALID_CLOB_NUMERIC"})))
             if conflict:
                 self._connection.execute("UPDATE markets SET lifecycle='INVALIDATED' WHERE market_id=?",
                                          (market.market_id,))
@@ -489,8 +496,7 @@ class RecorderStore:
                      "Resolution attempt must use the fixed public condition selector.")
             for name in ("started_wall_us", "ended_wall_us", "started_mono_ns", "ended_mono_ns"):
                 _integer(getattr(attempt, name), name)
-            _require(attempt.ended_wall_us >= attempt.started_wall_us
-                     and attempt.ended_mono_ns >= attempt.started_mono_ns,
+            _require(attempt.ended_mono_ns >= attempt.started_mono_ns,
                      "Resolution attempt times are reversed.")
             _integer(attempt.attempt_number, "resolution attempt number", minimum=1)
             _require(attempt.attempt_number <= 3, "Resolution HTTP retry policy exceeded.")
@@ -512,8 +518,6 @@ class RecorderStore:
                 _integer(observation.learned_server_us, "resolution learned server")
             if observation.reported_us is not None:
                 _integer(observation.reported_us, "reported resolution time", minimum=0)
-            _require(observation.learned_wall_us >= requests[-1].ended_wall_us,
-                     "Resolution cannot be learned before request completion.")
             _require(observation.classification in ("ABSENT", "PENDING", "INVALID",
                      "RESOLVED_DIRECTIONAL", "RESOLVED_OTHER")
                      and (observation.mapped_outcome in ("UP", "DOWN")
@@ -543,7 +547,12 @@ class RecorderStore:
                 resolution_id = self._insert("resolution_observations", dict(
                     market_id=observation.market_id, request_id=request_ids[-1],
                     condition_id=observation.condition_id, status_raw=observation.raw_status,
-                    payouts_raw_json=payouts_json, provenance_json=_json(observation.provenance),
+                    payouts_raw_json=payouts_json, provenance_json=_json(observation.provenance | (
+                        {"wall_clock_movement": {"request_backward": any(
+                            a.ended_wall_us < a.started_wall_us for a in requests),
+                            "learned_before_request_wall": observation.learned_wall_us < requests[-1].ended_wall_us}}
+                        if any(a.ended_wall_us < a.started_wall_us for a in requests)
+                        or observation.learned_wall_us < requests[-1].ended_wall_us else {})),
                     reported_resolved_us=observation.reported_us, reported_time_raw=reported_raw,
                     learned_wall_us=observation.learned_wall_us,
                     learned_server_us=observation.learned_server_us,
@@ -833,6 +842,18 @@ class RecorderStore:
             return self._insert("recorder_events", dict(
                 run_id=run_id, market_id=market_id, kind=kind,
                 started_us=started_us, ended_us=ended_us, detail_json=_json(detail)))
+
+    def finish_discovery_gap(self, event_id: int, *, run_id: str, ended_us: int) -> None:
+        """Fill an open acquisition interval once; diagnostic events cannot close."""
+        _integer(ended_us, "gap end")
+        with self._transaction():
+            self._run(run_id)
+            event = self._one("SELECT * FROM recorder_events WHERE event_id=?", (event_id,))
+            _require(event is not None and event["run_id"] == run_id
+                     and event["kind"] == "DISCOVERY_GAP" and event["ended_us"] is None
+                     and json.loads(event["detail_json"]).get("acquisition_gap") is True
+                     and ended_us >= event["started_us"], "Discovery gap closure contradicts its start.")
+            self._connection.execute("UPDATE recorder_events SET ended_us=? WHERE event_id=?", (ended_us,event_id))
 
     def reserve_slot(self, market_id: str, target: SlotTarget, *, run_id: str,
                      anchor_id: int, metadata_revision_id: int, started_mono_ns: int,

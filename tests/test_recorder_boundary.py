@@ -10,10 +10,11 @@ from tests.support import CONDITION, TOKEN_DOWN, TOKEN_UP, FakeClock
 
 
 class RecorderBoundaryTests(unittest.TestCase):
-    def reader(self, handler, *, headers=None, auth=None):
+    def reader(self, handler, *, headers=None, auth=None, cookies=None, params=None):
         clock = FakeClock()
         client = httpx.Client(transport=httpx.MockTransport(handler), headers=headers,
-                              auth=auth, trust_env=False, follow_redirects=False)
+                              auth=auth, cookies=cookies, params=params,
+                              trust_env=False, follow_redirects=False)
         return client, PublicGet(client, monotonic=clock.monotonic, sleep=clock.sleep,
                                  utcnow=clock.utcnow, max_attempts=1)
 
@@ -91,6 +92,9 @@ class RecorderBoundaryTests(unittest.TestCase):
                         {"headers": {"POLY-API-KEY": "secret"}},
                         {"headers": {"POLY_PASSPHRASE": "sentinel"}},
                         {"headers": {"POLY-PASSPHRASE": "sentinel"}},
+                        {"cookies": {"session": "sentinel"}},
+                        {"params": {"api_key": "sentinel"}},
+                        {"params": {"token_id": TOKEN_DOWN}},
                         {"auth": httpx.BasicAuth("user", "secret")}):
             with self.subTest(options=tuple(options)):
                 client, reader = self.reader(lambda request: requests.append(request) or httpx.Response(200, stream=httpx.ByteStream(b"{}")), **options)
@@ -117,5 +121,21 @@ class RecorderBoundaryTests(unittest.TestCase):
             with self.assertRaises(MarketDataError):
                 reader.get_json("clob", "/time", deadline=0)
             self.assertEqual(len(requests), 1)
+        finally:
+            client.close()
+
+    def test_response_cookie_cannot_reach_a_public_retry(self):
+        requests = []
+        def respond(request):
+            requests.append(request)
+            return httpx.Response(503,headers={"Set-Cookie":"session=sentinel; Path=/"},
+                                  stream=httpx.ByteStream(b"outage"))
+        client, reader = self.reader(respond)
+        reader.max_attempts = 2
+        try:
+            with self.assertRaises(MarketDataError):
+                reader.get_json("clob","/time",deadline=10)
+            self.assertEqual(len(requests),1)
+            self.assertNotIn("cookie",requests[0].headers)
         finally:
             client.close()

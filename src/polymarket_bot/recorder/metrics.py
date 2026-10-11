@@ -140,18 +140,24 @@ def _references(store, eligible, slots, markets, runs, end_us):
         r.expires_at_seconds,f.origin AS fetch_origin,f.purpose AS fetch_purpose,
         q.ended_server_us AS fetch_received_server_us,q.ended_wall_us AS fetch_received_wall_us,
         q.operation AS fetch_operation,q.run_id AS fetch_run_id FROM reference_associations a
-        JOIN reference_reports r USING(report_id)
-        JOIN reference_fetches f ON f.fetch_id=a.fetch_id AND f.feed_id=r.feed_id
-        JOIN request_attempts q ON q.request_id=f.request_id WHERE a.learned_wall_us<=?
-        AND r.first_received_wall_us<=? AND q.ended_wall_us<=?
-        ORDER BY a.learned_wall_us,a.association_id""",(end_us,end_us,end_us))
+        LEFT JOIN reference_reports r USING(report_id)
+        LEFT JOIN reference_fetches f ON f.fetch_id=a.fetch_id AND f.feed_id=r.feed_id
+        LEFT JOIN request_attempts q ON q.request_id=f.request_id WHERE a.learned_wall_us<=?
+        ORDER BY a.learned_wall_us,a.association_id""",(end_us,))
     live, boundaries = set(), {}
     by_id = {slot["slot_id"]:slot for slot in slots.values()}
     by_market = {row["market_id"]:row for row in markets}
     for row in rows:
         market = by_market.get(row["market_id"])
+        if (market is not None and row["role"] in ("OPENING", "CLOSING")
+                and row["target_us"] == market["window_start_us" if row["role"] == "OPENING" else "window_end_us"]):
+            # Latest learned status supersedes an older boundary, including a
+            # conflict/unavailable association with no report or fetch.
+            boundaries.pop((row["market_id"], row["role"]), None)
         if (market is None or row["status"]!="AVAILABLE" or row["decode_status"]!="DECODED"
-                or row["verification_status"]!="VERIFIED" or not row["decoder_revision"]):
+                or row["verification_status"]!="VERIFIED" or not row["decoder_revision"]
+                or row["first_received_wall_us"] is None or row["first_received_wall_us"] > end_us
+                or row["fetch_received_wall_us"] is None or row["fetch_received_wall_us"] > end_us):
             continue
         try:
             if parse_decimal(row["decoded_price_text"],field="reference metric price")<=0:
@@ -200,9 +206,13 @@ def _references(store, eligible, slots, markets, runs, end_us):
                 complete_market_windows=covered_windows)
 
 
-def _resolutions(store, markets, end_us):
-    expired = {m["market_id"] for m in markets if m["window_end_us"]<=end_us}
-    rows = store._rows("SELECT * FROM resolution_observations WHERE learned_wall_us<=? ORDER BY learned_wall_us,resolution_id",(end_us,))
+def _resolutions(store, markets, server_end_us, wall_end_us):
+    if server_end_us is None:
+        return dict(tracked_expired_markets=None,directional=None,other=None,pending=None,
+                    conflict=None,success_percent=None,learning_delay_seconds=nearest_rank_percentiles([]),
+                    unknown_learning_delay_count=None)
+    expired = {m["market_id"] for m in markets if m["window_end_us"]<=server_end_us}
+    rows = store._rows("SELECT * FROM resolution_observations WHERE learned_wall_us<=? ORDER BY learned_wall_us,resolution_id",(wall_end_us,))
     finals, conflicts, delays, unknown = {}, set(), [], 0
     for row in rows:
         market_id = row["market_id"]
@@ -232,6 +242,68 @@ def _resolutions(store, markets, end_us):
                 learning_delay_seconds=nearest_rank_percentiles(delays),unknown_learning_delay_count=unknown)
 
 
+def _quality_projection(store, runs, wall_start_us, wall_end_us):
+    """Conservative schema-v1 projection, never a claim of universal wall truth.
+
+    Compatible uncertainty intervals permit labelled point projections. Missing
+    run calibration, incompatible wall intervals or disjoint offset intervals
+    make grid statistics unavailable. Historical timestamps remain unchanged.
+    """
+    anchors = store._rows("SELECT * FROM clock_anchors WHERE request_end_wall_us<=? ORDER BY anchor_id", (wall_end_us,))
+    offsets, calibrated_runs, valid = [], set(), []
+    reason = None
+    for anchor in anchors:
+        if anchor["status"] != "VALID":
+            reason = "CLOCK_DISCONTINUITY"
+            continue
+        wall_elapsed = anchor["request_end_wall_us"]-anchor["request_start_wall_us"]
+        mono_elapsed = (anchor["request_end_mono_ns"]-anchor["request_start_mono_ns"])//1000
+        if wall_elapsed < 0 or abs(wall_elapsed-mono_elapsed) > anchor["uncertainty_us"]:
+            reason = "INCOMPATIBLE_ANCHOR_WALL_INTERVAL"
+            continue
+        wall_midpoint = (anchor["request_start_wall_us"]+anchor["request_end_wall_us"])//2
+        offsets.append(anchor["anchor_server_us"]-wall_midpoint)
+        valid.append(anchor)
+        calibrated_runs.add(anchor["run_id"])
+    if any(run["run_id"] not in calibrated_runs for run in runs):
+        reason = reason or "MISSING_RUN_CALIBRATION"
+    if not runs:
+        reason = reason or "MISSING_RUN_CALIBRATION"
+    compatible_bounds = ((max(o-a["uncertainty_us"] for o,a in zip(offsets,valid)),
+                          min(o+a["uncertainty_us"] for o,a in zip(offsets,valid))) if valid else None)
+    if not valid:
+        reason = reason or "MISSING_CALIBRATION"
+    elif compatible_bounds[0] > compatible_bounds[1]:
+        reason = reason or "DISAGREEING_CLOCK_OFFSETS"
+    bounds = startup = None
+    uncertainties = None
+    if reason is None:
+        # Startup retains its original calibration; later anchors supply only
+        # the relevant requested bound's point estimate and uncertainty.
+        first_run = min(runs,key=lambda r:r["started_wall_us"])
+        first = next(a for a in valid if a["run_id"] == first_run["run_id"])
+        ordered = sorted(zip(valid,offsets),key=lambda item:(item[0]["request_end_wall_us"],item[0]["anchor_id"]))
+        start_anchor,start_offset = next(((a,o) for a,o in reversed(ordered)
+            if a["request_end_wall_us"]<=wall_start_us),ordered[0])
+        end_anchor,end_offset = ordered[-1]
+        first_offset = first["anchor_server_us"]-(first["request_start_wall_us"]+first["request_end_wall_us"])//2
+        startup = first_run["started_wall_us"]+first_offset
+        bounds = (wall_start_us+start_offset,wall_end_us+end_offset)
+        uncertainties = (start_anchor["uncertainty_us"],end_anchor["uncertainty_us"],first["uncertainty_us"])
+        if bounds[1] < bounds[0]:
+            reason = "REVERSED_PROJECTED_INTERVAL"
+            bounds = startup = None
+            uncertainties = None
+    return bounds, startup, dict(
+        quality_time_unavailable_reason=reason, quality_time_domain="SERVER",
+        quality_projection_policy="Original startup anchor and latest as-of bound anchors with compatible recorded uncertainty intervals",
+        quality_count_interpretation="Calibrated point estimates with recorded uncertainty bounds",
+        quality_projection_uncertainty_us=uncertainties,
+        quality_compatible_offset_bounds_us=compatible_bounds,
+        quality_projection_anchor_ids=tuple(a["anchor_id"] for a in anchors),
+        quality_projection_offsets_us=tuple(sorted(set(offsets))))
+
+
 def measure(store: RecorderStore, *, start_us: int, end_us: int) -> MeasurementReport:
     """Measure checkpoint-bounded physical growth; absent checkpoints stay unavailable."""
     if type(start_us) is not int or type(end_us) is not int or end_us < start_us:
@@ -246,16 +318,19 @@ def measure(store: RecorderStore, *, start_us: int, end_us: int) -> MeasurementR
     all_runs = store._rows("SELECT * FROM recording_runs WHERE started_wall_us<=? ORDER BY started_wall_us",(end_us,))
     runs = {r["run_id"]:r for r in all_runs}
     relevant_runs = [r for r in all_runs if (r["ended_wall_us"] or end_us)>=start_us]
-    first_start = min((r["started_wall_us"] for r in all_runs),default=end_us)
-    effective_start = max(start_us,first_start)
-    markets = store._rows("SELECT * FROM markets WHERE first_seen_us<=?",(end_us,))
-    all_slots = store._rows("SELECT * FROM sample_slots WHERE scheduled_us>=? AND scheduled_us<?",(start_us,end_us))
+    bounds, first_start, projection = _quality_projection(store,all_runs,start_us,end_us)
+    server_start, server_end = bounds if bounds is not None else (None,None)
+    effective_start = max(server_start,first_start) if bounds is not None else None
+    start_unc,end_unc,first_unc = projection["quality_projection_uncertainty_us"] or (0,0,0)
+    possible_markets = store._rows("SELECT * FROM markets WHERE first_seen_us<=?",(server_end+end_unc,)) if bounds is not None else []
+    markets = [m for m in possible_markets if m["first_seen_us"]<=server_end]
+    all_slots = store._rows("SELECT * FROM sample_slots WHERE scheduled_us>=? AND scheduled_us<?",(server_start-start_unc,server_end+end_unc)) if bounds is not None else []
     slots = {(s["market_id"],s["slot_index"]):s for s in all_slots}
     grid, prefirst, inprogress = set(), 0, 0
     for market in markets:
         for index in range(450):
             scheduled = market["window_start_us"]+index*2_000_000
-            if start_us<=scheduled<end_us:
+            if server_start<=scheduled<server_end:
                 if scheduled<first_start:
                     prefirst += 1
                     continue
@@ -270,12 +345,26 @@ def measure(store: RecorderStore, *, start_us: int, end_us: int) -> MeasurementR
     denominators = dict(eligible_scheduled_slots=len(grid),terminal_slots=terminal,
         complete_slots=statuses["COMPLETE"],in_progress_slots=inprogress,pre_first_start_slots=prefirst,
         unrecorded_eligible_slots=len(grid)-terminal)
-    known_duration = _union_duration((max(effective_start,m["window_start_us"]),min(end_us,m["window_end_us"])) for m in markets)
-    unassigned = max(0,end_us-effective_start-known_duration)
-    denominators["unassigned_gap_seconds"] = unassigned/1_000_000
+    lower, upper = set(), set()
+    for market in possible_markets:
+        for index in range(450):
+            scheduled = market["window_start_us"]+index*2_000_000
+            key = (market["market_id"],index)
+            slot = slots.get(key)
+            if slot and (slot["status"]=="IN_PROGRESS" or slot["committed_wall_us"] is None or slot["committed_wall_us"]>end_us):
+                continue
+            if max(server_start-start_unc,first_start-first_unc)<=scheduled<server_end+end_unc:
+                upper.add(key)
+            if (market["first_seen_us"]<=server_end-end_unc
+                    and max(server_start+start_unc,first_start+first_unc)<=scheduled<server_end-end_unc):
+                lower.add(key)
+    denominators["eligible_scheduled_slot_bounds"] = (len(lower),len(upper)) if bounds is not None else None
+    known_duration = _union_duration((max(effective_start,m["window_start_us"]),min(server_end,m["window_end_us"])) for m in markets)
+    unassigned = max(0,server_end-effective_start-known_duration) if bounds is not None else None
+    denominators["unassigned_gap_seconds"] = unassigned/1_000_000 if unassigned is not None else None
     percentages = {status:_percent(statuses[status],len(grid)) for status in ("COMPLETE","PARTIAL","MISSED","FAILED","INTERRUPTED")}
     books = store._rows("""SELECT b.* FROM book_observations b JOIN sample_slots s USING(slot_id)
-        WHERE s.scheduled_us>=? AND s.scheduled_us<? AND s.committed_wall_us<=? AND b.status='VALID'""",(effective_start,end_us,end_us))
+        WHERE s.scheduled_us>=? AND s.scheduled_us<? AND s.committed_wall_us<=? AND b.status='VALID'""",(effective_start,server_end,end_us))
     valid_depth = [b for b in books if b["bid_level_count"] is not None and b["ask_level_count"] is not None]
     mean_depth = sum(b["bid_level_count"]+b["ask_level_count"] for b in valid_depth)/len(valid_depth) if valid_depth else None
     depth_breakdown = {outcome:dict(valid_books=sum(b["outcome"]==outcome for b in valid_depth),
@@ -288,29 +377,35 @@ def measure(store: RecorderStore, *, start_us: int, end_us: int) -> MeasurementR
                 for b in outcome_books)/len(outcome_books) if outcome_books else None)
     depth_breakdown["valid_books"] = len(valid_depth)
     depth_breakdown["excluded_invalid_books"] = store._one("""SELECT COUNT(*) n FROM book_observations b JOIN sample_slots s USING(slot_id)
-        WHERE s.scheduled_us>=? AND s.scheduled_us<? AND s.committed_wall_us<=? AND b.status<>'VALID'""",(effective_start,end_us,end_us))["n"]
+        WHERE s.scheduled_us>=? AND s.scheduled_us<? AND s.committed_wall_us<=? AND b.status<>'VALID'""",(effective_start,server_end,end_us))["n"]
     attempts = store._rows("SELECT operation,result,latency_ns FROM request_attempts WHERE started_wall_us>=? AND ended_wall_us<=?",(start_us,end_us))
     latency = defaultdict(lambda:defaultdict(list))
     for attempt in attempts:
         latency[attempt["operation"]][attempt["result"]].append(attempt["latency_ns"])
     latency = {op:{result:nearest_rank_percentiles(values) for result,values in groups.items()} for op,groups in latency.items()}
-    events = store._rows("SELECT * FROM recorder_events WHERE started_us<? AND COALESCE(ended_us,?)>=?",(end_us,end_us,start_us))
+    events = store._rows("SELECT * FROM recorder_events WHERE kind='DISCOVERY_GAP'")
     rollover,discovery = [],[]
     uncomparable_gaps = 0
     for event in events:
         if event["kind"]!="DISCOVERY_GAP":
             continue
+        if json.loads(event["detail_json"]).get("diagnostic_only"):
+            continue
         domain = json.loads(event["detail_json"]).get("time_domain","SERVER")
+        interval_start, interval_end = (server_start,server_end) if domain == "SERVER" else (start_us,end_us)
+        if interval_start is None:
+            uncomparable_gaps += 1
+            continue
         gap_end = event["ended_us"]
         end_evidence = "EVENT_END" if gap_end is not None else "REQUESTED_END_UNRESOLVED"
         if gap_end is None and domain=="SERVER":
             acquisitions = [m["first_seen_us"] for m in markets
-                            if event["started_us"]<m["first_seen_us"]<=end_us]
+                            if event["started_us"]<m["first_seen_us"]<=server_end]
             if acquisitions:
                 gap_end = min(acquisitions)
                 end_evidence = "VALIDATED_MARKET_ACQUISITION"
-        gap_end = min(end_us,gap_end if gap_end is not None else end_us)
-        gap_start = max(start_us,event["started_us"])
+        gap_end = min(interval_end,gap_end if gap_end is not None else interval_end)
+        gap_start = max(interval_start,event["started_us"])
         if gap_end<=gap_start:
             continue
         discovery.append(dict(started_us=gap_start,ended_us=gap_end,time_domain=domain,end_evidence=end_evidence))
@@ -328,7 +423,7 @@ def measure(store: RecorderStore, *, start_us: int, end_us: int) -> MeasurementR
     baselines = store._rows("""SELECT c.* FROM storage_checkpoints c WHERE c.checkpoint_id=(
         SELECT c2.checkpoint_id FROM storage_checkpoints c2 WHERE c2.run_id=c.run_id
         ORDER BY c2.observed_wall_us,c2.checkpoint_id LIMIT 1) AND c.observed_wall_us<=?""",(end_us,))
-    diagnostics = dict(requested_interval_us=(start_us,end_us),quality_interval_us=(effective_start,end_us),
+    diagnostics = dict(requested_interval_us=(start_us,end_us),quality_interval_us=(effective_start,server_end) if bounds is not None else None,
         physical_interval_us=(checkpoints[0]["observed_wall_us"],checkpoints[-1]["observed_wall_us"]) if len(checkpoints)>=2 else None,
         missing_checkpoints=len(checkpoints)<2,missing_start_checkpoint=not checkpoints or checkpoints[0]["observed_wall_us"]!=start_us,
         missing_end_checkpoint=not checkpoints or checkpoints[-1]["observed_wall_us"]!=end_us,
@@ -338,9 +433,9 @@ def measure(store: RecorderStore, *, start_us: int, end_us: int) -> MeasurementR
         clock_uncertainty_us=nearest_rank_percentiles(a["uncertainty_us"] for a in anchors),
         interruptions=sum(r["state"] in ("INTERRUPTED","FAILED") and r["ended_wall_us"] is not None and r["ended_wall_us"]<=end_us for r in relevant_runs),
         restart_downtime_seconds=_union_duration((max(start_us,a["ended_wall_us"]),min(end_us,b["started_wall_us"])) for a,b in zip(all_runs,all_runs[1:]) if a["ended_wall_us"] is not None)/1_000_000,
-        whole_period_coverage_established=unassigned==0 and effective_start==start_us and not inprogress and len(grid)>0 and terminal==len(grid),
+        whole_period_coverage_established=unassigned==0 and effective_start==server_start and not inprogress and len(grid)>0 and terminal==len(grid) and lower==upper,
         projection_label="Fixed observed workload projection; not a guarantee",
-        time_domain="Requested/checkpoint times use local wall; slots use calibrated server time; see clock uncertainty",
+        time_domain="Requested/checkpoint/receipt as-of times use local wall; quality grid/window/gap bounds use projected calibrated server time; see projection availability and clock uncertainty",
         formulae=dict(mb_per_day="growth_bytes / elapsed_seconds * 86400 / 1000000 (decimal MB)",
             gb_per_30_days="growth_bytes / elapsed_seconds * 2592000 / 1000000000 (decimal GB)",
             bytes_per_terminal_slot="growth_bytes / newly terminal scheduled slots; includes shared overhead",
@@ -348,12 +443,19 @@ def measure(store: RecorderStore, *, start_us: int, end_us: int) -> MeasurementR
         pages=tuple(dict(observed_wall_us=c["observed_wall_us"],allocated_bytes=c["page_size"]*c["page_count"],
             used_bytes=c["page_size"]*(c["page_count"]-c["freelist_count"]),freelist_count=c["freelist_count"],
             journal_bytes=c["journal_bytes"],db_file_bytes=c["db_file_bytes"]) for c in checkpoints))
+    diagnostics.update(projection)
+    diagnostics["quality_status_count_bounds"] = {status:(sum(key in slots and slots[key]["status"]==status for key in lower),
+        sum(key in slots and slots[key]["status"]==status for key in upper)) if bounds is not None else None
+        for status in percentages}
     reference = _references(store,grid,slots,markets,runs,end_us)
     discovery_by_domain = {domain:_union_duration((gap["started_us"],gap["ended_us"])
         for gap in discovery if gap["time_domain"]==domain)/1_000_000
         for domain in {gap["time_domain"] for gap in discovery}}
     diagnostics["discovery_gaps"] = dict(count=len(discovery),duration_seconds=sum(discovery_by_domain.values()),
         duration_seconds_by_time_domain=discovery_by_domain,intervals=tuple(discovery))
+    if bounds is None:
+        diagnostics["discovery_gaps"].update(count=None,duration_seconds=None,
+            unavailable_server_intervals=True)
     physical_counts = {} if len(checkpoints)>=2 else None
     if physical_counts is not None:
         physical_counts["terminal"] = checkpoints[-1]["committed_slot_count"]-checkpoints[0]["committed_slot_count"]
@@ -370,6 +472,16 @@ def measure(store: RecorderStore, *, start_us: int, end_us: int) -> MeasurementR
         diagnostics["physical_complete_unavailable_reason"] = "MISSING_CHECKPOINTS"
     denominators["physical_terminal_slots"] = physical_counts["terminal"] if physical_counts else None
     denominators["physical_complete_slots"] = physical_counts["complete"] if physical_counts else None
+    if bounds is None:
+        for key in ("eligible_scheduled_slots", "terminal_slots", "complete_slots", "in_progress_slots",
+                    "pre_first_start_slots", "unrecorded_eligible_slots"):
+            denominators[key] = None
+        for key in reference:
+            reference[key] = None
+        depth_breakdown["valid_books"] = None
+        depth_breakdown["excluded_invalid_books"] = None
+        for outcome in ("UP", "DOWN"):
+            depth_breakdown[outcome]["valid_books"] = None
     rate = growth/elapsed if growth is not None and elapsed > 0 else None
     return MeasurementReport(elapsed, next(iter(modes)) if len(modes)==1 else ("MIXED" if modes else None),
         growth, growth*86400/elapsed/1_000_000 if rate is not None else None,
@@ -377,10 +489,11 @@ def measure(store: RecorderStore, *, start_us: int, end_us: int) -> MeasurementR
         growth/physical_counts["terminal"] if rate is not None and physical_counts["terminal"] else None,
         growth/physical_counts["complete"] if rate is not None and physical_counts["complete"] else None,
         mean_depth, status_percentages=percentages,latency_percentiles=latency,
-        rollover_gaps=dict(count=len(rollover),duration_seconds=_union_duration(
-            (gap["started_us"],gap["ended_us"]) for gap in rollover)/1_000_000,
+        rollover_gaps=dict(count=len(rollover) if bounds is not None else None,
+            duration_seconds=_union_duration((gap["started_us"],gap["ended_us"])
+                for gap in rollover)/1_000_000 if bounds is not None else None,
             intervals=tuple(rollover),time_domain="SERVER",excluded_time_domain_count=uncomparable_gaps),
-        reference_coverage=reference,resolution_summary=_resolutions(store,markets,end_us),
+        reference_coverage=reference,resolution_summary=_resolutions(store,markets,server_end,end_us),
         denominators=denominators,depth_breakdown=depth_breakdown,diagnostics=diagnostics,
         evidence_bytes=dict(_evidence_bytes(store,start_us,end_us),reference_report_count=store._one(
             "SELECT COUNT(*) n FROM reference_reports WHERE first_received_wall_us>=? AND first_received_wall_us<=?",(start_us,end_us))["n"]))
