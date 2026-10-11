@@ -490,6 +490,9 @@ class ManagedReferenceSession(OfflineReferenceSession):
         from .chainlink_rest import ChainlinkRestClient
         from .chainlink_ws import ChainlinkLiveConsumer
         self.metadata = verify_feed_identity(self.discovery(deadline))
+        self.discovery_completed_mono_ns = self.monotonic_ns()
+        self.discovery_completed_wall_us = self.wall_us()
+        self.discovery_verified_us = None
         if self.metadata.name != 'BTC/USD-Streams-TWAP-60s-mainnet-production':
             raise MarketDataError('identity_conflict', 'Discovery feed name conflicts.')
         self.price_scale = self.metadata.price_scale
@@ -543,6 +546,32 @@ class ManagedReferenceSession(OfflineReferenceSession):
             raise MarketDataError('reference_shutdown_failed', 'Reference resource cleanup failed.') from error
 
     def fetch(self, row, deadline, *, run_id, anchor_id, project, buffer_only=False, payload_override=None):
+        if buffer_only and hasattr(self.consumer, 'get_report_status'):
+            from polymarket_bot.market_data.http import HttpAttempt
+            from .models import ReferenceFetchDraft
+            now_ns = self.monotonic_ns()
+            status, buffered = self.consumer.get_report_status(5, project(now_ns)/1_000_000)
+            if status == 'STALE':
+                result = super().fetch(row, deadline, run_id=run_id, anchor_id=anchor_id,
+                    project=project, buffer_only=True, payload_override=None)
+                from dataclasses import replace
+                return row, replace(result[1], error_code='STALE_REFERENCE'), (), deadline
+            if buffered is not None:
+                signed, fields = buffered
+                arrival_ns, arrival_wall = fields['receipt_mono_ns'], fields['receipt_wall_us']
+                if arrival_ns > now_ns:
+                    raise MarketDataError('invalid_reference_receipt', 'Future stream arrival.')
+                raw = fields['raw_message']
+                report = decode_schema_v2_report(fields, price_scale=self.price_scale,
+                    decoder_revision=self.decoder_revision, receipt_wall_us=arrival_wall,
+                    receipt_server_us=project(arrival_ns))
+                attempt = HttpAttempt('REFERENCE_LATEST', 'GET', '/ws/v1',
+                    ('feed_id='+CHAINLINK_FEED_ID,), 1, arrival_ns, arrival_ns,
+                    arrival_wall, arrival_wall, 200, 'success', None, raw, True)
+                fetch = ReferenceFetchDraft(attempt, run_id, CHAINLINK_FEED_ID, row.role,
+                    'LIVE_LATEST', row.target_us, 'UNAVAILABLE', None, raw,
+                    project(arrival_ns), row.market_id, anchor_id)
+                return row, fetch, (report,), deadline
         if buffer_only or payload_override is not None:
             return super().fetch(row, deadline, run_id=run_id, anchor_id=anchor_id,
                 project=project, buffer_only=buffer_only, payload_override=payload_override)
@@ -561,7 +590,7 @@ def due_reference_boundaries(store, now_us, limit=2):
         WHERE a.role IN ('OPENING','CLOSING') AND a.association_id=(
             SELECT MAX(b.association_id) FROM reference_associations b
             WHERE b.market_id=a.market_id AND b.role=a.role)
-        AND a.status IN ('PENDING','UNAVAILABLE','AMBIGUOUS','CONFLICT')
+        AND a.status IN ('PENDING','UNAVAILABLE','AMBIGUOUS','CONFLICT','AVAILABLE')
         AND a.next_due_us<=? ORDER BY a.next_due_us,a.market_id,a.role LIMIT ?""", (now_us, limit))
     return tuple(ReferenceAssociationDraft(**{name: row[name] for name in
         ReferenceAssociationDraft.__dataclass_fields__ if name != 'report_hash'}) for row in rows)
@@ -580,8 +609,13 @@ def reconcile_due_reference_boundaries(store, rest_client, now_server_us, deadli
         if monotonic() >= deadline:
             break
         fetch, reports = rest_client.fetch_boundary(row, deadline)
+        store.save_reference_evidence(fetch, reports, ())
         selected, status, reason = None, 'PENDING', 'BOUNDARY_PENDING'
         try:
+            retained = store._rows("SELECT report_hash FROM reference_reports WHERE feed_id=? AND decode_status='DECODED' AND valid_from_seconds<=? AND observations_seconds>=? LIMIT 2",
+                (CHAINLINK_FEED_ID, row.target_us//1_000_000, row.target_us//1_000_000))
+            if len({r['report_hash'] for r in retained}) > 1:
+                raise MarketDataError('BOUNDARY_AMBIGUOUS', 'Retained reports contain boundary.')
             selected = select_boundary_report(reports, row.target_us)
         except MarketDataError as exc:
             if exc.code != 'BOUNDARY_AMBIGUOUS':
@@ -596,7 +630,7 @@ def reconcile_due_reference_boundaries(store, rest_client, now_server_us, deadli
             learned_wall_us=fetch.attempt.ended_wall_us, learned_server_us=learned,
             fetch_id=None, report_id=None, report_hash=selected.report_hash if selected else None,
             selection_policy_revision='signed-inclusive-seconds-v1', reason=reason, attempt_count=row.attempt_count + 1,
-            next_due_us=None if status == 'AVAILABLE' else boundary_retry_due(row.target_us,
+            next_due_us=boundary_retry_due(row.target_us,
                 attempt_count=row.attempt_count + 1, now_us=max(now_server_us, learned or now_server_us)))
         store.save_reference_evidence(fetch, reports, (association,))
         completed += 1

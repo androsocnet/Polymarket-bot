@@ -644,7 +644,8 @@ class RecorderStore:
         routes = {"REFERENCE_LATEST": "/api/v1/reports/latest",
                   "REFERENCE_LOOKUP": "/api/v1/reports", "REFERENCE_PAGE": "/api/v1/reports/page"}
         _require(attempt.operation in routes and attempt.method == "GET"
-                 and attempt.path == routes[attempt.operation]
+                 and (attempt.path == routes[attempt.operation] or
+                      (attempt.operation == 'REFERENCE_LATEST' and attempt.path == '/ws/v1'))
                  and attempt.selectors == ("feed_id=" + CHAINLINK_FEED_ID,),
                  "Reference request must describe an approved exact-feed read.")
         _require((fetch.origin == "LIVE_LATEST") == (attempt.operation == "REFERENCE_LATEST"),
@@ -829,8 +830,8 @@ class RecorderStore:
                      'Live availability requires fresh signed interval and calibrated receipt.')
             if association.role == "SLOT_CURRENT":
                 _require(fetch.received_server_us is not None
-                         and association.target_us <= fetch.received_server_us
-                         < min(association.target_us + 2_000_000, market["window_end_us"]),
+and (fetch.attempt.path == '/ws/v1' or association.target_us <= fetch.received_server_us)
+                          and fetch.received_server_us < min(association.target_us + 2_000_000, market["window_end_us"]),
                          "A latest report outside its slot deadline cannot claim original live coverage.")
         values = asdict(association)
         values.pop("report_hash")

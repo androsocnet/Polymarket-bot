@@ -740,6 +740,70 @@ class RecorderServiceTests(unittest.TestCase):
         recorder._reference_housekeeping(fixture.monotonic_ns())
         self.assertEqual(len(fixture.rows('SELECT * FROM reference_associations')), before)
 
+    def test_real_ws_frame_arrival_preserved_at_later_sample(self):
+        import json
+        from polymarket_bot.recorder.chainlink_ws import ChainlinkLiveConsumer
+        from polymarket_bot.recorder.reference import ManagedReferenceSession, ActivationEvidence
+        from polymarket_bot.recorder.models import CHAINLINK_FEED_ID, ReferenceAssociationDraft
+        from tests.test_schema_v2_decoder import build_schema_v2_report_payload
+        fixture = self.fixture()
+        now = fixture.wall_us()//1_000_000
+        payload, signed = build_schema_v2_report_payload(valid_from=now-60, observations=now, expires=now+60)
+        frame = json.dumps(payload, indent=2).encode()
+        consumer = ChainlinkLiveConsumer('wss://ws.dataengine.chain.link', CHAINLINK_FEED_ID,
+            'synthetic-id', 'synthetic-secret', clock_seconds=lambda: fixture.wall_us()/1_000_000,
+            monotonic=lambda: fixture.monotonic_ns()/1_000_000_000)
+        arrival_ns, arrival_wall = fixture.monotonic_ns(), fixture.wall_us()
+        consumer._handle_websocket_message(frame)
+        fixture.advance(1)
+        session = ManagedReferenceSession(evidence=ActivationEvidence(*([True]*6)), discovery=lambda d: {},
+            credentials=lambda: ('id','secret'), monotonic_ns=fixture.monotonic_ns,
+            wall_us=fixture.wall_us, decoder_revision='abi')
+        session.consumer, session.price_scale, session.live = consumer, 8, consumer.get_freshest_report
+        row = ReferenceAssociationDraft('test', 'SLOT_CURRENT', fixture.wall_us(), 'UNAVAILABLE',
+            'NOT_FETCHED', False, fixture.wall_us(), fixture.wall_us())
+        result = session.fetch(row, fixture.monotonic_ns()/1_000_000_000+2, run_id='test', anchor_id=None,
+            project=lambda ns: arrival_wall+(ns-arrival_ns)//1000, buffer_only=True)
+        self.assertEqual(result[1].raw_response, frame)
+        self.assertEqual(result[1].attempt.ended_mono_ns, arrival_ns)
+        self.assertEqual(result[2][0].first_received_wall_us, arrival_wall)
+        self.assertEqual(result[2][0].first_received_server_us, arrival_wall)
+
+    def test_slow_reference_writer_never_claims_live(self):
+        from polymarket_bot.recorder.service import Recorder
+        from tests.test_schema_v2_decoder import build_schema_v2_report_payload
+        fixture = self.fixture()
+        def live(age, now):
+            payload, signed = build_schema_v2_report_payload(valid_from=int(now)-60,
+                observations=int(now), expires=int(now)+60)
+            return signed, payload['report']
+        session = self.review_session(fixture, latest=lambda d: None, live=live)
+        original = fixture.store.save_reference_evidence
+        def slow(*args):
+            result = original(*args)
+            fixture.advance(3)
+            return result
+        fixture.store.save_reference_evidence = slow
+        recorder = Recorder(fixture.store, fixture.public, monotonic_ns=fixture.monotonic_ns,
+            wall_us=fixture.wall_us, sleep=fixture.sleep, offline_reference=session)
+        recorder.run(RunConfig(mode='REFERENCE_REQUIRED'), should_stop=lambda: fixture.book_count>=1)
+        self.assertFalse(fixture.rows('SELECT * FROM reference_associations WHERE available_live=1'))
+
+    def test_startup_transport_failure_closes_store_and_sanitizes(self):
+        from polymarket_bot.recorder.reference import ManagedReferenceSession, ActivationEvidence
+        from polymarket_bot.recorder.service import Recorder
+        fixture = self.fixture()
+        session = ManagedReferenceSession(evidence=ActivationEvidence(*([True]*6)),
+            discovery=lambda d: (_ for _ in ()).throw(ConnectionError('secret-startup')),
+            credentials=lambda: self.fail('credentials'), monotonic_ns=fixture.monotonic_ns,
+            wall_us=fixture.wall_us, decoder_revision='abi')
+        recorder = Recorder(fixture.store, fixture.public, monotonic_ns=fixture.monotonic_ns,
+            wall_us=fixture.wall_us, sleep=fixture.sleep, offline_reference=session)
+        result = recorder.run(RunConfig(mode='REFERENCE_REQUIRED'), should_stop=lambda: False)
+        self.assertEqual(result.reason, 'reference_transport_failed')
+        reopened = RecorderStore.open(fixture.db.path)
+        reopened.close()
+
     def test_reference_worker_error_returns_failed_and_closes(self):
         from polymarket_bot.recorder.service import Recorder, ReferenceWorker
         fixture = self.fixture()
@@ -794,6 +858,7 @@ class RecorderServiceTests(unittest.TestCase):
             [{'verification_status': 'UNVERIFIED'}])
         self.assertIsNone(session.rest)
         self.assertIsNone(session.consumer)
+        self.assertIsNotNone(fixture.rows('SELECT verified_us FROM reference_feeds')[0]['verified_us'])
 
     def test_stale_and_late_buffer_evidence_never_eligible(self):
         from polymarket_bot.recorder.service import Recorder

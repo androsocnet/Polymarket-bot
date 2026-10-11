@@ -177,12 +177,13 @@ class ChainlinkLiveConsumer:
         digest = sha256(signed).hexdigest()
         key = (draft.observations_seconds, digest)
         fields.update(receipt_wall_us=receipt_wall_us, receipt_monotonic=receipt_monotonic,
+                      receipt_mono_ns=round(receipt_monotonic*1_000_000_000),
                       receipt_server_us=None, raw_message=raw, report_hash=digest,
                       verification_status='UNVERIFIED')
         with self._lock:
             if self._latest_report is not None and digest == self._latest_report[0][1]:
                 previous = self._latest_report[2]
-                evidence_keys = ('receipt_wall_us', 'receipt_monotonic', 'receipt_server_us',
+                evidence_keys = ('receipt_wall_us', 'receipt_monotonic', 'receipt_mono_ns', 'receipt_server_us',
                                  'raw_message', 'report_hash', 'verification_status')
                 if {k: v for k, v in fields.items() if k not in evidence_keys} != {
                         k: v for k, v in previous.items() if k not in evidence_keys}:
@@ -190,6 +191,14 @@ class ChainlinkLiveConsumer:
                 return
             if self._latest_report is None or key > self._latest_report[0]:
                 self._latest_report = (key, signed, fields, draft)
+
+    def get_report_status(self, max_age_s, now_server_s):
+        self.check_health()
+        report = self.get_freshest_report(max_age_s, now_server_s)
+        if report is not None:
+            return 'FRESH', report
+        with self._lock:
+            return ('EMPTY', None) if self._latest_report is None else ('STALE', None)
 
     def get_freshest_report(self, max_age_s, now_server_s):
         if type(max_age_s) not in (int, float) or not math.isfinite(max_age_s) or not 0 < max_age_s <= 5:

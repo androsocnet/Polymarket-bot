@@ -139,11 +139,17 @@ def _references(store, eligible, slots, markets, runs, end_us):
         r.first_received_server_us,r.valid_from_seconds,r.observations_seconds,
         r.expires_at_seconds,f.origin AS fetch_origin,f.purpose AS fetch_purpose,
         q.ended_server_us AS fetch_received_server_us,q.ended_wall_us AS fetch_received_wall_us,
-        q.operation AS fetch_operation,q.run_id AS fetch_run_id FROM reference_associations a
+        q.operation AS fetch_operation,q.path AS fetch_path,q.run_id AS fetch_run_id FROM reference_associations a
         LEFT JOIN reference_reports r USING(report_id)
         LEFT JOIN reference_fetches f ON f.fetch_id=a.fetch_id AND f.feed_id=r.feed_id
         LEFT JOIN request_attempts q ON q.request_id=f.request_id WHERE a.learned_wall_us<=?
         ORDER BY a.learned_wall_us,a.association_id""",(end_us,))
+    import json
+    durable = {}
+    for event in store._rows("SELECT started_us,detail_json FROM recorder_events WHERE kind='DISCOVERY_GAP' AND started_us<=?", (end_us,)):
+        detail = json.loads(event['detail_json'])
+        if detail.get('reason') == 'REFERENCE_DURABLE':
+            durable[(detail.get('slot_id'), detail.get('learned_wall_us'))] = detail
     live, boundaries = set(), {}
     by_id = {slot["slot_id"]:slot for slot in slots.values()}
     by_market = {row["market_id"]:row for row in markets}
@@ -176,6 +182,10 @@ def _references(store, eligible, slots, markets, runs, end_us):
         if run is None or run["mode"]=="BOOK_ONLY":
             continue
         receipt, learned, target = row["fetch_received_server_us"],row["learned_server_us"],slot["scheduled_us"]
+        proof = durable.get((row['slot_id'], row['learned_wall_us']))
+        if proof is not None and (not proof.get('available_live') or proof.get('durable_server_us') is None
+                or proof['durable_server_us'] >= min(target+2_000_000, market['window_end_us'])):
+            continue
         if (row["origin"]!="LIVE_LATEST" or not row["available_live"] or row["target_us"]!=target
                 or receipt is None or learned is None or receipt>learned
                 or row["fetch_origin"]!="LIVE_LATEST" or row["fetch_purpose"]!="SLOT_CURRENT"
@@ -183,7 +193,7 @@ def _references(store, eligible, slots, markets, runs, end_us):
                 or row["fetch_received_wall_us"]>row["learned_wall_us"]
                 or row["first_received_wall_us"]>row["fetch_received_wall_us"]
                 or row["first_received_server_us"] is None or row["first_received_server_us"]>receipt
-                or not target<=receipt<min(target+2_000_000,market["window_end_us"])
+                or not (receipt<min(target+2_000_000,market["window_end_us"]) and (row['fetch_path']=='/ws/v1' or target<=receipt))
                 or not target<=learned<min(target+2_000_000,market["window_end_us"])
                 or any(row[name] is None for name in ("valid_from_seconds","observations_seconds","expires_at_seconds"))
                 or not row["valid_from_seconds"]*1_000_000<=learned<=row["expires_at_seconds"]*1_000_000

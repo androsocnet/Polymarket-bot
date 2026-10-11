@@ -136,8 +136,19 @@ class ReferenceTests(unittest.TestCase):
         self.assertEqual(reference.reconcile_due_reference_boundaries(store, Reader(), NOW_US, 10,
             monotonic=lambda: 0), 1)
         saved = store._one('SELECT * FROM reference_associations ORDER BY association_id DESC LIMIT 1')
-        self.assertEqual((saved['status'], saved['available_live'], saved['next_due_us']), ('AVAILABLE', 0, None))
+        self.assertEqual((saved['status'], saved['available_live'], saved['next_due_us']), ('AVAILABLE', 0, NOW_US+60_000_000))
         self.assertEqual(saved['learned_server_us'], NOW_US)
+        later_report = replace(report, raw_signed_report=b'other-containing',
+            report_hash=__import__('hashlib').sha256(b'other-containing').hexdigest(),
+            first_received_wall_us=NOW_US+60_000_123, first_received_server_us=NOW_US+60_000_000)
+        later_fetch = self.fetch(run, receipt=NOW_US+60_000_000)
+        class LaterReader:
+            def fetch_boundary(self, row, deadline): return later_fetch, (later_report,)
+        reference.reconcile_due_reference_boundaries(store, LaterReader(), NOW_US+60_000_000, 10,
+            monotonic=lambda: 0)
+        latest = store._one('SELECT * FROM reference_associations ORDER BY association_id DESC LIMIT 1')
+        self.assertEqual(latest['status'], 'AMBIGUOUS')
+        self.assertEqual(latest['reason'], 'BOUNDARY_AMBIGUOUS')
         self.assertEqual(store._one('SELECT verification_status FROM reference_reports')['verification_status'], 'UNVERIFIED')
         association = replace(plan, status='AVAILABLE', origin='HISTORICAL_LOOKUP',
             learned_server_us=NOW_US, report_hash=report.report_hash, selection_policy_revision='signed-inclusive-seconds-v1')

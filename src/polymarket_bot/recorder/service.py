@@ -115,12 +115,17 @@ class Recorder:
         from dataclasses import replace
         from .reference import boundary_retry_due
         row, fetch, reports, deadline = result
+        self.store.save_reference_evidence(fetch, reports, ())
         now = self._now() if self.clock.usable() else fetch.received_server_us
         reason, status, selected = fetch.error_code or 'DON_UNVERIFIED', 'UNAVAILABLE', None
         if row.role != 'SLOT_CURRENT':
             from .reference import select_boundary_report
             status, reason = 'PENDING', 'BOUNDARY_PENDING'
             try:
+                retained = self.store._rows("SELECT report_hash FROM reference_reports WHERE feed_id=? AND decode_status='DECODED' AND valid_from_seconds<=? AND observations_seconds>=? LIMIT 2",
+                    (fetch.feed_id, row.target_us//1_000_000, row.target_us//1_000_000))
+                if len({r['report_hash'] for r in retained}) > 1:
+                    raise MarketDataError('BOUNDARY_AMBIGUOUS', 'Retained reports contain boundary.')
                 selected = select_boundary_report(reports, row.target_us)
             except MarketDataError as exc:
                 if exc.code != 'BOUNDARY_AMBIGUOUS':
@@ -150,9 +155,27 @@ class Recorder:
             learned_wall_us=learned_wall, learned_server_us=max(now, fetch.received_server_us),
             report_hash=selected.report_hash if selected else None, report_id=None, fetch_id=None,
             attempt_count=row.attempt_count+1, selection_policy_revision='signed-inclusive-seconds-v1',
-            next_due_us=None if row.role == 'SLOT_CURRENT' or status == 'AVAILABLE' else boundary_retry_due(row.target_us,
+            next_due_us=None if row.role == 'SLOT_CURRENT' else boundary_retry_due(row.target_us,
                 attempt_count=row.attempt_count+1, now_us=max(now, fetch.received_server_us)))
+        if association.available_live:
+            self.store.save_reference_evidence(fetch, reports, (replace(association,
+                status='UNAVAILABLE', available_live=False, reason='PERSISTENCE_PENDING'),))
+            association = replace(association, learned_wall_us=max(self.wall_us(), association.learned_wall_us+1),
+                learned_server_us=self._now() if self.clock.usable() else association.learned_server_us)
+            if self.monotonic_ns()/1_000_000_000 >= deadline:
+                association = replace(association, status='UNAVAILABLE', available_live=False, reason='LATE_REFERENCE')
         self.store.save_reference_evidence(fetch, reports, (association,))
+        if association.available_live and self.monotonic_ns()/1_000_000_000 >= deadline:
+            association = replace(association, status='UNAVAILABLE', available_live=False,
+                reason='LATE_REFERENCE', learned_wall_us=max(self.wall_us(), association.learned_wall_us+1),
+                learned_server_us=self._now() if self.clock.usable() else association.learned_server_us)
+            self.store.save_reference_evidence(fetch, reports, (association,))
+        self.store.record_event(self.run_id, 'DISCOVERY_GAP', started_us=self.wall_us(),
+            detail={'reason': 'REFERENCE_DURABLE', 'diagnostic_only': True, 'time_domain': 'LOCAL_WALL',
+                'slot_id': row.slot_id, 'market_id': row.market_id, 'role': row.role,
+                'learned_wall_us': association.learned_wall_us,
+                'durable_server_us': self._now() if self.clock.usable() else None,
+                'available_live': association.available_live})
         if fetch.error_code in ('chainlink_auth_failed', 'websocket_failed'):
             raise MarketDataError(fetch.error_code, 'Reference permission or worker gate lost.')
 
@@ -217,6 +240,16 @@ class Recorder:
                                         detail={"reason": exc.code, "time_domain": "LOCAL_WALL"})
             return False
         self.anchor_id = self.store.save_anchor(self.run_id, anchor)
+        from .reference import ManagedReferenceSession
+        if isinstance(self.offline_reference, ManagedReferenceSession) and self.reference_worker is not None:
+            completed = self.offline_reference.discovery_completed_mono_ns
+            if anchor.status != 'DISCONTINUITY' and 0 <= anchor.midpoint_ns-completed <= 60_000_000_000:
+                from .models import CHAINLINK_FEED_ID
+                verified = anchor.server_us+(completed-anchor.midpoint_ns)//1000
+                with self.store._transaction():
+                    self.store._connection.execute('UPDATE reference_feeds SET verified_us=? WHERE feed_id=?',
+                        (verified, CHAINLINK_FEED_ID))
+                self.offline_reference.discovery_verified_us = verified
         self.next_clock_ns = anchor.midpoint_ns + 60_000_000_000
         if anchor.status == "DISCONTINUITY":
             self.next_clock_ns = self.monotonic_ns()
@@ -376,6 +409,19 @@ class Recorder:
                 exc.code if isinstance(exc, RecorderStoreError) else "storage_failure")
 
     def _execute_run(self, config, *, should_stop):
+        try:
+            return self._execute_started_run(config, should_stop=should_stop)
+        except (ConnectionError, TimeoutError):
+            raise MarketDataError('reference_transport_failed', 'Reference startup transport failed.') from None
+        finally:
+            try:
+                from .reference import ManagedReferenceSession
+                if config.mode == 'REFERENCE_REQUIRED' and isinstance(self.offline_reference, ManagedReferenceSession):
+                    self.offline_reference.stop()
+            finally:
+                self.store.close()
+
+    def _execute_started_run(self, config, *, should_stop):
         from .reference import OfflineReferenceSession
         if config.mode != "BOOK_ONLY" and (config.mode != 'REFERENCE_REQUIRED'
                 or not isinstance(self.offline_reference, OfflineReferenceSession)):
@@ -389,7 +435,10 @@ class Recorder:
                 if isinstance(self.offline_reference, ManagedReferenceSession):
                     from .models import CHAINLINK_FEED_ID
                     pin = self.store._one('SELECT price_scale,decoder_revision FROM reference_feeds WHERE feed_id=?', (CHAINLINK_FEED_ID,))
-                    self.offline_reference.start(config.mode, self.monotonic_ns()/1_000_000_000+10, persisted_pin=pin)
+                    try:
+                        self.offline_reference.start(config.mode, self.monotonic_ns()/1_000_000_000+10, persisted_pin=pin)
+                    except (ConnectionError, TimeoutError, OSError):
+                        raise MarketDataError('reference_transport_failed', 'Reference startup transport failed.') from None
             except MarketDataError as exc:
                 self.store.close()
                 return RunResult('', 'FAILED', 2, 0, exc.code)

@@ -14,6 +14,17 @@ class ChainlinkLiveConsumerTests(unittest.TestCase):
         return ChainlinkLiveConsumer('wss://ws.dataengine.chain.link', CHAINLINK_FEED_ID,
                                     'cid', 'sec', clock_seconds=lambda: 160, **kwargs)
 
+    def test_buffer_status_distinguishes_empty_stale_and_fresh(self):
+        consumer = self.consumer(monotonic=lambda: 1)
+        self.assertEqual(consumer.get_report_status(5, 160)[0], 'EMPTY')
+        frame = json.dumps(make_valid_report_payload()).encode()
+        consumer._handle_websocket_message(frame)
+        self.assertEqual(consumer.get_report_status(5, 170)[0], 'STALE')
+        status, report = consumer.get_report_status(5, 161)
+        self.assertEqual(status, 'FRESH')
+        self.assertEqual(report[1]['raw_message'], frame)
+        self.assertEqual(report[1]['receipt_mono_ns'], 1_000_000_000)
+
     def test_terminal_worker_failure_visible_to_owner(self):
         consumer = self.consumer()
         consumer._failure = 'unexpected_worker_failure'
