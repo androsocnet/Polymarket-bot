@@ -209,6 +209,16 @@ Verification: exact user full offline unittest command ran 410 tests in 212.029 
 
 Author review: partial only. Independent reviewer unavailable; parent dispatch required. Review new reconciler trust boundary, unbounded queue read, reader interface mismatch, policy validation, evidence learning times, worker cleanup and missing service integration first. CP3 BLOCKED/PARTIAL; no checkpoint PASS or strategy-complete claim.
 
+### Last two medium remediation (base 1867b55)
+
+Root causes: owner called live accessor before book I/O outside normalization; LIMIT 2 anti-join still traversed historical market/association state each pass. RED observed accessor before COMPLETE commit and missing keyset cursor query in 101-market fixture.
+
+Fix: book terminal transaction completes before normalized buffer-only fetch invokes live accessor; expected ConnectionError/TimeoutError/OSError persist unavailable sanitized transport failure, slow callback cannot invalidate committed books and late drain is rejected. Empty buffer may submit fallback only within remaining slot budget. Historical worker remains independent.
+
+Boundary preparation uses indexed market_id keyset cursor, two markets/pass, exact role existence checks and deadline checks; cursor advances only after both roles considered. Fresh process replays bounded recovery batches idempotently; direct market acquisition creates missing plans so newly acquired IDs below cursor are not skipped. No repeated full NOT EXISTS market query. Ruling: cursor is per recorder/run memory, restarted from empty after process restart; persistent plans make replay safe without schema changes — cost: restart revisits history once in bounded batches, not each housekeeping pass.
+
+Fresh exact full offline unittest suite: 431 tests in 231.901 seconds OK. Both regression tests RED then GREEN; original assertions retained. Production activation remains refused and CP3 partial/BLOCKED pending Gates5/6 and parent recheck. No live network, actual credentials, CP4, DDL, push or merge. No configured lint/typecheck command found.
+
 ### Gate C independent review remediation
 
 Independent Gate C FAIL received against 9f5bd20. Production Gate5 signed-binary decoding and Gate6 verified selection remain unresolved: CP3 partial/BLOCKED, no activation or PASS claim.

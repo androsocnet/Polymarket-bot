@@ -763,6 +763,54 @@ class RecorderServiceTests(unittest.TestCase):
             self.assertFalse(reopened._rows("SELECT * FROM sample_slots WHERE status='IN_PROGRESS'"))
             reopened.close()
 
+    def test_live_accessor_failure_and_delay_preserve_committed_books(self):
+        from polymarket_bot.recorder.service import Recorder
+        for delay in (False, True):
+            fixture = self.fixture()
+            def live(age, now):
+                self.assertTrue(fixture.rows("SELECT * FROM sample_slots WHERE status='COMPLETE'"))
+                if delay:
+                    fixture.advance(3)
+                    return None
+                raise ConnectionError('secret sentinel')
+            session = self.review_session(fixture, latest=lambda d: None, live=live)
+            recorder = Recorder(fixture.store, fixture.public, monotonic_ns=fixture.monotonic_ns,
+                wall_us=fixture.wall_us, sleep=fixture.sleep, offline_reference=session)
+            result = recorder.run(RunConfig(mode='REFERENCE_REQUIRED'), should_stop=lambda: fixture.book_count>=1)
+            self.assertEqual((result.state, result.slots_finalized), ('STOPPED', 1))
+            self.assertTrue(fixture.rows("SELECT * FROM reference_associations WHERE reason=?",
+                ('LATE_REFERENCE' if delay else 'reference_transport_failed',)))
+
+    def test_boundary_preparation_cursor_visits_history_once_per_run(self):
+        from polymarket_bot.recorder.service import Recorder, ReferenceWorker
+        from tests.recorder_support import seed_writer_market
+        fixture = self.fixture()
+        recorder = Recorder(fixture.store, fixture.public, monotonic_ns=fixture.monotonic_ns,
+            wall_us=fixture.wall_us, sleep=fixture.sleep)
+        recorder.reference_worker = ReferenceWorker()
+        recorder.run_id = fixture.store.start_run(RunConfig(), wall_us=fixture.wall_us(), app_revision='test')
+        seed_writer_market(fixture.store, recorder.run_id)
+        with fixture.store._connection:
+            for index in range(100):
+                fixture.store._connection.execute("""INSERT INTO markets SELECT ?,event_id,?,slug,question,
+                    window_start_us,window_end_us,first_seen_us,up_token_id,down_token_id,
+                    up_outcome_index,down_outcome_index,lifecycle,resolution_state,
+                    resolution_next_due_us,resolution_attempts,selected_resolution_id FROM markets WHERE market_id='1001'""",
+                    (f'history-{index:03}', f'condition-{index}'))
+        recorder.offline_reference = self.review_session(fixture, latest=lambda d: None)
+        recorder.clock.usable = lambda: True
+        recorder._now = fixture.wall_us
+        recorder._reference_submit = lambda *a: False
+        traced = []
+        fixture.store._connection.set_trace_callback(traced.append)
+        for _ in range(60):
+            recorder._reference_housekeeping(fixture.monotonic_ns()+1_000_000_000)
+        cursor_queries = [q for q in traced if 'FROM markets' in q and 'market_id>' in q]
+        self.assertTrue(cursor_queries)
+        self.assertFalse(any('NOT EXISTS' in q and 'FROM markets' in q for q in traced))
+        self.assertEqual(len(fixture.rows('SELECT * FROM reference_associations')), 202)
+        self.assertEqual(recorder.reference_plan_cursor, 'history-099')
+
     def test_reference_required_refused_before_startup(self):
         fixture = self.fixture()
         result = self.run_recorder(fixture, config=RunConfig(mode="REFERENCE_REQUIRED"))

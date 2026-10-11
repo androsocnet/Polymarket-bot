@@ -82,6 +82,7 @@ class Recorder:
         self.offline_reference = offline_reference
         self.reference_worker = None
         self.reference_gap_end = None
+        self.reference_plan_cursor = ''
         self.store, self.public = store, public
         self.monotonic_ns, self.wall_us, self.sleep = monotonic_ns, wall_us, sleep
         self.clock = RecorderClock(monotonic_ns=monotonic_ns, wall_us=wall_us)
@@ -159,17 +160,18 @@ class Recorder:
         from .reference import boundary_reference, due_reference_boundaries
         if self.monotonic_ns() >= deadline_ns:
             return
-        plans = self.store._rows("""SELECT m.market_id,m.window_start_us,m.window_end_us,r.role
-            FROM markets m CROSS JOIN (SELECT 'OPENING' AS role UNION ALL SELECT 'CLOSING') r
-            WHERE NOT EXISTS (SELECT 1 FROM reference_associations a
-                WHERE a.market_id=m.market_id AND a.role=r.role)
-            ORDER BY m.window_start_us,m.market_id,r.role LIMIT 2""")
+        plans = self.store._rows('SELECT market_id,window_start_us,window_end_us FROM markets WHERE market_id>? ORDER BY market_id LIMIT 2',
+            (self.reference_plan_cursor,))
         for market in plans:
-            if self.monotonic_ns() >= deadline_ns:
-                return
-            self.store.save_reference_plan(boundary_reference(market['market_id'], market['role'],
-                window_start_us=market['window_start_us'], window_end_us=market['window_end_us'],
-                learned_wall_us=self.wall_us(), learned_server_us=self._now()))
+            for role in ('OPENING', 'CLOSING'):
+                if self.monotonic_ns() >= deadline_ns:
+                    return
+                if self.store._one('SELECT association_id FROM reference_associations WHERE market_id=? AND role=? LIMIT 1',
+                        (market['market_id'], role)) is None:
+                    self.store.save_reference_plan(boundary_reference(market['market_id'], role,
+                        window_start_us=market['window_start_us'], window_end_us=market['window_end_us'],
+                        learned_wall_us=self.wall_us(), learned_server_us=self._now()))
+            self.reference_plan_cursor = market['market_id']
         if self.monotonic_ns() < deadline_ns:
             for row in due_reference_boundaries(self.store, self._now(), limit=1):
                 self._reference_submit(row, deadline_ns)
@@ -313,6 +315,15 @@ class Recorder:
                     "time_domain": "SERVER" if server_time_available else "LOCAL_WALL"})
             return False
         self.revision, self.revision_id = candidate, revision_id
+        if self.reference_worker is not None:
+            from .reference import boundary_reference
+            market = candidate.market
+            for role in ('OPENING', 'CLOSING'):
+                if self.store._one('SELECT association_id FROM reference_associations WHERE market_id=? AND role=? LIMIT 1',
+                        (market.market_id, role)) is None:
+                    self.store.save_reference_plan(boundary_reference(market.market_id, role,
+                        window_start_us=_epoch_us(market.window_start), window_end_us=_epoch_us(market.window_end),
+                        learned_wall_us=self.wall_us(), learned_server_us=self._now()))
         return True
 
     def _reconcile(self, deadline_ns):
@@ -561,12 +572,7 @@ class Recorder:
                 self._reference_drain()
                 reference_deadline_ns = self.clock.deadline_ns(min(target.scheduled_us+2_000_000, end_us))
                 current_reference_result = None
-                buffered = self.offline_reference.live(5, self._now()/1_000_000) if self.offline_reference.live else None
-                if buffered is not None:
-                    current_reference_result = self.offline_reference.fetch(row, reference_deadline_ns/1_000_000_000,
-                        run_id=self.run_id, anchor_id=self.anchor_id, project=project,
-                        buffer_only=True, payload_override=buffered)
-                elif not self._reference_submit(row, reference_deadline_ns):
+                if self.offline_reference.live is None and not self._reference_submit(row, reference_deadline_ns):
                     current_reference_result = 'BUSY'
             previous = self.public.on_attempt
             self.public.on_attempt = None
@@ -588,7 +594,11 @@ class Recorder:
                 self.anchor_id, self.revision_id, books, reference, started_ns, ended_ns),
                 committed_wall_us=self.wall_us())
             self.finalized += 1
-            if self.reference_worker is not None and type(current_reference_result) is tuple:
+            if self.reference_worker is not None and self.offline_reference.live is not None:
+                current_reference_result = self.offline_reference.fetch(row, reference_deadline_ns/1_000_000_000,
+                    run_id=self.run_id, anchor_id=self.anchor_id, project=project, buffer_only=True)
                 self._reference_drain(result=current_reference_result)
+                if not current_reference_result[2] and current_reference_result[1].error_code == 'REFERENCE_PENDING':
+                    self._reference_submit(row, reference_deadline_ns)
         self._shutdown("STOPPED", "STOP_REQUESTED")
         return RunResult(self.run_id, "STOPPED", 0, self.finalized, "STOP_REQUESTED")

@@ -362,7 +362,7 @@ class OfflineReferenceSession:
             if started_ns / 1_000_000_000 >= deadline:
                 raise MarketDataError('chainlink_timeout', 'Reference budget expired.')
             if row.role == 'SLOT_CURRENT':
-                payload = payload_override if buffer_only else (self.live(5, project(started_ns)/1_000_000) if self.live else None)
+                payload = payload_override if payload_override is not None else (self.live(5, project(started_ns)/1_000_000) if self.live else None)
                 if payload is None and not buffer_only:
                     payload = self.latest(deadline)
                 elif type(payload) is tuple and len(payload) == 2:
