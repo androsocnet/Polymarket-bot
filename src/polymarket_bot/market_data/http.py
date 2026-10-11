@@ -115,95 +115,101 @@ class PublicGet:
                      "GAMMA_EVENTS" if path == "/events" else
                      "GAMMA_EVENT" if path.startswith("/events/slug/") else
                      "GAMMA_MARKET")
-        for attempt in range(self.max_attempts):
-            if self.before_attempt is not None:
-                self.before_attempt()
-            if (self.client.auth is not None or self.client.cookies or self.client.params or any(
-                    key.lower().replace("_", "-") in {"authorization", "cookie", "poly-api-key",
-                                    "poly-signature", "poly-passphrase", "x-api-key"}
-                    or "signature" in key.lower() for key in self.client.headers)):
-                raise MarketDataError("transport_error", "Authenticated clients cannot make public market-data reads.")
-            remaining = self._remaining(deadline)
-            start = self.monotonic()
-            started_ns = self.monotonic_ns()
-            started_wall_us = _wall_us(self.utcnow())
-            finished_ns = finished_wall_us = None
-            retry_after = None
-            retryable = False
-            status = None
-            body = bytearray()
-            raw_complete = False
-            error = None
-            try:
-                with self.client.stream(method, url, params=params, json=json_body, follow_redirects=False,
-                                        headers={"Accept-Encoding":"identity"},
-                                        timeout=httpx.Timeout(min(self.phase_timeout, remaining))) as response:
-                    self._remaining(deadline)
-                    status = response.status_code
-                    if status == 429 or 500 <= status <= 599:
-                        error = MarketDataError("rate_limited" if status == 429 else "transport_error",
-                                                f"{source} {method} {path} returned HTTP {status}.", http_status=status)
-                        retry_after = response.headers.get("Retry-After")
-                        retryable = True
-                    elif status != 200:
-                        error = MarketDataError("transport_error",
-                                                f"{source} {method} {path} returned HTTP {status}.",
-                                                http_status=status)
-                    self._receive_body(response, deadline, body)
-                    raw_complete = True
-                    if status == 200:
-                        try:
-                            payload = load_numeric_json(body)
-                        except MarketDataError as exc:
-                            raise MarketDataError("invalid_metadata", f"Invalid JSON from {source} {method} {path}.",
-                                                  http_status=status) from exc
-                        self._remaining(deadline)
-                        finished_mono = self.monotonic()
-                        finished_ns = self.monotonic_ns()
-                        finished_wall_us = _wall_us(self.utcnow())
-                        return JsonRead(payload, start, finished_mono, bytes(body),
-                                        started_ns, finished_ns, started_wall_us, finished_wall_us)
-            except MarketDataError as exc:
-                error = exc
+        had_pre_existing_cookies = bool(self.client.cookies)
+        try:
+            for attempt in range(self.max_attempts):
+                if self.before_attempt is not None:
+                    self.before_attempt()
+                if (self.client.auth is not None or self.client.cookies or self.client.params or any(
+                        key.lower().replace("_", "-") in {"authorization", "cookie", "poly-api-key",
+                                        "poly-signature", "poly-passphrase", "x-api-key"}
+                        or "signature" in key.lower() for key in self.client.headers)):
+                    raise MarketDataError("transport_error", "Authenticated clients cannot make public market-data reads.")
+                remaining = self._remaining(deadline)
+                start = self.monotonic()
+                started_ns = self.monotonic_ns()
+                started_wall_us = _wall_us(self.utcnow())
+                finished_ns = finished_wall_us = None
+                retry_after = None
                 retryable = False
-            except (httpx.TimeoutException, httpx.NetworkError) as exc:
-                error = MarketDataError("transport_error", f"{source} {method} {path}: {type(exc).__name__}.")
-                retryable = True
-            except httpx.HTTPError as exc:
-                error = MarketDataError("transport_error", f"{source} {method} {path}: {type(exc).__name__}.")
-            except BaseException:
-                error = MarketDataError("transport_error", f"{source} {method} {path}: interrupted.")
-                raise
-            finally:
-                if self.on_attempt is not None:
-                    self.on_attempt(HttpAttempt(
-                        operation, method, path, selectors, attempt + 1,
-                        started_ns, finished_ns if finished_ns is not None else self.monotonic_ns(),
-                        started_wall_us, finished_wall_us if finished_wall_us is not None else _wall_us(self.utcnow()), status,
-                        "success" if error is None else "failure",
-                        None if error is None else error.code, bytes(body), raw_complete))
-            if not retryable or attempt == self.max_attempts - 1:
-                raise error
-            remaining = self._remaining(deadline)
-            delay = (0.5, 1.0)[attempt]
-            if retry_after is not None:
+                status = None
+                body = bytearray()
+                raw_complete = False
+                error = None
                 try:
-                    header = retry_after.strip()
-                    if len(header) > 128:
-                        raise ValueError("Oversized Retry-After")
-                    if re.fullmatch(r"[0-9]+", header):
-                        delay = float(int(header))
-                    else:
-                        parsed = parsedate_to_datetime(retry_after)
-                        if parsed.tzinfo is None:
-                            raise ValueError("Retry-After date requires timezone")
-                        delay = max(0.0, (parsed-self.utcnow()).total_seconds())
-                except (ValueError, TypeError, OverflowError):
-                    delay = (0.5, 1.0)[attempt]
-            if delay >= remaining:
-                raise error
-            self.sleep(delay)
-        raise AssertionError("Unreachable retry state")
+                    with self.client.stream(method, url, params=params, json=json_body, follow_redirects=False,
+                                            headers={"Accept-Encoding":"identity"},
+                                            timeout=httpx.Timeout(min(self.phase_timeout, remaining))) as response:
+                        self._remaining(deadline)
+                        status = response.status_code
+                        if status == 429 or 500 <= status <= 599:
+                            error = MarketDataError("rate_limited" if status == 429 else "transport_error",
+                                                    f"{source} {method} {path} returned HTTP {status}.", http_status=status)
+                            retry_after = response.headers.get("Retry-After")
+                            retryable = True
+                        elif status != 200:
+                            error = MarketDataError("transport_error",
+                                                    f"{source} {method} {path} returned HTTP {status}.",
+                                                    http_status=status)
+                        self._receive_body(response, deadline, body)
+                        raw_complete = True
+                        if status == 200:
+                            try:
+                                payload = load_numeric_json(body)
+                            except MarketDataError as exc:
+                                raise MarketDataError("invalid_metadata", f"Invalid JSON from {source} {method} {path}.",
+                                                      http_status=status) from exc
+                            self._remaining(deadline)
+                            finished_mono = self.monotonic()
+                            finished_ns = self.monotonic_ns()
+                            finished_wall_us = _wall_us(self.utcnow())
+                            return JsonRead(payload, start, finished_mono, bytes(body),
+                                            started_ns, finished_ns, started_wall_us, finished_wall_us)
+                except MarketDataError as exc:
+                    error = exc
+                    retryable = False
+                except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                    error = MarketDataError("transport_error", f"{source} {method} {path}: {type(exc).__name__}.")
+                    retryable = True
+                except httpx.HTTPError as exc:
+                    error = MarketDataError("transport_error", f"{source} {method} {path}: {type(exc).__name__}.")
+                except BaseException:
+                    error = MarketDataError("transport_error", f"{source} {method} {path}: interrupted.")
+                    raise
+                finally:
+                    if self.on_attempt is not None:
+                        self.on_attempt(HttpAttempt(
+                            operation, method, path, selectors, attempt + 1,
+                            started_ns, finished_ns if finished_ns is not None else self.monotonic_ns(),
+                            started_wall_us, finished_wall_us if finished_wall_us is not None else _wall_us(self.utcnow()), status,
+                            "success" if error is None else "failure",
+                            None if error is None else error.code, bytes(body), raw_complete))
+                if not retryable or attempt == self.max_attempts - 1:
+                    raise error
+                remaining = self._remaining(deadline)
+                delay = (0.5, 1.0)[attempt]
+                if retry_after is not None:
+                    try:
+                        header = retry_after.strip()
+                        if len(header) > 128:
+                            raise ValueError("Oversized Retry-After")
+                        if re.fullmatch(r"[0-9]+", header):
+                            delay = float(int(header))
+                        else:
+                            parsed = parsedate_to_datetime(retry_after)
+                            if parsed.tzinfo is None:
+                                raise ValueError("Retry-After date requires timezone")
+                            delay = max(0.0, (parsed-self.utcnow()).total_seconds())
+                    except (ValueError, TypeError, OverflowError):
+                        delay = (0.5, 1.0)[attempt]
+                if delay >= remaining:
+                    raise error
+                self.sleep(delay)
+            raise AssertionError("Unreachable retry state")
+        finally:
+            if not had_pre_existing_cookies:
+                self.client.cookies.clear()
+
 
     def _receive_body(self, response: httpx.Response, deadline: float,
                       body: bytearray) -> None:

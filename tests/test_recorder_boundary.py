@@ -139,3 +139,21 @@ class RecorderBoundaryTests(unittest.TestCase):
             self.assertNotIn("cookie",requests[0].headers)
         finally:
             client.close()
+
+    def test_server_set_cookie_does_not_break_subsequent_public_request(self):
+        requests = []
+        def respond(request):
+            requests.append(request)
+            headers = {"Set-Cookie": "__cf_bm=sentinel; Path=/"} if request.url.path == "/time" else {}
+            return httpx.Response(200, headers=headers, stream=httpx.ByteStream(b"{}"))
+        client, reader = self.reader(respond)
+        try:
+            read1 = reader.get_json("clob", "/time", deadline=10)
+            self.assertEqual(read1.payload, {})
+            read2 = reader.get_json("gamma", "/events", deadline=10)
+            self.assertEqual(read2.payload, {})
+            self.assertEqual(len(requests), 2)
+            self.assertNotIn("cookie", requests[1].headers)
+        finally:
+            client.close()
+
