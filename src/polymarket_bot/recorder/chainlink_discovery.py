@@ -103,23 +103,45 @@ def verify_feed_identity(discovery_payload: dict | list, expected_feed_id: str =
 
 
 def fetch_feed_discovery(client: httpx.Client, endpoint_url: str = CHAINLINK_DISCOVERY_URL, *, deadline: float | None = None) -> dict:
-    parsed = urlparse(endpoint_url)
-    if parsed.netloc.lower() != CHAINLINK_DISCOVERY_HOST.lower():
-        raise MarketDataError("invalid_discovery_host", f"Endpoint host '{parsed.netloc}' not permitted for Discovery.")
-
-    timeout = None
-    if deadline is not None:
-        # Clamped timeout budget
-        timeout = httpx.Timeout(deadline)
-
+    import math
+    import time
+    from contextlib import closing
+    if endpoint_url != CHAINLINK_DISCOVERY_URL:
+        raise MarketDataError('invalid_discovery_host', 'Only fixed HTTPS Discovery route is permitted.')
+    deadline = time.monotonic()+2 if deadline is None else deadline
+    if type(deadline) not in (int, float) or not math.isfinite(deadline):
+        raise MarketDataError('discovery_timeout', 'Invalid Discovery deadline.')
+    def remaining():
+        value = deadline-time.monotonic()
+        if value <= 0:
+            raise MarketDataError('discovery_timeout', 'Discovery deadline expired.')
+        return min(value, 2)
+    request = httpx.Request('GET', CHAINLINK_DISCOVERY_URL, headers={'Accept-Encoding': 'identity'},
+        extensions={'timeout': {p: remaining() for p in ('connect','read','write','pool')}})
     try:
-        request = client.build_request("GET", endpoint_url)
-        for header in ("authorization", "x-authorization-timestamp",
-                        "x-authorization-signature-sha256"):
-            request.headers.pop(header, None)
-        response = client.send(request, stream=False)
-        if response.status_code != 200:
-            raise MarketDataError("discovery_http_error", f"Discovery GET failed with HTTP {response.status_code}.", http_status=response.status_code)
-        return load_numeric_json(response.content)
-    except httpx.HTTPError as exc:
-        raise MarketDataError("discovery_http_error", f"Discovery request transport failure: {exc}") from exc
+        with closing(client.send(request, stream=True, follow_redirects=False)) as response:
+            remaining()
+            if response.status_code != 200:
+                raise MarketDataError('discovery_http_error', 'Discovery request rejected.', http_status=response.status_code)
+            if response.headers.get('Content-Encoding', 'identity').lower() != 'identity':
+                raise MarketDataError('invalid_discovery_payload', 'Compressed Discovery response unsupported.')
+            body = bytearray()
+            chunks = iter((response.content,)) if response.is_stream_consumed else response.iter_raw()
+            while True:
+                request.extensions['timeout']['read'] = remaining()
+                try:
+                    chunk = next(chunks)
+                except StopIteration:
+                    break
+                remaining()
+                if len(body)+len(chunk) > 10_485_760:
+                    raise MarketDataError('response_too_large', 'Discovery response exceeds budget.')
+                body.extend(chunk)
+            remaining()
+            payload = load_numeric_json(bytes(body))
+            remaining()
+            return payload
+    except httpx.HTTPError:
+        raise MarketDataError('discovery_http_error', 'Discovery transport failed.') from None
+    finally:
+        client.cookies.clear()

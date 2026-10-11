@@ -7,13 +7,14 @@ collector is disabled; every recorder run is `REFERENCE_INCOMPLETE`. Neither
 command trades or produces a strategy-complete dataset.
 
 There is no wallet, Polymarket authentication, order/cancellation path, strategy,
-signal, simulated trading, WebSocket, BTC spot-feed substitution, or live
-Chainlink signer. No `.env` or credential file is loaded.
+signal, simulated trading, or BTC spot-feed substitution. Dormant isolated
+Chainlink HMAC, REST and WebSocket adapters exist, but CLI runtime activation
+remains refused. No `.env` or credential file is loaded.
 
 ## Setup and commands
 
-Use Python 3.12 or newer and uv from this checkout. The only direct dependency
-is httpx; `uv.lock` pins its supporting packages.
+Use Python 3.12 or newer and uv from this checkout. Direct dependencies are
+httpx and websockets; `uv.lock` pins supporting packages.
 
 ```powershell
 uv sync --locked --cache-dir .uv-cache --no-python-downloads
@@ -127,6 +128,17 @@ Future Chainlink signing must follow its verified authentication timestamp
 contract, including units, freshness and source/skew. CLOB server time governs
 market-window sampling; it is not assumed to be the Chainlink signing clock.
 No pilot, subscription, credential use or 24-hour run is claimed here.
+
+CP3 is partial/BLOCKED pending independent review and production Gates 5/6.
+The current decoder structurally parses unsigned envelope metadata; it does not
+prove signed-binary decoding or DON authenticity. All collector-produced reports
+remain UNVERIFIED and unavailable, with zero verified live coverage.
+Explicitly injected OfflineReferenceSession paths exercise synthetic gates only:
+run activation enum VERIFIED is schema-v1 compatibility, not live authorization;
+activation evidence records SYNTHETIC_OFFLINE_ONLY and live_activation=false.
+Research report counts are cumulative database counts as of report end, not
+counts collected within the requested interval. Transport byte counts retain
+their separately labelled interval. No strategy-complete claim follows.
 
 ## Offline tests and design
 

@@ -86,7 +86,7 @@ class ReadOnlyBoundaryTests(unittest.TestCase):
                         self.assertEqual(ast.unparse(node.func.value), "client")
                         self.assertEqual(ast.unparse(node.args[0]), "request")
                         self.assertEqual({kw.arg: ast.literal_eval(kw.value) for kw in node.keywords},
-                                         {"stream": False})
+                                          {"stream": True, "follow_redirects": False})
                     if node.func.attr == "send" and path.name != "chainlink_discovery.py":
                         self.assertEqual(path.name, "chainlink_rest.py")
                         self.assertEqual(ast.unparse(node.func.value), "self._client")

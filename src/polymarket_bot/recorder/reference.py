@@ -351,7 +351,7 @@ class OfflineReferenceSession:
         self.monotonic_ns, self.wall_us = monotonic_ns, wall_us
         self.selection_policy, self.policy_revision = selection_policy, policy_revision
 
-    def fetch(self, row, deadline, *, run_id, anchor_id, project):
+    def fetch(self, row, deadline, *, run_id, anchor_id, project, buffer_only=False, payload_override=None):
         import json
         from dataclasses import replace
         from polymarket_bot.market_data.http import HttpAttempt
@@ -362,8 +362,8 @@ class OfflineReferenceSession:
             if started_ns / 1_000_000_000 >= deadline:
                 raise MarketDataError('chainlink_timeout', 'Reference budget expired.')
             if row.role == 'SLOT_CURRENT':
-                payload = self.live(5, project(started_ns)/1_000_000) if self.live else None
-                if payload is None:
+                payload = payload_override if buffer_only else (self.live(5, project(started_ns)/1_000_000) if self.live else None)
+                if payload is None and not buffer_only:
                     payload = self.latest(deadline)
                 elif type(payload) is tuple and len(payload) == 2:
                     signed, fields = payload
@@ -393,6 +393,8 @@ class OfflineReferenceSession:
                 error = 'REFERENCE_PENDING'
         except MarketDataError as exc:
             error = exc.code
+        except (ConnectionError, TimeoutError, OSError):
+            error = 'reference_transport_failed'
         except (ValueError, TypeError, UnicodeError, RecursionError):
             error = 'invalid_reference_payload'
         ended_ns, ended_wall = self.monotonic_ns(), self.wall_us()

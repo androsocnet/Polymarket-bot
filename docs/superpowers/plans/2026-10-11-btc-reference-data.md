@@ -209,6 +209,20 @@ Verification: exact user full offline unittest command ran 410 tests in 212.029 
 
 Author review: partial only. Independent reviewer unavailable; parent dispatch required. Review new reconciler trust boundary, unbounded queue read, reader interface mismatch, policy validation, evidence learning times, worker cleanup and missing service integration first. CP3 BLOCKED/PARTIAL; no checkpoint PASS or strategy-complete claim.
 
+### Gate C independent review remediation
+
+Independent Gate C FAIL received against 9f5bd20. Production Gate5 signed-binary decoding and Gate6 verified selection remain unresolved: CP3 partial/BLOCKED, no activation or PASS claim.
+
+Root causes verified: historical work monopolized single-flight dispatch before current buffer sampling; expected provider OS/connection/timeouts escaped fetch normalization; finally join error escaped RunResult; housekeeping enumerated all markets; Discovery used host-only guard, eager unbounded read, inherited redirects and exception text.
+
+Fixes: current cheap buffer sampling independent of historical worker, busy fallback explicit REFERENCE_BUSY; provider ConnectionError/TimeoutError/OSError persist sanitized reference_transport_failed; shutdown MarketDataError returns FAILED while worker handle retained; boundary plan preparation LIMIT 2 SQL with deadline checks; Discovery exact fixed HTTPS URL, independent Request, explicit redirects false, bounded raw streaming, absolute remaining phase budget and reject-late checks, sanitized errors. Cumulative research and synthetic activation scope exposed in diagnostics and README; current httpx/websockets dependencies and dormant limits documented.
+
+RED observed Discovery wrong-route requests and late success; service contention missing SLOT_CURRENT, provider nonzero result, shutdown exception escaping; boundary preparation forbidden full scan. GREEN focused tests then exact full offline suite 429 tests in 260.029 seconds OK. Added stale/late integrated reopen coverage. Existing audit updated narrowly to REQUIRE stream=True/follow_redirects=False for Discovery, no exemption or weakened security guard. No existing test deleted. No configured lint/typecheck command. No network, actual credentials, CP4, DDL, trading, push or merge.
+
+Ruling: LIMIT bounds returned/prepared work, not SQLite query execution preemption; phase budgets likewise not hard total cancellation — schema fixed and synchronous operations cannot guarantee that; cost: large DB query or dependency blocking can overshoot, caller rechecks deadlines. Cheap buffer provider contract is nonblocking; arbitrary injected blocking callbacks violate that contract.
+
+Review handoff: parent rechecks 9f5bd20..HEAD and complete CP3 b5fef87..HEAD. No independent re-review dispatched here. High live gates remain BLOCKED; medium fixes delivered for review only.
+
 ### Further autonomous continuation
 
 Continuation base: 4566458. Prior outstanding items above describe that commit, not the current diff.

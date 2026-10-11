@@ -650,6 +650,119 @@ class RecorderServiceTests(unittest.TestCase):
         gaps = [r for r in fixture.rows('SELECT detail_json FROM recorder_events') if 'REFERENCE_CONNECTION_GAP' in r['detail_json']]
         self.assertEqual(len(gaps), 1)
 
+    def review_session(self, fixture, **providers):
+        from polymarket_bot.recorder.reference import OfflineReferenceSession, ActivationEvidence
+        from polymarket_bot.recorder.models import CHAINLINK_FEED_ID, CHAINLINK_FEED_NAME
+        return OfflineReferenceSession(price_scale=8, decoder_revision='structural',
+            discovery_payload={'feedId': CHAINLINK_FEED_ID, 'name': CHAINLINK_FEED_NAME,
+                'schemaVersion': 2, 'decimals': 8, 'status': 'active'},
+            evidence=ActivationEvidence(True, True, True, True, True, True),
+            monotonic_ns=fixture.monotonic_ns, wall_us=fixture.wall_us, **providers)
+
+    def test_boundary_contention_still_samples_current_buffer(self):
+        import threading
+        from polymarket_bot.recorder.service import Recorder
+        from polymarket_bot.recorder.models import CHAINLINK_FEED_ID
+        fixture = self.fixture()
+        entered, release = threading.Event(), threading.Event()
+        def boundary(target, deadline):
+            entered.set()
+            release.wait(2)
+            return None
+        def live(age, now):
+            return (str(int(now)).encode(), {'feedId': CHAINLINK_FEED_ID,
+                'validFromTimestamp': int(now)-60, 'observationsTimestamp': int(now),
+                'expiresAt': int(now)+60, 'benchmarkPrice': '100'})
+        session = self.review_session(fixture, latest=lambda d: None, boundary=boundary, live=live)
+        def book(request, payload, f):
+            if request.url.path == '/books':
+                self.assertTrue(entered.wait(1))
+                release.set()
+        fixture.hook = book
+        self.addCleanup(release.set)
+        recorder = Recorder(fixture.store, fixture.public, monotonic_ns=fixture.monotonic_ns,
+            wall_us=fixture.wall_us, sleep=fixture.sleep, offline_reference=session)
+        result = recorder.run(RunConfig(mode='REFERENCE_REQUIRED'), should_stop=lambda: fixture.book_count>=1)
+        self.assertEqual(result.exit_code, 0)
+        self.assertTrue(fixture.rows("SELECT * FROM reference_fetches WHERE purpose='SLOT_CURRENT'"))
+
+    def test_expected_provider_failures_are_durable_and_books_continue(self):
+        from polymarket_bot.recorder.service import Recorder
+        for error in (ConnectionError, TimeoutError, OSError):
+            fixture = self.fixture()
+            def fail(deadline):
+                raise error('secret sentinel')
+            session = self.review_session(fixture, latest=fail)
+            recorder = Recorder(fixture.store, fixture.public, monotonic_ns=fixture.monotonic_ns,
+                wall_us=fixture.wall_us, sleep=fixture.sleep, offline_reference=session)
+            try:
+                result = recorder.run(RunConfig(mode='REFERENCE_REQUIRED'), should_stop=lambda: fixture.book_count>=2)
+            except (ConnectionError, TimeoutError, OSError):
+                self.fail('Expected provider failure escaped coordinator')
+            self.assertEqual(result.exit_code, 0)
+            self.assertTrue(fixture.rows("SELECT * FROM reference_fetches WHERE error_code='reference_transport_failed'"))
+            self.assertFalse(fixture.rows("SELECT * FROM reference_fetches WHERE error_code LIKE '%sentinel%'"))
+
+    def test_shutdown_join_failure_returns_failed_result_and_retains_worker(self):
+        from polymarket_bot.recorder.service import Recorder, ReferenceWorker
+        from polymarket_bot.market_data.models import MarketDataError
+        fixture = self.fixture()
+        session = self.review_session(fixture, latest=lambda d: None)
+        recorder = Recorder(fixture.store, fixture.public, monotonic_ns=fixture.monotonic_ns,
+            wall_us=fixture.wall_us, sleep=fixture.sleep, offline_reference=session)
+        with patch.object(ReferenceWorker, 'stop', side_effect=MarketDataError('reference_shutdown_failed', 'join failed')):
+            try:
+                result = recorder.run(RunConfig(mode='REFERENCE_REQUIRED'), should_stop=lambda: fixture.book_count>=1)
+            except MarketDataError:
+                self.fail('Shutdown error escaped RunResult')
+        self.assertEqual((result.state, result.reason), ('FAILED', 'reference_shutdown_failed'))
+        self.assertIsNotNone(recorder.reference_worker)
+        recorder.reference_worker.stop()
+
+    def test_boundary_preparation_bounded_and_deadline_aware(self):
+        from polymarket_bot.recorder.service import Recorder, ReferenceWorker
+        from tests.recorder_support import seed_writer_market
+        fixture = self.fixture()
+        recorder = Recorder(fixture.store, fixture.public, monotonic_ns=fixture.monotonic_ns,
+            wall_us=fixture.wall_us, sleep=fixture.sleep)
+        recorder.reference_worker = ReferenceWorker()
+        recorder.run_id = fixture.store.start_run(RunConfig(), wall_us=fixture.wall_us(), app_revision='test')
+        seed_writer_market(fixture.store, recorder.run_id)
+        recorder.offline_reference = self.review_session(fixture, latest=lambda d: None)
+        recorder.clock.usable = lambda: True
+        recorder._now = fixture.wall_us
+        fixture.store.restart_context = lambda: self.fail('Entire market scan forbidden')
+        recorder._reference_submit = lambda *a: False
+        recorder._reference_housekeeping(fixture.monotonic_ns()+1_000_000_000)
+        self.assertLessEqual(len(fixture.rows('SELECT * FROM reference_associations')), 2)
+        before = len(fixture.rows('SELECT * FROM reference_associations'))
+        recorder._reference_housekeeping(fixture.monotonic_ns())
+        self.assertEqual(len(fixture.rows('SELECT * FROM reference_associations')), before)
+
+    def test_stale_and_late_buffer_evidence_never_eligible(self):
+        from polymarket_bot.recorder.service import Recorder
+        from polymarket_bot.recorder.models import CHAINLINK_FEED_ID
+        for offset, delay, reason in ((-10, 0, 'STALE_REFERENCE'), (0, 3, 'LATE_REFERENCE')):
+            fixture = self.fixture()
+            def live(age, now):
+                return (str(int(now)).encode(), {'feedId': CHAINLINK_FEED_ID,
+                    'validFromTimestamp': int(now)-60, 'observationsTimestamp': int(now)+offset,
+                    'expiresAt': int(now)+60, 'benchmarkPrice': '100'})
+            session = self.review_session(fixture, latest=lambda d: None, live=live)
+            def slow(request, payload, f):
+                if request.url.path == '/books':
+                    f.advance(delay)
+            fixture.hook = slow
+            recorder = Recorder(fixture.store, fixture.public, monotonic_ns=fixture.monotonic_ns,
+                wall_us=fixture.wall_us, sleep=fixture.sleep, offline_reference=session)
+            recorder.run(RunConfig(mode='REFERENCE_REQUIRED'), should_stop=lambda: fixture.book_count>=1)
+            self.assertTrue(fixture.rows('SELECT * FROM reference_associations WHERE reason=?', (reason,)))
+            self.assertFalse(fixture.rows('SELECT * FROM reference_associations WHERE available_live=1'))
+            reopened = RecorderStore.open(fixture.db.path)
+            reopened.recover_interrupted(wall_us=fixture.wall_us())
+            self.assertFalse(reopened._rows("SELECT * FROM sample_slots WHERE status='IN_PROGRESS'"))
+            reopened.close()
+
     def test_reference_required_refused_before_startup(self):
         fixture = self.fixture()
         result = self.run_recorder(fixture, config=RunConfig(mode="REFERENCE_REQUIRED"))

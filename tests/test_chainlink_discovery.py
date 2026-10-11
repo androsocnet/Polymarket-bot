@@ -16,6 +16,45 @@ from polymarket_bot.recorder.chainlink_discovery import (
 
 
 class ChainlinkDiscoveryTests(unittest.TestCase):
+    def setUp(self):
+        clock = patch('time.monotonic', return_value=0)
+        clock.start()
+        self.addCleanup(clock.stop)
+
+    def test_discovery_fixed_route_redirect_and_budget(self):
+        sent = []
+        client = httpx.Client(transport=httpx.MockTransport(lambda r: sent.append(r) or
+            httpx.Response(302, headers={'Location': 'https://evil.example/secret'})), follow_redirects=True)
+        self.addCleanup(client.close)
+        for url in ('http://api.dataengine.chain.link/api/v1/feeds',
+                    'https://api.dataengine.chain.link/other', CHAINLINK_DISCOVERY_URL+'?secret=x'):
+            with self.assertRaises(MarketDataError):
+                fetch_feed_discovery(client, url, deadline=1)
+        self.assertEqual(sent, [])
+        with self.assertRaises(MarketDataError):
+            fetch_feed_discovery(client, deadline=1)
+        self.assertEqual(len(sent), 1)
+        self.assertTrue(all(v <= 1 for v in sent[0].extensions['timeout'].values()))
+
+    def test_discovery_late_stream_and_sanitized_failure(self):
+        clock = [0]
+        class Stream(httpx.SyncByteStream):
+            def __iter__(self):
+                yield b'{}'
+                clock[0] = 2
+        client = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200, stream=Stream())))
+        self.addCleanup(client.close)
+        with patch('time.monotonic', side_effect=lambda: clock[0]), self.assertRaises(MarketDataError):
+            fetch_feed_discovery(client, deadline=1)
+        def fail(r):
+            raise httpx.ConnectError('secret sentinel')
+        other = httpx.Client(transport=httpx.MockTransport(fail))
+        self.addCleanup(other.close)
+        with self.assertRaises(MarketDataError) as caught:
+            fetch_feed_discovery(other, deadline=1)
+        self.assertNotIn('sentinel', str(caught.exception))
+        self.assertIsNone(caught.exception.__cause__)
+
     def test_discovery_verification_success(self):
         payload = {
             "feeds": [

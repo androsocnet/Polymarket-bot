@@ -100,10 +100,10 @@ class Recorder:
         return self.reference_worker.submit(lambda: self.offline_reference.fetch(row,
             deadline_ns/1_000_000_000, run_id=run_id, anchor_id=anchor_id, project=project))
 
-    def _reference_drain(self, *, stopping=False):
+    def _reference_drain(self, *, stopping=False, result=None):
         if self.reference_worker is None:
             return
-        result = self.reference_worker.take()
+        result = self.reference_worker.take() if result is None else result
         if result is None:
             return
         from dataclasses import replace
@@ -144,7 +144,7 @@ class Recorder:
             raise MarketDataError('chainlink_auth_failed', 'Reference permission gate lost.')
 
     def _reference_housekeeping(self, deadline_ns):
-        if self.reference_worker is None or not self.clock.usable():
+        if self.reference_worker is None or not self.clock.usable() or self.monotonic_ns() >= deadline_ns:
             return
         self._reference_drain()
         gaps = getattr(self.offline_reference, 'gaps', None)
@@ -157,16 +157,22 @@ class Recorder:
                             'end_mono_ns': round(end*1_000_000_000)})
                     self.reference_gap_end = end
         from .reference import boundary_reference, due_reference_boundaries
-        for market in self.store.restart_context()[1]:
-            for role in ('OPENING', 'CLOSING'):
-                existing = self.store._one('SELECT association_id FROM reference_associations WHERE market_id=? AND role=? LIMIT 1',
-                    (market['market_id'], role))
-                if existing is None:
-                    self.store.save_reference_plan(boundary_reference(market['market_id'], role,
-                        window_start_us=market['window_start_us'], window_end_us=market['window_end_us'],
-                        learned_wall_us=self.wall_us(), learned_server_us=self._now()))
-        for row in due_reference_boundaries(self.store, self._now(), limit=1):
-            self._reference_submit(row, deadline_ns)
+        if self.monotonic_ns() >= deadline_ns:
+            return
+        plans = self.store._rows("""SELECT m.market_id,m.window_start_us,m.window_end_us,r.role
+            FROM markets m CROSS JOIN (SELECT 'OPENING' AS role UNION ALL SELECT 'CLOSING') r
+            WHERE NOT EXISTS (SELECT 1 FROM reference_associations a
+                WHERE a.market_id=m.market_id AND a.role=r.role)
+            ORDER BY m.window_start_us,m.market_id,r.role LIMIT 2""")
+        for market in plans:
+            if self.monotonic_ns() >= deadline_ns:
+                return
+            self.store.save_reference_plan(boundary_reference(market['market_id'], market['role'],
+                window_start_us=market['window_start_us'], window_end_us=market['window_end_us'],
+                learned_wall_us=self.wall_us(), learned_server_us=self._now()))
+        if self.monotonic_ns() < deadline_ns:
+            for row in due_reference_boundaries(self.store, self._now(), limit=1):
+                self._reference_submit(row, deadline_ns)
 
     def _control(self, operation):
         attempts = []
@@ -339,6 +345,8 @@ class Recorder:
         self.run_id, self.finalized = "", 0
         try:
             return self._execute_run(config, should_stop=should_stop)
+        except MarketDataError as exc:
+            return RunResult(self.run_id, 'FAILED', 2, self.finalized, exc.code)
         except (RecorderStoreError, sqlite3.DatabaseError, OSError) as exc:
             # Includes failure to close; no successful durability claim escapes.
             return RunResult(self.run_id, "FAILED", 1, self.finalized,
@@ -551,7 +559,15 @@ class Recorder:
                 row = ReferenceAssociationDraft(market.market_id, 'SLOT_CURRENT', target.scheduled_us,
                     'UNAVAILABLE', 'NOT_FETCHED', False, self.wall_us(), self._now(), slot_id=slot_id)
                 self._reference_drain()
-                self._reference_submit(row, self.clock.deadline_ns(min(target.scheduled_us+2_000_000, end_us)))
+                reference_deadline_ns = self.clock.deadline_ns(min(target.scheduled_us+2_000_000, end_us))
+                current_reference_result = None
+                buffered = self.offline_reference.live(5, self._now()/1_000_000) if self.offline_reference.live else None
+                if buffered is not None:
+                    current_reference_result = self.offline_reference.fetch(row, reference_deadline_ns/1_000_000_000,
+                        run_id=self.run_id, anchor_id=self.anchor_id, project=project,
+                        buffer_only=True, payload_override=buffered)
+                elif not self._reference_submit(row, reference_deadline_ns):
+                    current_reference_result = 'BUSY'
             previous = self.public.on_attempt
             self.public.on_attempt = None
             try:
@@ -566,10 +582,13 @@ class Recorder:
                 learned_wall_us=self.wall_us(), learned_server_us=project(ended_ns))
             if self.reference_worker is not None:
                 from dataclasses import replace
-                reference = replace(reference, status='UNAVAILABLE', reason='REFERENCE_PENDING')
+                reference = replace(reference, status='UNAVAILABLE',
+                    reason='REFERENCE_BUSY' if current_reference_result == 'BUSY' else 'REFERENCE_PENDING')
             self.store.finalize_slot(slot_id, SlotCommit(market.market_id, target, self.run_id,
                 self.anchor_id, self.revision_id, books, reference, started_ns, ended_ns),
                 committed_wall_us=self.wall_us())
             self.finalized += 1
+            if self.reference_worker is not None and type(current_reference_result) is tuple:
+                self._reference_drain(result=current_reference_result)
         self._shutdown("STOPPED", "STOP_REQUESTED")
         return RunResult(self.run_id, "STOPPED", 0, self.finalized, "STOP_REQUESTED")
