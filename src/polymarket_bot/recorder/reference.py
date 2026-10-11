@@ -97,7 +97,7 @@ def normalize_reference_fields(raw_signed_report: bytes, fields: dict, *,
 
 
 def eligible_as_of(association: ReferenceAssociationDraft, report: ReferenceReportDraft | None,
-                   *, decision_us: int, role: str) -> bool:
+                   *, decision_us: int, role: str, durable_proof: dict | None = None) -> bool:
     """Current/opening input eligibility, never closing-label eligibility.
 
     VERIFIED is externally supplied evidence, not produced by this normalizer.
@@ -117,6 +117,16 @@ def eligible_as_of(association: ReferenceAssociationDraft, report: ReferenceRepo
             or report.observations_seconds * 1_000_000 > decision_us
             or (association.report_hash is not None and association.report_hash != report.report_hash)):
         return False
+    if (association.selection_policy_revision or '').startswith('managed-'):
+        if (type(durable_proof) is not dict or durable_proof.get('reason') != 'REFERENCE_DURABLE'
+                or any(durable_proof.get(name) != getattr(association, name) for name in
+                    ('market_id', 'role', 'slot_id', 'learned_wall_us'))
+                or durable_proof.get('report_hash') != report.report_hash
+                or type(durable_proof.get('durable_server_us')) is not int
+                or not association.learned_server_us <= durable_proof['durable_server_us'] <= decision_us
+                or (role == 'SLOT_CURRENT' and (durable_proof.get('available_live') is not True
+                    or durable_proof['durable_server_us'] >= association.target_us+2_000_000))):
+            return False
     if role == "OPENING":
         return (association.origin in ("LIVE_LATEST", "HISTORICAL_LOOKUP")
                 and bool(association.selection_policy_revision))

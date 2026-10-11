@@ -337,6 +337,25 @@ class ReferenceTests(unittest.TestCase):
         self.assertTrue(hasattr(reference, "eligible_as_of"), "Reference as-of eligibility is missing")
         return reference.eligible_as_of(association, report, decision_us=decision, role=role)
 
+    def test_managed_as_of_crash_requires_matching_durable_proof(self):
+        reference = self.reference()
+        report = self.normalize(receipt=NOW_US+1_000_000)
+        association = models.ReferenceAssociationDraft(MARKET_ID, 'SLOT_CURRENT', NOW_US,
+            'AVAILABLE', 'LIVE_LATEST', True, NOW_US+1_000_123, NOW_US+1_000_000,
+            slot_id=1, report_hash=report.report_hash, selection_policy_revision='managed-signed-inclusive-seconds-v1')
+        self.assertFalse(reference.eligible_as_of(association, report, decision_us=NOW_US+1_500_000, role='SLOT_CURRENT'))
+        proof = dict(reason='REFERENCE_DURABLE', market_id=MARKET_ID, role='SLOT_CURRENT', slot_id=1,
+            learned_wall_us=association.learned_wall_us, report_hash=report.report_hash,
+            durable_server_us=NOW_US+1_600_000, available_live=True)
+        self.assertFalse(reference.eligible_as_of(association, report, decision_us=NOW_US+1_500_000,
+            role='SLOT_CURRENT', durable_proof=proof))
+        self.assertTrue(reference.eligible_as_of(association, report, decision_us=NOW_US+1_700_000,
+            role='SLOT_CURRENT', durable_proof=proof))
+        for changes in ({'report_hash': 'foreign'}, {'slot_id': 2}, {'durable_server_us': None},
+                        {'learned_wall_us': 0}, {'available_live': False}):
+            self.assertFalse(reference.eligible_as_of(association, report, decision_us=NOW_US+1_700_000,
+                role='SLOT_CURRENT', durable_proof=dict(proof, **changes)))
+
     def test_live_current_requires_actual_receipt_verification_and_five_second_age(self):
         report = replace(self.normalize(receipt=NOW_US + 1_000_000), verification_status="VERIFIED")
         association = models.ReferenceAssociationDraft(MARKET_ID, "SLOT_CURRENT", NOW_US,

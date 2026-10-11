@@ -157,6 +157,9 @@ class Recorder:
             attempt_count=row.attempt_count+1, selection_policy_revision='signed-inclusive-seconds-v1',
             next_due_us=None if row.role == 'SLOT_CURRENT' else boundary_retry_due(row.target_us,
                 attempt_count=row.attempt_count+1, now_us=max(now, fetch.received_server_us)))
+        from .reference import ManagedReferenceSession
+        if isinstance(self.offline_reference, ManagedReferenceSession):
+            association = replace(association, selection_policy_revision='managed-signed-inclusive-seconds-v1')
         if association.available_live:
             self.store.save_reference_evidence(fetch, reports, (replace(association,
                 status='UNAVAILABLE', available_live=False, reason='PERSISTENCE_PENDING'),))
@@ -173,7 +176,7 @@ class Recorder:
         self.store.record_event(self.run_id, 'DISCOVERY_GAP', started_us=self.wall_us(),
             detail={'reason': 'REFERENCE_DURABLE', 'diagnostic_only': True, 'time_domain': 'LOCAL_WALL',
                 'slot_id': row.slot_id, 'market_id': row.market_id, 'role': row.role,
-                'learned_wall_us': association.learned_wall_us,
+                'learned_wall_us': association.learned_wall_us, 'report_hash': association.report_hash,
                 'durable_server_us': self._now() if self.clock.usable() else None,
                 'available_live': association.available_live})
         if fetch.error_code in ('chainlink_auth_failed', 'websocket_failed'):
