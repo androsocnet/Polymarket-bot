@@ -129,10 +129,17 @@ contract, including units, freshness and source/skew. CLOB server time governs
 market-window sampling; it is not assumed to be the Chainlink signing clock.
 No pilot, subscription, credential use or 24-hour run is claimed here.
 
-CP3 is partial/BLOCKED pending independent review and production Gates 5/6.
-The current decoder structurally parses unsigned envelope metadata; it does not
-prove signed-binary decoding or DON authenticity. All collector-produced reports
-remain UNVERIFIED and unavailable, with zero verified live coverage.
+CP3 remediation awaits independent Gate C review. Decoder reads canonical signed
+fullReport ABI content; conflicting envelope fields are rejected. Reports remain
+UNVERIFIED: structural live availability is not DON cryptographic verification.
+Live reference coverage measures timely point-in-time availability, separately
+from DON verification counts. Both boundary roles use exact integer seconds and
+inclusive signed validFrom <= T <= observations; later gap reports are historical
+only, missing reports retry, and distinct containing hashes fail closed.
+ManagedReferenceSession supports permission-gated injectable production REST/WS
+factories, Discovery pin checks before credential loading, startup cleanup and
+idempotent stop. CLI remains closed without explicitly supplied activation wiring.
+No runtime network or actual credentials were used during remediation.
 Explicitly injected OfflineReferenceSession paths exercise synthetic gates only:
 run activation enum VERIFIED is schema-v1 compatibility, not live authorization;
 activation evidence records SYNTHETIC_OFFLINE_ONLY and live_activation=false.

@@ -155,7 +155,7 @@ def _references(store, eligible, slots, markets, runs, end_us):
             # conflict/unavailable association with no report or fetch.
             boundaries.pop((row["market_id"], row["role"]), None)
         if (market is None or row["status"]!="AVAILABLE" or row["decode_status"]!="DECODED"
-                or row["verification_status"]!="VERIFIED" or not row["decoder_revision"]
+                or not row["decoder_revision"]
                 or row["first_received_wall_us"] is None or row["first_received_wall_us"] > end_us
                 or row["fetch_received_wall_us"] is None or row["fetch_received_wall_us"] > end_us):
             continue

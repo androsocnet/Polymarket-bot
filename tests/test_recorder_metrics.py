@@ -388,7 +388,7 @@ class RecorderMetricsTests(unittest.TestCase):
         self.assertEqual(report.reference_coverage["live_slots"],0)
         self.reference(store,run_id,slot,learned=NOW_US,verified="UNVERIFIED")
         report = metrics.measure(store,start_us=NOW_US,end_us=NOW_US+4_000_000)
-        self.assertEqual(report.reference_coverage["live_slots"],0)
+        self.assertEqual(report.reference_coverage["live_slots"],1)
         # Offline fixture mode activation: no credential loading or runtime activation.
         with store._connection:
             store._connection.execute("UPDATE recording_runs SET mode='REFERENCE_REQUIRED',reference_activation='VERIFIED',activation_evidence_json='{}'")

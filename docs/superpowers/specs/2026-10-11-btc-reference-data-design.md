@@ -4,6 +4,12 @@ Date: 2026-10-11 (Asia/Jakarta)
 
 Status: Approved by the user with required amendments (Discovery verification, WebSocket primary transport, explicit activation gates, and clarified backtest/authenticity scope). Implementation plan approved for autonomous major-checkpoint execution.
 
+## Authoritative CP3 amendment — 2026-10-12
+
+User-approved ruling overrides older boundary/availability wording: opening and closing target exact integer second T, accepting decoded signed `validFrom <= T <= observations` inclusive. No rounding. Gap-absorbing observations after T are valid historical evidence but never backdated live. Missing reports remain pending with existing retry schedule; multiple distinct containing report hashes are ambiguous and fail closed. Signed fullReport ABI content is authoritative; envelope metadata cannot override it. Structural DECODED plus UNVERIFIED evidence may be available live with correct identity, freshness and timely calibrated receipt/learning; DON verification is separate and never fabricated. Live coverage measures point-in-time availability, with verification counts separate.
+
+Managed production lifecycle must check permission evidence before credential factories, validate Discovery and persisted pins before loading credentials, manage real CP2 REST/WS through injectable interfaces, stop workers and close resources on failures/shutdown. BOOK_ONLY creates no credential resources. Schema v1 unchanged. No runtime network, actual credentials, CP4, private Polymarket, trading, push or merge during implementation. Offline synthetic vectors do not prove DON signatures or grant runtime permission.
+
 ## 1. Purpose and Boundaries
 
 Build the independent BTC reference-price side required for a strategy-complete dataset for the Polymarket BTC 15-minute Up/Down market.

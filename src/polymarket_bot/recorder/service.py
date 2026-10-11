@@ -104,7 +104,12 @@ class Recorder:
     def _reference_drain(self, *, stopping=False, result=None):
         if self.reference_worker is None:
             return
-        result = self.reference_worker.take() if result is None else result
+        try:
+            result = self.reference_worker.take() if result is None else result
+        except MarketDataError:
+            raise
+        except Exception:
+            raise MarketDataError('reference_worker_failed', 'Reference worker failed.') from None
         if result is None:
             return
         from dataclasses import replace
@@ -113,36 +118,43 @@ class Recorder:
         now = self._now() if self.clock.usable() else fetch.received_server_us
         reason, status, selected = fetch.error_code or 'DON_UNVERIFIED', 'UNAVAILABLE', None
         if row.role != 'SLOT_CURRENT':
-            policy = self.offline_reference.selection_policy
-            revision = self.offline_reference.policy_revision
-            status, reason = ('AMBIGUOUS', 'BOUNDARY_POLICY_UNVERIFIED') if not policy or not revision else ('PENDING', 'BOUNDARY_PENDING')
-            if policy and revision:
-                selected = policy(reports, row.target_us)
-                if selected is not None and selected not in reports:
-                    raise RecorderStoreError('fatal_invariant', 'Boundary selector returned foreign evidence.')
-                if selected is not None:
-                    status, reason = 'UNAVAILABLE', 'DON_UNVERIFIED'
+            from .reference import select_boundary_report
+            status, reason = 'PENDING', 'BOUNDARY_PENDING'
+            try:
+                selected = select_boundary_report(reports, row.target_us)
+            except MarketDataError as exc:
+                if exc.code != 'BOUNDARY_AMBIGUOUS':
+                    raise
+                status, reason = 'AMBIGUOUS', exc.code
+            if selected is not None:
+                status, reason = 'AVAILABLE', None
         elif reports:
             selected = reports[0]
             if selected.decode_status != 'DECODED':
                 reason = 'INVALID_REFERENCE'
-            elif not 0 <= (fetch.received_server_us-selected.observations_seconds*1_000_000) <= 5_000_000:
+            elif (fetch.received_server_us is None or selected.observations_seconds is None
+                    or selected.valid_from_seconds is None or selected.expires_at_seconds is None
+                    or not selected.valid_from_seconds*1_000_000 <= fetch.received_server_us <= selected.expires_at_seconds*1_000_000
+                    or not 0 <= fetch.received_server_us-selected.observations_seconds*1_000_000 <= 5_000_000):
                 reason = 'STALE_REFERENCE'
+            elif fetch.error_code is None:
+                status, reason = 'AVAILABLE', None
         if self.monotonic_ns()/1_000_000_000 >= deadline and status != 'AMBIGUOUS':
             status, reason = 'UNAVAILABLE', 'LATE_REFERENCE'
         learned_wall = max(self.wall_us(), fetch.attempt.ended_wall_us)
         prior = self.store._one('SELECT MAX(learned_wall_us) AS learned FROM reference_associations WHERE market_id=? AND role=? AND slot_id IS ?',
             (row.market_id, row.role, row.slot_id))['learned']
         learned_wall = max(learned_wall, (prior+1) if prior is not None else learned_wall)
-        association = replace(row, status=status, reason=reason, origin=fetch.origin, available_live=False,
+        association = replace(row, status=status, reason=reason, origin=fetch.origin,
+            available_live=status == 'AVAILABLE' and row.role == 'SLOT_CURRENT' and fetch.origin == 'LIVE_LATEST',
             learned_wall_us=learned_wall, learned_server_us=max(now, fetch.received_server_us),
             report_hash=selected.report_hash if selected else None, report_id=None, fetch_id=None,
-            attempt_count=row.attempt_count+1, selection_policy_revision=self.offline_reference.policy_revision,
-            next_due_us=None if row.role == 'SLOT_CURRENT' else boundary_retry_due(row.target_us,
+            attempt_count=row.attempt_count+1, selection_policy_revision='signed-inclusive-seconds-v1',
+            next_due_us=None if row.role == 'SLOT_CURRENT' or status == 'AVAILABLE' else boundary_retry_due(row.target_us,
                 attempt_count=row.attempt_count+1, now_us=max(now, fetch.received_server_us)))
         self.store.save_reference_evidence(fetch, reports, (association,))
-        if fetch.error_code == 'chainlink_auth_failed':
-            raise MarketDataError('chainlink_auth_failed', 'Reference permission gate lost.')
+        if fetch.error_code in ('chainlink_auth_failed', 'websocket_failed'):
+            raise MarketDataError(fetch.error_code, 'Reference permission or worker gate lost.')
 
     def _reference_housekeeping(self, deadline_ns):
         if self.reference_worker is None or not self.clock.usable() or self.monotonic_ns() >= deadline_ns:
@@ -366,13 +378,18 @@ class Recorder:
     def _execute_run(self, config, *, should_stop):
         from .reference import OfflineReferenceSession
         if config.mode != "BOOK_ONLY" and (config.mode != 'REFERENCE_REQUIRED'
-                or type(self.offline_reference) is not OfflineReferenceSession):
+                or not isinstance(self.offline_reference, OfflineReferenceSession)):
             self.store.close()
             return RunResult("", "FAILED", 2, 0, "reference_runtime_unavailable")
         if config.mode == 'REFERENCE_REQUIRED':
             from .reference import require_reference_activation
             try:
                 require_reference_activation(config.mode, self.offline_reference.evidence)
+                from .reference import ManagedReferenceSession
+                if isinstance(self.offline_reference, ManagedReferenceSession):
+                    from .models import CHAINLINK_FEED_ID
+                    pin = self.store._one('SELECT price_scale,decoder_revision FROM reference_feeds WHERE feed_id=?', (CHAINLINK_FEED_ID,))
+                    self.offline_reference.start(config.mode, self.monotonic_ns()/1_000_000_000+10, persisted_pin=pin)
             except MarketDataError as exc:
                 self.store.close()
                 return RunResult('', 'FAILED', 2, 0, exc.code)
@@ -421,7 +438,12 @@ class Recorder:
                 if self.reference_worker is not None:
                     self.reference_worker.stop()
             finally:
-                self.store.close()
+                try:
+                    from .reference import ManagedReferenceSession
+                    if config.mode == 'REFERENCE_REQUIRED' and isinstance(self.offline_reference, ManagedReferenceSession):
+                        self.offline_reference.stop()
+                finally:
+                    self.store.close()
 
     def _shutdown(self, state, reason):
         if self.reference_worker is not None:

@@ -318,8 +318,18 @@ class RecorderStore:
 
     def start_run(self, config: RunConfig, *, wall_us: int, app_revision: str, offline_reference=None) -> str:
         self._check_writer()
-        from .reference import OfflineReferenceSession
-        offline = type(offline_reference) is OfflineReferenceSession and config.mode == 'REFERENCE_REQUIRED'
+        from .reference import OfflineReferenceSession, ManagedReferenceSession
+        offline = isinstance(offline_reference, OfflineReferenceSession) and config.mode == 'REFERENCE_REQUIRED'
+        managed = isinstance(offline_reference, ManagedReferenceSession)
+        if offline:
+            from .reference import require_reference_activation
+            require_reference_activation(config.mode, offline_reference.evidence)
+            if managed:
+                _require(offline_reference.started, 'Managed reference must complete startup before persistence.')
+                pinned = self._one('SELECT price_scale,decoder_revision FROM reference_feeds WHERE feed_id=?', (CHAINLINK_FEED_ID,))
+                _require(pinned is None or pinned['price_scale'] is None or
+                    (pinned['price_scale'] == offline_reference.price_scale and pinned['decoder_revision'] == offline_reference.decoder_revision),
+                    'Discovery conflicts with persisted reference pin.')
         _require(isinstance(config, RunConfig) and (config.mode == "BOOK_ONLY" or offline) and type(config.use_fast_path) is bool,
                  "Only BOOK_ONLY can start without verified reference activation gates.")
         _integer(wall_us, "started_wall_us")
@@ -329,8 +339,8 @@ class RecorderStore:
             self._insert("recording_runs", dict(run_id=run_id, started_wall_us=wall_us,
                 mode=config.mode, reference_activation="VERIFIED" if offline else "DISABLED", state="RUNNING",
                 app_revision=app_revision, config_json=_json(asdict(config)),
-                activation_evidence_json=_json({'scope': 'SYNTHETIC_OFFLINE_ONLY',
-                    'live_activation': False, 'gates': asdict(offline_reference.evidence)}) if offline else None))
+                activation_evidence_json=_json({'scope': 'MANAGED_PRODUCTION' if managed else 'SYNTHETIC_OFFLINE_ONLY',
+                    'live_activation': managed, 'gates': asdict(offline_reference.evidence)}) if offline else None))
             self._connection.execute("""INSERT OR IGNORE INTO reference_feeds
                 (feed_id,name,environment,source_url,catalog_metadata_json,lookback_seconds,report_schema_version)
                 VALUES (?,?, 'mainnet',?, '{}',60,2)""",
@@ -339,7 +349,7 @@ class RecorderStore:
                 self._connection.execute('UPDATE reference_feeds SET price_scale=?,decoder_revision=?,catalog_metadata_json=?,verification_evidence_json=? WHERE feed_id=?',
                     (offline_reference.price_scale, offline_reference.decoder_revision,
                      _json(offline_reference.metadata.catalog_metadata),
-                     _json({'scope': 'SYNTHETIC_OFFLINE_ONLY', 'signed_binary_decoder_verified': False,
+                     _json({'scope': 'MANAGED_PRODUCTION' if managed else 'SYNTHETIC_OFFLINE_ONLY', 'signed_binary_decoder_verified': False,
                             'don_verified': False}), CHAINLINK_FEED_ID))
         return run_id
 
@@ -809,8 +819,14 @@ class RecorderStore:
         _require(type(association.available_live) is bool, "Reference live availability must be boolean.")
         if association.available_live:
             _require(fetch.origin == "LIVE_LATEST" and association.status == "AVAILABLE"
-                     and report is not None and report["decode_status"] == "DECODED"
-                     and report["verification_status"] == "VERIFIED", "Live availability requires verified latest evidence.")
+                      and report is not None and report["decode_status"] == "DECODED",
+                     "Live availability requires structurally decoded latest evidence.")
+            receipt = fetch.received_server_us
+            _require(receipt is not None and report['observations_seconds'] is not None
+                     and report['valid_from_seconds'] is not None and report['expires_at_seconds'] is not None
+                     and report['valid_from_seconds']*1_000_000 <= receipt <= report['expires_at_seconds']*1_000_000
+                     and 0 <= receipt-report['observations_seconds']*1_000_000 <= 5_000_000,
+                     'Live availability requires fresh signed interval and calibrated receipt.')
             if association.role == "SLOT_CURRENT":
                 _require(fetch.received_server_us is not None
                          and association.target_us <= fetch.received_server_us

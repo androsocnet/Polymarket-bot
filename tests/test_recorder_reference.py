@@ -89,7 +89,7 @@ class ReferenceTests(unittest.TestCase):
         self.assertEqual(reader.target, WINDOW_START_US)
         row = store._one("SELECT * FROM reference_associations ORDER BY association_id DESC LIMIT 1")
         self.assertEqual((row["status"], row["origin"], row["available_live"], row["reason"]),
-                         ("UNAVAILABLE", "HISTORICAL_LOOKUP", 0, "DON_UNVERIFIED"))
+                         ("PENDING", "HISTORICAL_LOOKUP", 0, "BOUNDARY_PENDING"))
         self.assertEqual(row["next_due_us"], NOW_US + 60_000_000)
         self.assertEqual(store._one("SELECT verification_status FROM reference_reports")["verification_status"], "UNVERIFIED")
         self.assertEqual(reference.reconcile_due_reference_boundaries(store, reader, NOW_US, 0,
@@ -119,6 +119,30 @@ class ReferenceTests(unittest.TestCase):
         self.assertEqual(fetch.origin, 'HISTORICAL_LOOKUP')
         self.assertEqual(reports[0].verification_status, 'UNVERIFIED')
         self.assertEqual(reports[0].raw_signed_report, signed)
+
+    def test_boundary_gap_absorbing_unverified_available_after_receipt(self):
+        reference = self.reference()
+        store, run = self.database()
+        plan = reference.boundary_reference(MARKET_ID, 'OPENING', window_start_us=WINDOW_START_US,
+            window_end_us=WINDOW_START_US+900_000_000, learned_wall_us=NOW_US, learned_server_us=NOW_US)
+        store.save_reference_plan(plan)
+        report = self.normalize(fields={'feed_id': models.CHAINLINK_FEED_ID, 'report_schema_version': 2,
+            'valid_from_seconds': WINDOW_START_US//1_000_000,
+            'observations_seconds': NOW_US//1_000_000, 'expires_at_seconds': NOW_US//1_000_000+60,
+            'price_integer': '100'})
+        fetch = self.fetch(run)
+        class Reader:
+            def fetch_boundary(self, row, deadline): return fetch, (report,)
+        self.assertEqual(reference.reconcile_due_reference_boundaries(store, Reader(), NOW_US, 10,
+            monotonic=lambda: 0), 1)
+        saved = store._one('SELECT * FROM reference_associations ORDER BY association_id DESC LIMIT 1')
+        self.assertEqual((saved['status'], saved['available_live'], saved['next_due_us']), ('AVAILABLE', 0, None))
+        self.assertEqual(saved['learned_server_us'], NOW_US)
+        self.assertEqual(store._one('SELECT verification_status FROM reference_reports')['verification_status'], 'UNVERIFIED')
+        association = replace(plan, status='AVAILABLE', origin='HISTORICAL_LOOKUP',
+            learned_server_us=NOW_US, report_hash=report.report_hash, selection_policy_revision='signed-inclusive-seconds-v1')
+        self.assertFalse(reference.eligible_as_of(association, report, decision_us=WINDOW_START_US, role='OPENING'))
+        self.assertTrue(reference.eligible_as_of(association, report, decision_us=NOW_US, role='OPENING'))
 
     def test_boundary_due_queue_uses_latest_id_and_survives_reopen(self):
         reference = self.reference()
@@ -312,7 +336,9 @@ class ReferenceTests(unittest.TestCase):
                                    (NOW_US + 5_000_001, False)):
             with self.subTest(decision=decision):
                 self.assertEqual(self.eligible(association, report, decision, "SLOT_CURRENT"), expected)
-        for changes in ({"verification_status": "UNVERIFIED"}, {"decode_status": "INVALID"},
+        self.assertTrue(self.eligible(association, replace(report, verification_status='UNVERIFIED'),
+            NOW_US + 1_000_000, 'SLOT_CURRENT'))
+        for changes in ({"decode_status": "INVALID"},
                         {"decoded_price": None}, {"feed_id": "spot"}, {"report_schema_version": 3},
                         {"observations_seconds": NOW_US // 1_000_000 + 3},
                         {"expires_at_seconds": NOW_US // 1_000_000},

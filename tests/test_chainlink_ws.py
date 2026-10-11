@@ -14,6 +14,13 @@ class ChainlinkLiveConsumerTests(unittest.TestCase):
         return ChainlinkLiveConsumer('wss://ws.dataengine.chain.link', CHAINLINK_FEED_ID,
                                     'cid', 'sec', clock_seconds=lambda: 160, **kwargs)
 
+    def test_terminal_worker_failure_visible_to_owner(self):
+        consumer = self.consumer()
+        consumer._failure = 'unexpected_worker_failure'
+        with self.assertRaises(MarketDataError) as caught:
+            consumer.check_health()
+        self.assertEqual(caught.exception.code, 'websocket_failed')
+
     def test_exact_wss_host(self):
         for url in ('wss://ws.dataengine.chain.link.evil', 'wss://evil/dataengine.chain.link',
                     'wss://user@ws.dataengine.chain.link', 'wss://ws.dataengine.chain.link:443',

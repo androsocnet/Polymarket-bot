@@ -49,7 +49,14 @@ def parse_report(payload):
                                     receipt_wall_us=0, receipt_server_us=None)
     if draft.decode_status == 'INVALID':
         raise MarketDataError('invalid_response', 'Invalid Chainlink report metadata.')
-    return bytes.fromhex(hex_value), dict(report), draft
+    from .reference import decode_signed_report
+    raw = bytes.fromhex(hex_value)
+    signed = decode_signed_report(raw)
+    fields = dict(report)
+    fields.update(feedId=signed['feed_id'], validFromTimestamp=signed['valid_from_seconds'],
+        observationsTimestamp=signed['observations_seconds'], expiresAt=signed['expires_at_seconds'],
+        benchmarkPrice=str(signed['price_integer']))
+    return raw, fields, draft
 
 
 class ChainlinkRestClient:

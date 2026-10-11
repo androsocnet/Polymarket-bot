@@ -107,7 +107,7 @@ def eligible_as_of(association: ReferenceAssociationDraft, report: ReferenceRepo
     if (role not in ("SLOT_CURRENT", "OPENING") or association.role != role
             or association.status != "AVAILABLE" or report is None
             or report.feed_id != CHAINLINK_FEED_ID or report.report_schema_version != 2
-            or report.decode_status != "DECODED" or report.verification_status != "VERIFIED"
+            or report.decode_status != "DECODED"
             or not isinstance(report.decoded_price, Decimal) or not report.decoded_price.is_finite()
             or report.decoded_price <= 0 or report.decoder_revision is None
             or report.first_received_server_us is None or association.learned_server_us is None
@@ -174,6 +174,19 @@ def boundary_retry_due(target_us: int, *, attempt_count: int, now_us: int) -> in
             return due
     delay_seconds = min(21_600, 60 * (2 ** min(max(attempt_count - 5, 0), 9)))
     return now_us + delay_seconds * 1_000_000
+
+
+def select_boundary_report(reports, target_us):
+    if type(target_us) is not int or target_us % 1_000_000:
+        return None
+    target = target_us // 1_000_000
+    candidates = {r.report_hash: r for r in reports if r.feed_id == CHAINLINK_FEED_ID
+        and r.report_schema_version == 2 and r.decode_status == 'DECODED'
+        and r.valid_from_seconds is not None and r.observations_seconds is not None
+        and r.valid_from_seconds <= target <= r.observations_seconds}
+    if len(candidates) > 1:
+        raise MarketDataError('BOUNDARY_AMBIGUOUS', 'Distinct signed reports contain boundary.')
+    return next(iter(candidates.values()), None)
 
 
 def decode_signed_report(raw: bytes) -> dict:
@@ -255,6 +268,9 @@ def decode_schema_v2_report(payload: object, *, price_scale: int | None,
         if full_report_hex.startswith("0x") or full_report_hex.startswith("0X"):
             full_report_hex = full_report_hex[2:]
 
+        if (len(full_report_hex) > 20_971_520 or len(full_report_hex) % 2
+                or re.fullmatch('[0-9a-fA-F]+', full_report_hex) is None):
+            raise MarketDataError('invalid_reference_payload', 'Noncanonical or oversized report hex.')
         try:
             raw_signed_report = bytes.fromhex(full_report_hex)
         except ValueError as exc:
@@ -451,6 +467,93 @@ class OfflineReferenceSession:
         return row, fetch, reports, deadline
 
 
+class ManagedReferenceSession(OfflineReferenceSession):
+    def __init__(self, *, evidence, discovery, credentials, monotonic_ns, wall_us,
+                 decoder_revision, rest_factory=None, live_factory=None):
+        self.evidence, self.discovery, self.credentials = evidence, discovery, credentials
+        self.monotonic_ns, self.wall_us = monotonic_ns, wall_us
+        self.decoder_revision = decoder_revision
+        self.rest_factory, self.live_factory = rest_factory, live_factory
+        self.rest = self.consumer = None
+        self.live = None
+        self.selection_policy, self.policy_revision = select_boundary_report, 'signed-inclusive-seconds-v1'
+        self.started = False
+
+    def start(self, mode, deadline, *, persisted_pin=None):
+        if mode == 'BOOK_ONLY':
+            return
+        require_reference_activation(mode, self.evidence)
+        if self.started:
+            return
+        from .chainlink_discovery import verify_feed_identity
+        from .chainlink_auth import validate_credentials
+        from .chainlink_rest import ChainlinkRestClient
+        from .chainlink_ws import ChainlinkLiveConsumer
+        self.metadata = verify_feed_identity(self.discovery(deadline))
+        if self.metadata.name != 'BTC/USD-Streams-TWAP-60s-mainnet-production':
+            raise MarketDataError('identity_conflict', 'Discovery feed name conflicts.')
+        self.price_scale = self.metadata.price_scale
+        if persisted_pin is not None and persisted_pin['price_scale'] is not None and (
+                persisted_pin['price_scale'] != self.price_scale or persisted_pin['decoder_revision'] != self.decoder_revision):
+            raise MarketDataError('identity_conflict', 'Discovery conflicts with persisted reference pin.')
+        if type(self.decoder_revision) is not str or not 0 < len(self.decoder_revision) <= 128:
+            raise MarketDataError('decoder_verification_failed', 'Decoder revision required.')
+        if self.monotonic_ns()/1_000_000_000 >= deadline:
+            raise MarketDataError('chainlink_timeout', 'Startup budget expired.')
+        require_reference_activation(mode, self.evidence)
+        identity, secret = validate_credentials(*self.credentials())
+        try:
+            self.rest = (self.rest_factory or (lambda i, s: ChainlinkRestClient(
+                ChainlinkRestClient._BASE, i, s)))(identity, secret)
+            self.consumer = (self.live_factory or (lambda i, s: ChainlinkLiveConsumer(
+                'wss://ws.dataengine.chain.link', CHAINLINK_FEED_ID, i, s)))(identity, secret)
+            self.consumer.start()
+            self.live = self.get_live_report
+            self.gaps = self.consumer.get_connection_gaps
+            self.started = True
+        except BaseException:
+            self.stop()
+            raise
+
+    def get_live_report(self, max_age_s, now_server_s):
+        health = getattr(self.consumer, 'check_health', None)
+        if health is not None:
+            health()
+        return self.consumer.get_freshest_report(max_age_s, now_server_s)
+
+    def stop(self):
+        error = None
+        if self.consumer is not None:
+            try:
+                self.consumer.stop()
+            except Exception as exc:
+                error = exc
+            else:
+                self.consumer = None
+        if self.rest is not None:
+            try:
+                self.rest.close()
+            except Exception as exc:
+                error = error or exc
+            else:
+                self.rest = None
+        self.started = False
+        self.live = None
+        if error is not None:
+            raise MarketDataError('reference_shutdown_failed', 'Reference resource cleanup failed.') from error
+
+    def fetch(self, row, deadline, *, run_id, anchor_id, project, buffer_only=False, payload_override=None):
+        if buffer_only or payload_override is not None:
+            return super().fetch(row, deadline, run_id=run_id, anchor_id=anchor_id,
+                project=project, buffer_only=buffer_only, payload_override=payload_override)
+        if not self.started or self.rest is None:
+            raise MarketDataError('activation_required', 'Managed reference session not started.')
+        reader = ReferenceRestEvidence(self.rest, run_id=run_id, price_scale=self.price_scale,
+            decoder_revision=self.decoder_revision, project=project, anchor_id=anchor_id)
+        fetch, reports = reader.fetch(row, deadline)
+        return row, fetch, reports, deadline
+
+
 def due_reference_boundaries(store, now_us, limit=2):
     if type(limit) is not int or not 1 <= limit <= 20:
         raise ValueError('Boundary batch limit must be 1..20.')
@@ -477,24 +580,22 @@ def reconcile_due_reference_boundaries(store, rest_client, now_server_us, deadli
         if monotonic() >= deadline:
             break
         fetch, reports = rest_client.fetch_boundary(row, deadline)
-        selected = selection_policy(reports, row.target_us) if selection_policy and policy_revision else None
-        if selected is not None and selected not in reports:
-            raise ValueError("Boundary policy selected evidence outside retrieval.")
-        reason = 'BOUNDARY_POLICY_UNVERIFIED' if not selection_policy or not policy_revision else 'BOUNDARY_PENDING'
-        status = 'AMBIGUOUS' if reason == 'BOUNDARY_POLICY_UNVERIFIED' else 'PENDING'
+        selected, status, reason = None, 'PENDING', 'BOUNDARY_PENDING'
+        try:
+            selected = select_boundary_report(reports, row.target_us)
+        except MarketDataError as exc:
+            if exc.code != 'BOUNDARY_AMBIGUOUS':
+                raise
+            status, reason = 'AMBIGUOUS', exc.code
         if selected is not None:
-            status, reason = 'UNAVAILABLE', 'DON_UNVERIFIED'
-            if selected.decode_status != 'DECODED':
-                reason = 'INVALID_REFERENCE'
-            elif selected.verification_status == 'VERIFIED':
-                status, reason = 'AVAILABLE', None
+            status, reason = 'AVAILABLE', None
         if monotonic() >= deadline:
             status, reason = 'UNAVAILABLE', 'LATE_REFERENCE'
         learned = fetch.received_server_us
         association = replace(row, status=status, origin='HISTORICAL_LOOKUP', available_live=False,
             learned_wall_us=fetch.attempt.ended_wall_us, learned_server_us=learned,
             fetch_id=None, report_id=None, report_hash=selected.report_hash if selected else None,
-            selection_policy_revision=policy_revision, reason=reason, attempt_count=row.attempt_count + 1,
+            selection_policy_revision='signed-inclusive-seconds-v1', reason=reason, attempt_count=row.attempt_count + 1,
             next_due_us=None if status == 'AVAILABLE' else boundary_retry_due(row.target_us,
                 attempt_count=row.attempt_count + 1, now_us=max(now_server_us, learned or now_server_us)))
         store.save_reference_evidence(fetch, reports, (association,))

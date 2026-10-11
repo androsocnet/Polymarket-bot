@@ -47,6 +47,107 @@ def build_schema_v2_report_payload(
 
 
 class SchemaV2DecoderTests(unittest.TestCase):
+    def test_managed_lifecycle_gates_cleanup_and_idempotence(self):
+        from polymarket_bot.recorder.reference import ManagedReferenceSession, ActivationEvidence
+        calls = []
+        class Rest:
+            def close(self): calls.append('rest-close')
+        class Live:
+            def start(self): calls.append('live-start')
+            def stop(self): calls.append('live-stop')
+            def get_freshest_report(self, *args): return None
+            def get_connection_gaps(self): return ()
+        discovery = {'feedId': models.CHAINLINK_FEED_ID,
+            'name': models.CHAINLINK_FEED_NAME, 'status': 'active', 'schemaVersion': 2, 'decimals': 8}
+        session = ManagedReferenceSession(evidence=ActivationEvidence(*([True]*6)),
+            discovery=lambda deadline: discovery, credentials=lambda: calls.append('credentials') or ('id', 'secret'),
+            rest_factory=lambda *args: Rest(), live_factory=lambda *args: Live(),
+            monotonic_ns=lambda: 0, wall_us=lambda: NOW_US, decoder_revision='abi-v2')
+        session.start('BOOK_ONLY', 2)
+        self.assertEqual(calls, [])
+        session.start('REFERENCE_REQUIRED', 2)
+        self.assertEqual(calls, ['credentials', 'live-start'])
+        session.stop(); session.stop()
+        self.assertEqual(calls, ['credentials', 'live-start', 'live-stop', 'rest-close'])
+        denied = ManagedReferenceSession(evidence=ActivationEvidence(*([False]*6)),
+            discovery=lambda d: self.fail('Discovery before permission'),
+            credentials=lambda: self.fail('Credentials before permission'),
+            monotonic_ns=lambda: 0, wall_us=lambda: NOW_US, decoder_revision='abi-v2')
+        with self.assertRaises(MarketDataError): denied.start('REFERENCE_REQUIRED', 2)
+
+    def test_decoder_rejects_noncanonical_hex_before_allocation(self):
+        payload, raw = build_schema_v2_report_payload()
+        payload['report']['fullReport'] = raw.hex()[:64] + ' ' + raw.hex()[64:]
+        result = decode_schema_v2_report(payload, price_scale=8, decoder_revision='abi',
+            receipt_wall_us=NOW_US, receipt_server_us=NOW_US)
+        self.assertEqual(result.decode_status, 'INVALID')
+
+    def test_decoder_rejects_noncanonical_offsets_lengths_and_words(self):
+        payload, raw = build_schema_v2_report_payload()
+        for offset, value in ((96, 225), (128, 224), (160, 2**255), (224, 223),
+                              (480, 33), (544, 0), (288, 2**32), (352, 2**192),
+                              (448, 2**191)):
+            with self.subTest(offset=offset):
+                changed = raw[:offset] + value.to_bytes(32, 'big') + raw[offset+32:]
+                payload['report']['fullReport'] = changed.hex()
+                result = decode_schema_v2_report(payload, price_scale=8, decoder_revision='abi',
+                    receipt_wall_us=NOW_US, receipt_server_us=NOW_US)
+                self.assertEqual(result.decode_status, 'INVALID')
+                self.assertEqual(result.report_hash, sha256(changed).hexdigest())
+
+    def test_signed_only_transport_has_canonical_timestamp_fields(self):
+        from polymarket_bot.recorder.chainlink_rest import parse_report
+        payload, raw = build_schema_v2_report_payload()
+        signed, fields, draft = parse_report({'fullReport': raw.hex()})
+        self.assertEqual(fields['observationsTimestamp'], 160)
+        self.assertEqual(fields['validFromTimestamp'], 100)
+        self.assertEqual(fields['benchmarkPrice'], '6500012345678')
+
+    def test_managed_pin_conflict_precedes_credentials(self):
+        from polymarket_bot.recorder.reference import ManagedReferenceSession, ActivationEvidence
+        session = ManagedReferenceSession(evidence=ActivationEvidence(*([True]*6)),
+            discovery=lambda d: {'feedId': models.CHAINLINK_FEED_ID, 'name': models.CHAINLINK_FEED_NAME,
+                'status': 'active', 'schemaVersion': 2, 'decimals': 8},
+            credentials=lambda: self.fail('Credentials loaded despite persisted pin conflict'),
+            monotonic_ns=lambda: 0, wall_us=lambda: NOW_US, decoder_revision='abi')
+        with self.assertRaises(MarketDataError) as caught:
+            session.start('REFERENCE_REQUIRED', 2, persisted_pin={'price_scale': 9, 'decoder_revision': 'abi'})
+        self.assertEqual(caught.exception.code, 'identity_conflict')
+
+    def test_managed_start_failure_closes_rest_and_consumer(self):
+        from polymarket_bot.recorder.reference import ManagedReferenceSession, ActivationEvidence
+        calls = []
+        class Rest:
+            def close(self): calls.append('rest-close')
+        class Live:
+            def start(self): raise MarketDataError('websocket_failure', 'Synthetic failure')
+            def stop(self): calls.append('live-stop')
+        session = ManagedReferenceSession(evidence=ActivationEvidence(*([True]*6)),
+            discovery=lambda d: {'feedId': models.CHAINLINK_FEED_ID, 'name': models.CHAINLINK_FEED_NAME,
+                'status': 'active', 'schemaVersion': 2, 'decimals': 8},
+            credentials=lambda: ('id', 'secret'), rest_factory=lambda *a: Rest(),
+            live_factory=lambda *a: Live(), monotonic_ns=lambda: 0, wall_us=lambda: NOW_US,
+            decoder_revision='abi')
+        with self.assertRaises(MarketDataError): session.start('REFERENCE_REQUIRED', 2)
+        session.stop()
+        self.assertEqual(calls, ['live-stop', 'rest-close'])
+        self.assertIsNone(session.rest)
+        self.assertIsNone(session.consumer)
+
+    def test_inclusive_boundary_selection_and_overlap(self):
+        from polymarket_bot.recorder.reference import select_boundary_report
+        payload, raw = build_schema_v2_report_payload()
+        report = decode_schema_v2_report(payload, price_scale=8, decoder_revision='abi',
+            receipt_wall_us=NOW_US, receipt_server_us=NOW_US)
+        for target in (100, 160, 120):
+            self.assertEqual(select_boundary_report((report,), target*1_000_000), report)
+        for target in (99, 161):
+            self.assertIsNone(select_boundary_report((report,), target*1_000_000))
+        self.assertIsNone(select_boundary_report((report,), 100_000_001))
+        with self.assertRaises(MarketDataError) as caught:
+            select_boundary_report((report, replace(report, report_hash='other')), 120_000_000)
+        self.assertEqual(caught.exception.code, 'BOUNDARY_AMBIGUOUS')
+
     def test_signed_content_without_envelope_fields(self):
         payload, raw = build_schema_v2_report_payload()
         result = decode_schema_v2_report({'fullReport': raw.hex()}, price_scale=8,

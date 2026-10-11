@@ -46,6 +46,11 @@ class ChainlinkLiveConsumer:
         self._gaps = deque(maxlen=128)
         self._failure = None
 
+    def check_health(self):
+        with self._lock:
+            if self._failure is not None:
+                raise MarketDataError('websocket_failed', 'Reference stream worker failed.')
+
     def is_connected(self):
         with self._lock:
             return self._connected
