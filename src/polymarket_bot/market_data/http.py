@@ -177,6 +177,8 @@ class PublicGet:
                     error = MarketDataError("transport_error", f"{source} {method} {path}: interrupted.")
                     raise
                 finally:
+                    if not had_pre_existing_cookies:
+                        self.client.cookies.clear()
                     if self.on_attempt is not None:
                         self.on_attempt(HttpAttempt(
                             operation, method, path, selectors, attempt + 1,
@@ -184,6 +186,7 @@ class PublicGet:
                             started_wall_us, finished_wall_us if finished_wall_us is not None else _wall_us(self.utcnow()), status,
                             "success" if error is None else "failure",
                             None if error is None else error.code, bytes(body), raw_complete))
+
                 if not retryable or attempt == self.max_attempts - 1:
                     raise error
                 remaining = self._remaining(deadline)

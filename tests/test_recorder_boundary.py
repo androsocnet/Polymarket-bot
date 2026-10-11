@@ -135,8 +135,10 @@ class RecorderBoundaryTests(unittest.TestCase):
         try:
             with self.assertRaises(MarketDataError):
                 reader.get_json("clob","/time",deadline=10)
-            self.assertEqual(len(requests),1)
-            self.assertNotIn("cookie",requests[0].headers)
+            self.assertEqual(len(requests), 2)
+            self.assertNotIn("cookie", requests[0].headers)
+            self.assertNotIn("cookie", requests[1].headers)
+            self.assertEqual(len(client.cookies), 0)
         finally:
             client.close()
 
@@ -156,4 +158,51 @@ class RecorderBoundaryTests(unittest.TestCase):
             self.assertNotIn("cookie", requests[1].headers)
         finally:
             client.close()
+
+    def test_retry_after_response_cookie_on_429_succeeds_without_cookie_forwarding(self):
+        requests = []
+        attempts = []
+        def respond(request):
+            requests.append(request)
+            if len(requests) == 1:
+                return httpx.Response(429, headers={"Set-Cookie": "__cf_bm=sentinel; Path=/", "Retry-After": "0"},
+                                      stream=httpx.ByteStream(b"{}"))
+            return httpx.Response(200, stream=httpx.ByteStream(b"{}"))
+        client, reader = self.reader(respond)
+        reader.on_attempt = attempts.append
+        reader.max_attempts = 2
+        try:
+            read = reader.get_json("clob", "/time", deadline=10)
+            self.assertEqual(read.payload, {})
+            self.assertEqual(len(requests), 2)
+            self.assertNotIn("cookie", requests[0].headers)
+            self.assertNotIn("cookie", requests[1].headers)
+            self.assertEqual(len(attempts), 2)
+            self.assertEqual(len(client.cookies), 0)
+        finally:
+            client.close()
+
+    def test_retry_after_response_cookie_on_503_succeeds_without_cookie_forwarding(self):
+        requests = []
+        attempts = []
+        def respond(request):
+            requests.append(request)
+            if len(requests) == 1:
+                return httpx.Response(503, headers={"Set-Cookie": "__cf_bm=sentinel; Path=/"},
+                                      stream=httpx.ByteStream(b"{}"))
+            return httpx.Response(200, stream=httpx.ByteStream(b"{}"))
+        client, reader = self.reader(respond)
+        reader.on_attempt = attempts.append
+        reader.max_attempts = 2
+        try:
+            read = reader.get_json("clob", "/time", deadline=10)
+            self.assertEqual(read.payload, {})
+            self.assertEqual(len(requests), 2)
+            self.assertNotIn("cookie", requests[0].headers)
+            self.assertNotIn("cookie", requests[1].headers)
+            self.assertEqual(len(attempts), 2)
+            self.assertEqual(len(client.cookies), 0)
+        finally:
+            client.close()
+
 
