@@ -61,6 +61,7 @@ class ReadOnlyBoundaryTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]/"src"
         raw_sites = []
         forbidden = []
+        chainlink_sends = []
         for path in root.rglob("*.py"):
             tree = ast.parse(path.read_text(encoding="utf-8"))
             for node in ast.walk(tree):
@@ -81,8 +82,21 @@ class ReadOnlyBoundaryTests(unittest.TestCase):
                     if re.search(r"^/(order|orders|cancel|auth|api-key|balance|trade)(/|$)",node.value):
                         forbidden.append((path.name,node.lineno))
                 if isinstance(node,ast.Call) and isinstance(node.func,ast.Attribute):
+                    if node.func.attr == "send" and path.name == "chainlink_discovery.py":
+                        self.assertEqual(ast.unparse(node.func.value), "client")
+                        self.assertEqual(ast.unparse(node.args[0]), "request")
+                        self.assertEqual({kw.arg: ast.literal_eval(kw.value) for kw in node.keywords},
+                                         {"stream": False})
+                    if node.func.attr == "send" and path.name != "chainlink_discovery.py":
+                        self.assertEqual(path.name, "chainlink_rest.py")
+                        self.assertEqual(ast.unparse(node.func.value), "self._client")
+                        self.assertEqual(ast.unparse(node.args[0]), "request")
+                        self.assertEqual({kw.arg: ast.literal_eval(kw.value) for kw in node.keywords},
+                                         {"stream": True, "follow_redirects": False})
+                        chainlink_sends.append(node)
                     if node.func.attr in ("stream","request","post","put","patch","delete"):
                         raw_sites.append((path.name,node))
+        self.assertEqual(len(chainlink_sends), 1)
         self.assertEqual(forbidden,[])
         self.assertEqual(len(raw_sites),1)
         name,call = raw_sites[0]
