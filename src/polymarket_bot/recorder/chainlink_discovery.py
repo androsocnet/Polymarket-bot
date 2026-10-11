@@ -11,7 +11,7 @@ from polymarket_bot.recorder.models import CHAINLINK_FEED_ID
 
 CHAINLINK_DISCOVERY_HOST = "api.dataengine.chain.link"
 CHAINLINK_DISCOVERY_PATH = "/api/v1/feeds"
-CHAINLINK_DISCOVERY_URL = f"https://{CHAINLINK_DISCOVERY_HOST}{CHAINLINK_DISCOVERY_PATH}"
+CHAINLINK_DISCOVERY_URL = "https://api.dataengine.chain.link/api/v1/feeds"
 
 
 @dataclass(frozen=True)
@@ -113,7 +113,11 @@ def fetch_feed_discovery(client: httpx.Client, endpoint_url: str = CHAINLINK_DIS
         timeout = httpx.Timeout(deadline)
 
     try:
-        response = client.get(endpoint_url, timeout=timeout)
+        request = client.build_request("GET", endpoint_url)
+        for header in ("authorization", "x-authorization-timestamp",
+                        "x-authorization-signature-sha256"):
+            request.headers.pop(header, None)
+        response = client.send(request, stream=False)
         if response.status_code != 200:
             raise MarketDataError("discovery_http_error", f"Discovery GET failed with HTTP {response.status_code}.", http_status=response.status_code)
         return load_numeric_json(response.content)

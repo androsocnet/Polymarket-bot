@@ -266,7 +266,15 @@ def decode_schema_v2_report(payload: object, *, price_scale: int | None,
         price, status = None, "INVALID"
         diagnostics = (exc.code if isinstance(exc, MarketDataError) else "invalid_numeric",)
 
-    report_hash = sha256(raw_signed_report).hexdigest() if raw_signed_report else sha256(b"").hexdigest()
+    if raw_signed_report:
+        report_hash = sha256(raw_signed_report).hexdigest()
+    else:
+        import json as _json
+        try:
+            fallback_bytes = _json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        except Exception:
+            fallback_bytes = b""
+        report_hash = sha256(fallback_bytes).hexdigest()
 
     return ReferenceReportDraft(
         CHAINLINK_FEED_ID, 2, raw_signed_report, report_hash,

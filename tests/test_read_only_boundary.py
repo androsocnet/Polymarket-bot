@@ -73,6 +73,8 @@ class ReadOnlyBoundaryTests(unittest.TestCase):
                         if node.value == "https://data.chain.link/streams/btc-usd-twap-60s-streams":
                             # Inert feed provenance; executable request sites remain checked below.
                             self.assertEqual(path, root/"polymarket_bot"/"recorder"/"store.py")
+                        elif re.search(r"^https?://[^/]*dataengine\.chain\.link", node.value):
+                            self.assertIn(path.name, ("chainlink_discovery.py", "chainlink_rest.py", "chainlink_ws.py"))
                         else:
                             self.assertIn(node.value,("https://gamma-api.polymarket.com","https://clob.polymarket.com",
                                                       "https://data-api.polymarket.com", "https://clob.polymarket.com/books"))
