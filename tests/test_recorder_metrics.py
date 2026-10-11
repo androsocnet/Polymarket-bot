@@ -301,6 +301,17 @@ class RecorderMetricsTests(unittest.TestCase):
         self.assertEqual(report.reference_coverage['don_unverified_reports'], 1)
         self.assertEqual(report.reference_coverage['cryptographically_verified_reports'], 0)
 
+    def test_research_counts_survive_missing_clock_without_claiming_coverage(self):
+        store, run = self.fixture()
+        slot = self.slot(store, run, 150, 'COMPLETE')
+        self.reference(store, run, slot, verified='UNVERIFIED')
+        with store._connection:
+            store._connection.execute('DELETE FROM clock_anchors')
+        report = self.metrics().measure(store, start_us=NOW_US, end_us=NOW_US+2_000_000)
+        self.assertIsNone(report.reference_coverage['live_slots'])
+        self.assertEqual(report.reference_coverage['research_collected_reports'], 1)
+        self.assertEqual(report.reference_coverage['don_unverified_reports'], 1)
+
     def test_percentiles_and_disabled_reference(self):
         metrics = self.metrics()
         store, run_id = self.fixture()

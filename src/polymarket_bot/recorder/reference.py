@@ -289,6 +289,142 @@ def decode_schema_v2_report(payload: object, *, price_scale: int | None,
     )
 
 
+class ReferenceRestEvidence:
+    def __init__(self, client, *, run_id, price_scale, decoder_revision, project, anchor_id):
+        self.client, self.run_id = client, run_id
+        self.price_scale, self.decoder_revision = price_scale, decoder_revision
+        self.project, self.anchor_id = project, anchor_id
+
+    def fetch_boundary(self, row, deadline):
+        return self.fetch(row, deadline)
+
+    def fetch(self, row, deadline):
+        from dataclasses import replace
+        from .models import ReferenceFetchDraft
+        attempts, reports, error = [], (), None
+        previous = self.client.on_attempt
+        self.client.on_attempt = attempts.append
+        latest = row.role == 'SLOT_CURRENT'
+        try:
+            if latest:
+                raw, fields = self.client.get_latest_report(CHAINLINK_FEED_ID, deadline)
+            else:
+                if row.target_us % 1_000_000:
+                    raise MarketDataError('boundary_timestamp_unsupported', 'Fractional boundary cannot be rounded.')
+                raw, fields = self.client.get_report_at_timestamp(CHAINLINK_FEED_ID, row.target_us//1_000_000, deadline)
+            attempt = attempts[-1]
+            report = decode_schema_v2_report(fields, price_scale=self.price_scale,
+                decoder_revision=self.decoder_revision, receipt_wall_us=attempt.ended_wall_us,
+                receipt_server_us=self.project(attempt.ended_mono_ns))
+            if report.raw_signed_report == raw:
+                reports = (report,)
+        except MarketDataError as exc:
+            error = exc.code
+            if not attempts:
+                raise
+        finally:
+            self.client.on_attempt = previous
+        attempt = attempts[-1]
+        if reports and attempt.result != 'success':
+            reports = ()
+        fetch = ReferenceFetchDraft(attempt, self.run_id, CHAINLINK_FEED_ID, row.role,
+            'LIVE_LATEST' if latest else 'HISTORICAL_LOOKUP', row.target_us,
+            'UNAVAILABLE', error, attempt.raw_body if attempt.raw_complete else None,
+            self.project(attempt.ended_mono_ns), row.market_id, self.anchor_id)
+        return fetch, reports
+
+
+class OfflineReferenceSession:
+    def __init__(self, *, price_scale, decoder_revision, discovery_payload, evidence,
+                 latest, monotonic_ns, wall_us, boundary=None, live=None,
+                 selection_policy=None, policy_revision=None):
+        from .chainlink_discovery import verify_feed_identity
+        require_reference_activation('REFERENCE_REQUIRED', evidence)
+        metadata = verify_feed_identity(discovery_payload)
+        if metadata.price_scale != price_scale or metadata.name != 'BTC/USD-Streams-TWAP-60s-mainnet-production':
+            raise MarketDataError('identity_conflict', 'Offline feed metadata conflicts.')
+        if type(decoder_revision) is not str or not 0 < len(decoder_revision) <= 128:
+            raise MarketDataError('decoder_verification_failed', 'Structural decoder revision required.')
+        self.price_scale, self.decoder_revision = price_scale, decoder_revision
+        self.metadata, self.evidence = metadata, evidence
+        self.latest, self.boundary, self.live = latest, boundary, live
+        self.monotonic_ns, self.wall_us = monotonic_ns, wall_us
+        self.selection_policy, self.policy_revision = selection_policy, policy_revision
+
+    def fetch(self, row, deadline, *, run_id, anchor_id, project):
+        import json
+        from dataclasses import replace
+        from polymarket_bot.market_data.http import HttpAttempt
+        from .models import ReferenceFetchDraft
+        started_ns, started_wall = self.monotonic_ns(), self.wall_us()
+        raw, reports, error, http_status, complete = b'', (), None, None, False
+        try:
+            if started_ns / 1_000_000_000 >= deadline:
+                raise MarketDataError('chainlink_timeout', 'Reference budget expired.')
+            if row.role == 'SLOT_CURRENT':
+                payload = self.live(5, project(started_ns)/1_000_000) if self.live else None
+                if payload is None:
+                    payload = self.latest(deadline)
+                elif type(payload) is tuple and len(payload) == 2:
+                    signed, fields = payload
+                    if type(signed) is not bytes or type(fields) is not dict:
+                        raise MarketDataError('invalid_reference_payload', 'Invalid live buffer evidence.')
+                    payload = dict(fields)
+                    payload['fullReport'] = signed.hex()
+                    for key in ('raw_message', 'receipt_monotonic', 'receipt_wall_us', 'receipt_server_us'):
+                        payload.pop(key, None)
+            else:
+                payload = self.boundary(row.target_us, deadline) if self.boundary else None
+            if payload is not None:
+                raw = json.dumps(payload, separators=(',', ':'), allow_nan=False).encode()
+                if len(raw) > 10_485_760:
+                    raw = b''
+                    raise MarketDataError('response_too_large', 'Reference envelope exceeds budget.')
+                http_status, complete = 200, True
+                ended_ns, ended_wall = self.monotonic_ns(), self.wall_us()
+                report = decode_schema_v2_report(payload, price_scale=self.price_scale,
+                    decoder_revision=self.decoder_revision, receipt_wall_us=ended_wall,
+                    receipt_server_us=project(ended_ns))
+                if report.raw_signed_report:
+                    reports = (report,)
+                if self.monotonic_ns()/1_000_000_000 >= deadline:
+                    error = 'LATE_REFERENCE'
+            else:
+                error = 'REFERENCE_PENDING'
+        except MarketDataError as exc:
+            error = exc.code
+        except (ValueError, TypeError, UnicodeError, RecursionError):
+            error = 'invalid_reference_payload'
+        ended_ns, ended_wall = self.monotonic_ns(), self.wall_us()
+        if reports:
+            reports = tuple(replace(r, first_received_wall_us=ended_wall,
+                first_received_server_us=project(ended_ns)) for r in reports)
+        latest = row.role == 'SLOT_CURRENT'
+        attempt = HttpAttempt('REFERENCE_LATEST' if latest else 'REFERENCE_LOOKUP', 'GET',
+            '/api/v1/reports/latest' if latest else '/api/v1/reports',
+            ('feed_id=' + CHAINLINK_FEED_ID,), 1, started_ns, ended_ns,
+            started_wall, ended_wall, http_status, 'success' if reports else 'error',
+            error, raw, complete)
+        fetch = ReferenceFetchDraft(attempt, run_id, CHAINLINK_FEED_ID, row.role,
+            'LIVE_LATEST' if latest else 'HISTORICAL_LOOKUP', row.target_us,
+            'UNAVAILABLE', error, raw if complete else None, project(ended_ns),
+            row.market_id, anchor_id)
+        return row, fetch, reports, deadline
+
+
+def due_reference_boundaries(store, now_us, limit=2):
+    if type(limit) is not int or not 1 <= limit <= 20:
+        raise ValueError('Boundary batch limit must be 1..20.')
+    rows = store._rows("""SELECT a.* FROM reference_associations a
+        WHERE a.role IN ('OPENING','CLOSING') AND a.association_id=(
+            SELECT MAX(b.association_id) FROM reference_associations b
+            WHERE b.market_id=a.market_id AND b.role=a.role)
+        AND a.status IN ('PENDING','UNAVAILABLE','AMBIGUOUS','CONFLICT')
+        AND a.next_due_us<=? ORDER BY a.next_due_us,a.market_id,a.role LIMIT ?""", (now_us, limit))
+    return tuple(ReferenceAssociationDraft(**{name: row[name] for name in
+        ReferenceAssociationDraft.__dataclass_fields__ if name != 'report_hash'}) for row in rows)
+
+
 def reconcile_due_reference_boundaries(store, rest_client, now_server_us, deadline, *,
                                        monotonic=None, selection_policy=None,
                                        policy_revision=None, limit=2):
@@ -297,11 +433,8 @@ def reconcile_due_reference_boundaries(store, rest_client, now_server_us, deadli
     monotonic = monotonic or time.monotonic
     if monotonic() >= deadline:
         return 0
-    rows = store._rows("SELECT * FROM reference_associations WHERE role IN ('OPENING','CLOSING') ORDER BY association_id")
-    drafts = tuple(ReferenceAssociationDraft(**{name: row[name] for name in
-        ReferenceAssociationDraft.__dataclass_fields__ if name != 'report_hash'}) for row in rows)
     completed = 0
-    for row in reference_due_work(drafts, now_us=now_server_us, limit=limit):
+    for row in due_reference_boundaries(store, now_server_us, limit):
         if monotonic() >= deadline:
             break
         fetch, reports = rest_client.fetch_boundary(row, deadline)

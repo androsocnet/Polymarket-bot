@@ -484,7 +484,8 @@ def measure(store: RecorderStore, *, start_us: int, end_us: int) -> MeasurementR
                     "pre_first_start_slots", "unrecorded_eligible_slots"):
             denominators[key] = None
         for key in reference:
-            reference[key] = None
+            if key not in ('research_collected_reports', 'don_unverified_reports', 'cryptographically_verified_reports'):
+                reference[key] = None
         depth_breakdown["valid_books"] = None
         depth_breakdown["excluded_invalid_books"] = None
         for outcome in ("UP", "DOWN"):

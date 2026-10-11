@@ -78,7 +78,10 @@ def _epoch_us(value):
 class Recorder:
     def __init__(self, store: RecorderStore, public: PublicGet, *,
                  monotonic_ns: Callable[[], int], wall_us: Callable[[], int],
-                 sleep: Callable[[float], None]):
+                 sleep: Callable[[float], None], offline_reference=None):
+        self.offline_reference = offline_reference
+        self.reference_worker = None
+        self.reference_gap_end = None
         self.store, self.public = store, public
         self.monotonic_ns, self.wall_us, self.sleep = monotonic_ns, wall_us, sleep
         self.clock = RecorderClock(monotonic_ns=monotonic_ns, wall_us=wall_us)
@@ -88,6 +91,82 @@ class Recorder:
         public.utcnow = lambda: datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=wall_us())
         public.sleep = sleep
         self.gamma = GammaClient(public)
+
+    def _reference_submit(self, row, deadline_ns):
+        if self.reference_worker is None or not self.clock.usable() or self.monotonic_ns() >= deadline_ns:
+            return False
+        anchor, anchor_id, run_id = self.clock.anchor, self.anchor_id, self.run_id
+        project = lambda ns: anchor.server_us + (ns-anchor.midpoint_ns)//1000
+        return self.reference_worker.submit(lambda: self.offline_reference.fetch(row,
+            deadline_ns/1_000_000_000, run_id=run_id, anchor_id=anchor_id, project=project))
+
+    def _reference_drain(self, *, stopping=False):
+        if self.reference_worker is None:
+            return
+        result = self.reference_worker.take()
+        if result is None:
+            return
+        from dataclasses import replace
+        from .reference import boundary_retry_due
+        row, fetch, reports, deadline = result
+        now = self._now() if self.clock.usable() else fetch.received_server_us
+        reason, status, selected = fetch.error_code or 'DON_UNVERIFIED', 'UNAVAILABLE', None
+        if row.role != 'SLOT_CURRENT':
+            policy = self.offline_reference.selection_policy
+            revision = self.offline_reference.policy_revision
+            status, reason = ('AMBIGUOUS', 'BOUNDARY_POLICY_UNVERIFIED') if not policy or not revision else ('PENDING', 'BOUNDARY_PENDING')
+            if policy and revision:
+                selected = policy(reports, row.target_us)
+                if selected is not None and selected not in reports:
+                    raise RecorderStoreError('fatal_invariant', 'Boundary selector returned foreign evidence.')
+                if selected is not None:
+                    status, reason = 'UNAVAILABLE', 'DON_UNVERIFIED'
+        elif reports:
+            selected = reports[0]
+            if selected.decode_status != 'DECODED':
+                reason = 'INVALID_REFERENCE'
+            elif not 0 <= (fetch.received_server_us-selected.observations_seconds*1_000_000) <= 5_000_000:
+                reason = 'STALE_REFERENCE'
+        if self.monotonic_ns()/1_000_000_000 >= deadline and status != 'AMBIGUOUS':
+            status, reason = 'UNAVAILABLE', 'LATE_REFERENCE'
+        learned_wall = max(self.wall_us(), fetch.attempt.ended_wall_us)
+        prior = self.store._one('SELECT MAX(learned_wall_us) AS learned FROM reference_associations WHERE market_id=? AND role=? AND slot_id IS ?',
+            (row.market_id, row.role, row.slot_id))['learned']
+        learned_wall = max(learned_wall, (prior+1) if prior is not None else learned_wall)
+        association = replace(row, status=status, reason=reason, origin=fetch.origin, available_live=False,
+            learned_wall_us=learned_wall, learned_server_us=max(now, fetch.received_server_us),
+            report_hash=selected.report_hash if selected else None, report_id=None, fetch_id=None,
+            attempt_count=row.attempt_count+1, selection_policy_revision=self.offline_reference.policy_revision,
+            next_due_us=None if row.role == 'SLOT_CURRENT' else boundary_retry_due(row.target_us,
+                attempt_count=row.attempt_count+1, now_us=max(now, fetch.received_server_us)))
+        self.store.save_reference_evidence(fetch, reports, (association,))
+        if fetch.error_code == 'chainlink_auth_failed':
+            raise MarketDataError('chainlink_auth_failed', 'Reference permission gate lost.')
+
+    def _reference_housekeeping(self, deadline_ns):
+        if self.reference_worker is None or not self.clock.usable():
+            return
+        self._reference_drain()
+        gaps = getattr(self.offline_reference, 'gaps', None)
+        if gaps is not None:
+            for start, end in gaps()[-128:]:
+                if self.reference_gap_end is None or end > self.reference_gap_end:
+                    self.store.record_event(self.run_id, 'DISCOVERY_GAP', started_us=self.wall_us(),
+                        detail={'reason': 'REFERENCE_CONNECTION_GAP', 'diagnostic_only': True,
+                            'time_domain': 'RUN_MONOTONIC', 'start_mono_ns': round(start*1_000_000_000),
+                            'end_mono_ns': round(end*1_000_000_000)})
+                    self.reference_gap_end = end
+        from .reference import boundary_reference, due_reference_boundaries
+        for market in self.store.restart_context()[1]:
+            for role in ('OPENING', 'CLOSING'):
+                existing = self.store._one('SELECT association_id FROM reference_associations WHERE market_id=? AND role=? LIMIT 1',
+                    (market['market_id'], role))
+                if existing is None:
+                    self.store.save_reference_plan(boundary_reference(market['market_id'], role,
+                        window_start_us=market['window_start_us'], window_end_us=market['window_end_us'],
+                        learned_wall_us=self.wall_us(), learned_server_us=self._now()))
+        for row in due_reference_boundaries(self.store, self._now(), limit=1):
+            self._reference_submit(row, deadline_ns)
 
     def _control(self, operation):
         attempts = []
@@ -145,6 +224,7 @@ class Recorder:
         deadline_ns = target_ns - 1_000_000
         if self.monotonic_ns() >= deadline_ns:
             return
+        self._reference_housekeeping(deadline_ns)
         self._checkpoint_due(target_ns)
         if self.monotonic_ns() >= deadline_ns:
             return
@@ -265,9 +345,19 @@ class Recorder:
                 exc.code if isinstance(exc, RecorderStoreError) else "storage_failure")
 
     def _execute_run(self, config, *, should_stop):
-        if config.mode != "BOOK_ONLY":
+        from .reference import OfflineReferenceSession
+        if config.mode != "BOOK_ONLY" and (config.mode != 'REFERENCE_REQUIRED'
+                or type(self.offline_reference) is not OfflineReferenceSession):
             self.store.close()
             return RunResult("", "FAILED", 2, 0, "reference_runtime_unavailable")
+        if config.mode == 'REFERENCE_REQUIRED':
+            from .reference import require_reference_activation
+            try:
+                require_reference_activation(config.mode, self.offline_reference.evidence)
+            except MarketDataError as exc:
+                self.store.close()
+                return RunResult('', 'FAILED', 2, 0, exc.code)
+            self.reference_worker = ReferenceWorker()
         original_attempts = self.public.max_attempts
         original_guard = self.public.before_attempt
         def stop_guard():
@@ -300,12 +390,24 @@ class Recorder:
             # No further persistence or HTTP follows a failed writer/invariant.
             return RunResult(self.run_id, "FAILED", 1, self.finalized,
                              exc.code if isinstance(exc, RecorderStoreError) else "storage_failure")
+        except MarketDataError as exc:
+            if self.run_id and not self.store._write_failed:
+                self.store.recover_interrupted(wall_us=self.wall_us(), run_id=self.run_id, finish_runs=False)
+                self.store.finish_run(self.run_id, state='FAILED', wall_us=self.wall_us(), reason=exc.code)
+            return RunResult(self.run_id, 'FAILED', 2, self.finalized, exc.code)
         finally:
             self.public.max_attempts = original_attempts
             self.public.before_attempt = original_guard
-            self.store.close()
+            try:
+                if self.reference_worker is not None:
+                    self.reference_worker.stop()
+            finally:
+                self.store.close()
 
     def _shutdown(self, state, reason):
+        if self.reference_worker is not None:
+            self.reference_worker.stop()
+            self._reference_drain(stopping=True)
         self.store.record_event(self.run_id, "SHUTDOWN", started_us=self.wall_us(),
                                 detail={"reason": reason})
         self.store.finish_run(self.run_id, state=state, wall_us=self.wall_us(), reason=reason)
@@ -329,7 +431,8 @@ class Recorder:
         self.invalidated = {row["market_id"] for row in self.known_markets if row["lifecycle"] == "INVALIDATED"}
         self.store.recover_interrupted(wall_us=self.wall_us())
         self.public.max_attempts = min(self.public.max_attempts, config.max_attempts)
-        self.run_id = self.store.start_run(config, wall_us=self.wall_us(), app_revision=config.policy_revision)
+        self.run_id = self.store.start_run(config, wall_us=self.wall_us(), app_revision=config.policy_revision,
+            offline_reference=self.offline_reference if self.reference_worker else None)
         take_checkpoint(self.store,run_id=self.run_id,wall_us=self.wall_us())
         self.next_checkpoint_ns = self.monotonic_ns()+3_600_000_000_000
         self.store.record_event(self.run_id, "STARTUP", started_us=self.wall_us())
@@ -443,6 +546,12 @@ class Recorder:
                 started_server_us=self._now())
             anchor = self.clock.anchor
             project = lambda moment_ns: anchor.server_us + (moment_ns-anchor.midpoint_ns)//1000
+            if self.reference_worker is not None:
+                from .models import ReferenceAssociationDraft
+                row = ReferenceAssociationDraft(market.market_id, 'SLOT_CURRENT', target.scheduled_us,
+                    'UNAVAILABLE', 'NOT_FETCHED', False, self.wall_us(), self._now(), slot_id=slot_id)
+                self._reference_drain()
+                self._reference_submit(row, self.clock.deadline_ns(min(target.scheduled_us+2_000_000, end_us)))
             previous = self.public.on_attempt
             self.public.on_attempt = None
             try:
@@ -455,6 +564,9 @@ class Recorder:
             ended_ns = self.monotonic_ns()
             reference = disabled_reference(market.market_id, target.scheduled_us,
                 learned_wall_us=self.wall_us(), learned_server_us=project(ended_ns))
+            if self.reference_worker is not None:
+                from dataclasses import replace
+                reference = replace(reference, status='UNAVAILABLE', reason='REFERENCE_PENDING')
             self.store.finalize_slot(slot_id, SlotCommit(market.market_id, target, self.run_id,
                 self.anchor_id, self.revision_id, books, reference, started_ns, ended_ns),
                 committed_wall_us=self.wall_us())

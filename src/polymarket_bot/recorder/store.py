@@ -316,21 +316,31 @@ class RecorderStore:
                  "Clock anchor does not belong to the slot run or is invalid.")
         return anchor
 
-    def start_run(self, config: RunConfig, *, wall_us: int, app_revision: str) -> str:
+    def start_run(self, config: RunConfig, *, wall_us: int, app_revision: str, offline_reference=None) -> str:
         self._check_writer()
-        _require(isinstance(config, RunConfig) and config.mode == "BOOK_ONLY" and type(config.use_fast_path) is bool,
+        from .reference import OfflineReferenceSession
+        offline = type(offline_reference) is OfflineReferenceSession and config.mode == 'REFERENCE_REQUIRED'
+        _require(isinstance(config, RunConfig) and (config.mode == "BOOK_ONLY" or offline) and type(config.use_fast_path) is bool,
                  "Only BOOK_ONLY can start without verified reference activation gates.")
         _integer(wall_us, "started_wall_us")
         _require(isinstance(app_revision, str) and bool(app_revision), "Application revision is required.")
         run_id = str(uuid4())
         with self._transaction():
             self._insert("recording_runs", dict(run_id=run_id, started_wall_us=wall_us,
-                mode=config.mode, reference_activation="DISABLED", state="RUNNING",
-                app_revision=app_revision, config_json=_json(asdict(config))))
+                mode=config.mode, reference_activation="VERIFIED" if offline else "DISABLED", state="RUNNING",
+                app_revision=app_revision, config_json=_json(asdict(config)),
+                activation_evidence_json=_json({'scope': 'SYNTHETIC_OFFLINE_ONLY',
+                    'live_activation': False, 'gates': asdict(offline_reference.evidence)}) if offline else None))
             self._connection.execute("""INSERT OR IGNORE INTO reference_feeds
                 (feed_id,name,environment,source_url,catalog_metadata_json,lookback_seconds,report_schema_version)
                 VALUES (?,?, 'mainnet',?, '{}',60,2)""",
                 (CHAINLINK_FEED_ID, CHAINLINK_FEED_NAME, "https://data.chain.link/streams/btc-usd-twap-60s-streams"))
+            if offline:
+                self._connection.execute('UPDATE reference_feeds SET price_scale=?,decoder_revision=?,catalog_metadata_json=?,verification_evidence_json=? WHERE feed_id=?',
+                    (offline_reference.price_scale, offline_reference.decoder_revision,
+                     _json(offline_reference.metadata.catalog_metadata),
+                     _json({'scope': 'SYNTHETIC_OFFLINE_ONLY', 'signed_binary_decoder_verified': False,
+                            'don_verified': False}), CHAINLINK_FEED_ID))
         return run_id
 
     def save_anchor(self, run_id: str, anchor: ClockAnchor) -> int:
@@ -1014,7 +1024,9 @@ class RecorderStore:
         _require(reference.market_id == commit.market_id and reference.role == "SLOT_CURRENT"
                  and reference.target_us == commit.target.scheduled_us
                  and reference.slot_id in (None, slot_id), "Reference association does not target this slot.")
-        _require(reference.status == "DISABLED" and reference.origin == "NOT_FETCHED"
+        run_mode = self._run(commit.run_id, running=False)['mode']
+        _require(reference.status == ('DISABLED' if run_mode == 'BOOK_ONLY' else 'UNAVAILABLE')
+                 and reference.origin == "NOT_FETCHED"
                  and reference.available_live is False and reference.fetch_id is None and reference.report_id is None
                  and reference.attempt_count == 0 and reference.next_due_us is None,
                  "Book-only original reference association must preserve disabled provenance.")

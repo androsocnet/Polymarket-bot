@@ -24,6 +24,20 @@ class ChainlinkRestClientTests(unittest.TestCase):
         self.addCleanup(reader.close)
         return reader
 
+    def test_actual_attempt_evidence_retains_raw_failure_and_receipt(self):
+        attempts = []
+        reader = self.reader(lambda r: httpx.Response(200, content=b'{broken'))
+        reader.on_attempt = attempts.append
+        with self.assertRaises(MarketDataError):
+            reader.get_latest_report(CHAINLINK_FEED_ID, 102)
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(attempts[0].raw_body, b'{broken')
+        self.assertTrue(attempts[0].raw_complete)
+        self.assertEqual(attempts[0].operation, 'REFERENCE_LATEST')
+        self.assertEqual(attempts[0].http_status, 200)
+        self.assertEqual(attempts[0].result, 'error')
+        self.assertNotIn('sec', repr(attempts[0]))
+
     def test_signed_actual_query_and_approved_interfaces(self):
         requests = []
         def handler(request):

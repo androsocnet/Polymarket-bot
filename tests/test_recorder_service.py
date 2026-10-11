@@ -499,6 +499,157 @@ class RecorderServiceTests(unittest.TestCase):
         self.assertEqual(worker.take(), 'evidence')
         self.assertFalse(worker.submit(slow))
 
+    def test_offline_reference_capture_keeps_books_and_unverified_evidence(self):
+        from polymarket_bot.recorder.service import Recorder
+        from polymarket_bot.recorder import reference
+        fixture = self.fixture()
+        self.assertTrue(hasattr(reference, 'OfflineReferenceSession'))
+        session = reference.OfflineReferenceSession(price_scale=8,
+            decoder_revision='structural-v2', discovery_payload={
+                'feedId': reference.CHAINLINK_FEED_ID, 'name': 'BTC/USD-Streams-TWAP-60s-mainnet-production',
+                'schemaVersion': 2, 'decimals': 8, 'status': 'active'},
+            evidence=reference.ActivationEvidence(True, True, True, True, True, True),
+            latest=lambda deadline: ({'feedId': reference.CHAINLINK_FEED_ID,
+                'fullReport': str(fixture.wall_us()//1_000_000).encode().hex(), 'validFromTimestamp': fixture.wall_us()//1_000_000-60,
+                'observationsTimestamp': fixture.wall_us()//1_000_000,
+                'expiresAt': fixture.wall_us()//1_000_000+60, 'benchmarkPrice': '6000000000000'}),
+            monotonic_ns=fixture.monotonic_ns, wall_us=fixture.wall_us)
+        recorder = Recorder(fixture.store, fixture.public, monotonic_ns=fixture.monotonic_ns,
+            wall_us=fixture.wall_us, sleep=fixture.sleep, offline_reference=session)
+        result = recorder.run(RunConfig(mode='REFERENCE_REQUIRED'), should_stop=lambda: fixture.book_count>=2)
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.slots_finalized, 2)
+        self.assertEqual(fixture.rows("SELECT DISTINCT verification_status FROM reference_reports"),
+                         [{'verification_status': 'UNVERIFIED'}])
+        rows = fixture.rows("SELECT status,available_live FROM reference_associations WHERE role='SLOT_CURRENT'")
+        self.assertTrue(rows)
+        self.assertTrue(all(r['status']=='UNAVAILABLE' and r['available_live']==0 for r in rows))
+        self.assertEqual(fixture.rows('PRAGMA user_version')[0]['user_version'], 1)
+        feed = fixture.rows('SELECT price_scale,decoder_revision,verification_evidence_json FROM reference_feeds')[0]
+        self.assertEqual(feed['price_scale'], 8)
+        self.assertEqual(feed['decoder_revision'], 'structural-v2')
+        self.assertIn('SYNTHETIC_OFFLINE_ONLY', feed['verification_evidence_json'])
+
+    def test_slow_offline_fallback_does_not_drop_valid_book_capture(self):
+        import threading
+        from polymarket_bot.recorder.reference import OfflineReferenceSession, ActivationEvidence
+        from polymarket_bot.recorder.models import CHAINLINK_FEED_ID
+        from polymarket_bot.recorder.service import Recorder
+        fixture = self.fixture()
+        entered, release = threading.Event(), threading.Event()
+        def latest(deadline):
+            entered.set()
+            release.wait(2)
+            return None
+        session = OfflineReferenceSession(price_scale=8, decoder_revision='structural',
+            discovery_payload={'feedId': CHAINLINK_FEED_ID, 'name': 'BTC/USD-Streams-TWAP-60s-mainnet-production',
+                'schemaVersion': 2, 'decimals': 8, 'status': 'active'},
+            evidence=ActivationEvidence(True, True, True, True, True, True), latest=latest,
+            monotonic_ns=fixture.monotonic_ns, wall_us=fixture.wall_us)
+        def books(request, payload, f):
+            if request.url.path == '/books':
+                self.assertTrue(entered.wait(1))
+                self.assertFalse(release.is_set())
+                release.set()
+        fixture.hook = books
+        self.addCleanup(release.set)
+        recorder = Recorder(fixture.store, fixture.public, monotonic_ns=fixture.monotonic_ns,
+            wall_us=fixture.wall_us, sleep=fixture.sleep, offline_reference=session)
+        result = recorder.run(RunConfig(mode='REFERENCE_REQUIRED'), should_stop=lambda: fixture.book_count>=1)
+        self.assertEqual(result.slots_finalized, 1)
+        self.assertEqual(fixture.rows("SELECT status FROM sample_slots WHERE slot_index=151")[0]['status'], 'COMPLETE')
+
+    def test_offline_worker_joined_when_book_writer_fails(self):
+        import threading
+        from polymarket_bot.recorder.service import Recorder
+        from polymarket_bot.recorder.reference import OfflineReferenceSession, ActivationEvidence
+        from polymarket_bot.recorder.models import CHAINLINK_FEED_ID
+        fixture = self.fixture()
+        session = OfflineReferenceSession(price_scale=8, decoder_revision='structural',
+            discovery_payload={'feedId': CHAINLINK_FEED_ID, 'name': 'BTC/USD-Streams-TWAP-60s-mainnet-production',
+                'schemaVersion': 2, 'decimals': 8, 'status': 'active'},
+            evidence=ActivationEvidence(True, True, True, True, True, True), latest=lambda deadline: None,
+            monotonic_ns=fixture.monotonic_ns, wall_us=fixture.wall_us)
+        fixture.store.finalize_slot = lambda *a, **k: (_ for _ in ()).throw(RecorderStoreError('storage_failure', 'injected'))
+        recorder = Recorder(fixture.store, fixture.public, monotonic_ns=fixture.monotonic_ns,
+            wall_us=fixture.wall_us, sleep=fixture.sleep, offline_reference=session)
+        result = recorder.run(RunConfig(mode='REFERENCE_REQUIRED'), should_stop=lambda: fixture.book_count>=1)
+        self.assertEqual(result.exit_code, 1)
+        self.assertTrue(recorder.reference_worker._stopped)
+        self.assertFalse(recorder.reference_worker._thread and recorder.reference_worker._thread.is_alive())
+
+    def test_malformed_offline_reference_and_missing_policy_preserve_books(self):
+        from polymarket_bot.recorder.service import Recorder
+        from polymarket_bot.recorder.reference import OfflineReferenceSession, ActivationEvidence
+        from polymarket_bot.recorder.models import CHAINLINK_FEED_ID
+        fixture = self.fixture()
+        session = OfflineReferenceSession(price_scale=8, decoder_revision='structural',
+            discovery_payload={'feedId': CHAINLINK_FEED_ID, 'name': 'BTC/USD-Streams-TWAP-60s-mainnet-production',
+                'schemaVersion': 2, 'decimals': 8, 'status': 'active'},
+            evidence=ActivationEvidence(True, True, True, True, True, True),
+            latest=lambda deadline: {'feedId': CHAINLINK_FEED_ID, 'fullReport': '616263',
+                'validFromTimestamp': 1, 'observationsTimestamp': True, 'expiresAt': 3,
+                'benchmarkPrice': 'NaN'}, boundary=lambda target, deadline: None,
+            monotonic_ns=fixture.monotonic_ns, wall_us=fixture.wall_us)
+        with patch('os.getenv', side_effect=AssertionError('credential lookup')), \
+             patch('hmac.new', side_effect=AssertionError('signing')), \
+             patch('threading.Thread', wraps=__import__('threading').Thread):
+            recorder = Recorder(fixture.store, fixture.public, monotonic_ns=fixture.monotonic_ns,
+                wall_us=fixture.wall_us, sleep=fixture.sleep, offline_reference=session)
+            result = recorder.run(RunConfig(mode='REFERENCE_REQUIRED'), should_stop=lambda: fixture.book_count>=2)
+        self.assertEqual(result.slots_finalized, 2)
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(fixture.rows('SELECT DISTINCT decode_status FROM reference_reports'), [{'decode_status': 'INVALID'}])
+        self.assertTrue(fixture.rows("SELECT * FROM reference_associations WHERE status='AMBIGUOUS'"))
+        self.assertFalse(fixture.rows('SELECT * FROM reference_associations WHERE available_live=1'))
+
+    def test_book_only_ignores_supplied_reference_session_without_threads(self):
+        fixture = self.fixture()
+        from polymarket_bot.recorder.service import Recorder
+        with patch('threading.Thread', side_effect=AssertionError('reference thread')), \
+             patch('os.getenv', side_effect=AssertionError('credential lookup')):
+            recorder = Recorder(fixture.store, fixture.public, monotonic_ns=fixture.monotonic_ns,
+                wall_us=fixture.wall_us, sleep=fixture.sleep, offline_reference=object())
+            result = recorder.run(RunConfig(), should_stop=lambda: fixture.book_count>=1)
+        self.assertEqual(result.exit_code, 0)
+        self.assertIsNone(recorder.reference_worker)
+
+    def test_offline_session_rechecks_mutated_gate_before_startup(self):
+        from polymarket_bot.recorder.reference import OfflineReferenceSession, ActivationEvidence
+        from polymarket_bot.recorder.models import CHAINLINK_FEED_ID
+        from polymarket_bot.recorder.service import Recorder
+        from dataclasses import replace
+        fixture = self.fixture()
+        session = OfflineReferenceSession(price_scale=8, decoder_revision='structural',
+            discovery_payload={'feedId': CHAINLINK_FEED_ID, 'name': 'BTC/USD-Streams-TWAP-60s-mainnet-production',
+                'schemaVersion': 2, 'decimals': 8, 'status': 'active'},
+            evidence=ActivationEvidence(True, True, True, True, True, True), latest=lambda deadline: None,
+            monotonic_ns=fixture.monotonic_ns, wall_us=fixture.wall_us)
+        session.evidence = replace(session.evidence, boundary_verified=False)
+        recorder = Recorder(fixture.store, fixture.public, monotonic_ns=fixture.monotonic_ns,
+            wall_us=fixture.wall_us, sleep=fixture.sleep, offline_reference=session)
+        result = recorder.run(RunConfig(mode='REFERENCE_REQUIRED'), should_stop=lambda: fixture.book_count>=1)
+        self.assertEqual(result.exit_code, 2)
+        self.assertEqual(fixture.requests, [])
+        self.assertEqual(fixture.rows('SELECT * FROM recording_runs'), [])
+
+    def test_offline_gap_provider_persists_once_without_schema_change(self):
+        from polymarket_bot.recorder.service import Recorder
+        from polymarket_bot.recorder.reference import OfflineReferenceSession, ActivationEvidence
+        from polymarket_bot.recorder.models import CHAINLINK_FEED_ID
+        fixture = self.fixture()
+        session = OfflineReferenceSession(price_scale=8, decoder_revision='structural',
+            discovery_payload={'feedId': CHAINLINK_FEED_ID, 'name': 'BTC/USD-Streams-TWAP-60s-mainnet-production',
+                'schemaVersion': 2, 'decimals': 8, 'status': 'active'},
+            evidence=ActivationEvidence(True, True, True, True, True, True), latest=lambda deadline: None,
+            monotonic_ns=fixture.monotonic_ns, wall_us=fixture.wall_us)
+        session.gaps = lambda: [(fixture.epoch_ns/1e9, fixture.epoch_ns/1e9+0.1)]
+        recorder = Recorder(fixture.store, fixture.public, monotonic_ns=fixture.monotonic_ns,
+            wall_us=fixture.wall_us, sleep=fixture.sleep, offline_reference=session)
+        recorder.run(RunConfig(mode='REFERENCE_REQUIRED'), should_stop=lambda: fixture.book_count>=3)
+        gaps = [r for r in fixture.rows('SELECT detail_json FROM recorder_events') if 'REFERENCE_CONNECTION_GAP' in r['detail_json']]
+        self.assertEqual(len(gaps), 1)
+
     def test_reference_required_refused_before_startup(self):
         fixture = self.fixture()
         result = self.run_recorder(fixture, config=RunConfig(mode="REFERENCE_REQUIRED"))

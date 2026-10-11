@@ -62,6 +62,7 @@ class ChainlinkRestClient:
         self._client_id, self._client_secret = validate_credentials(client_id, client_secret)
         self._monotonic = monotonic
         self._clock_seconds = clock_seconds
+        self.on_attempt = None
         self._client = httpx.Client(transport=transport, trust_env=False, follow_redirects=False)
 
     def close(self):
@@ -87,6 +88,9 @@ class ChainlinkRestClient:
         request = httpx.Request('GET', url, headers=headers,
                                 extensions={'timeout': {phase: min(remaining, 2.0)
                                             for phase in ('connect', 'read', 'write', 'pool')}})
+        started_ns = round(self._monotonic() * 1_000_000_000)
+        started_wall = round(self._clock_seconds() * 1_000_000)
+        body, status, complete, error_code = bytearray(), None, False, None
         try:
             self._client.cookies.clear()
             with closing(self._client.send(request, stream=True, follow_redirects=False)) as response:
@@ -116,15 +120,31 @@ class ChainlinkRestClient:
                         raise MarketDataError('response_too_large', 'Chainlink response exceeds 10 MiB.')
                     body.extend(chunk)
                 self._remaining(deadline)
+                complete = True
                 payload = load_numeric_json(bytes(body))
                 self._remaining(deadline)
                 return payload
+        except MarketDataError as exc:
+            error_code = exc.code
+            raise
         except httpx.TimeoutException:
+            error_code = 'chainlink_timeout'
             raise MarketDataError('chainlink_timeout', 'Chainlink transport timed out.') from None
         except httpx.HTTPError:
+            error_code = 'chainlink_http_error'
             raise MarketDataError('chainlink_http_error', 'Chainlink transport failed.') from None
         finally:
             self._client.cookies.clear()
+            if self.on_attempt is not None:
+                from polymarket_bot.market_data.http import HttpAttempt
+                operation = {'/api/v1/reports/latest': 'REFERENCE_LATEST',
+                             '/api/v1/reports': 'REFERENCE_LOOKUP',
+                             '/api/v1/reports/page': 'REFERENCE_PAGE'}[path]
+                self.on_attempt(HttpAttempt(operation, 'GET', path,
+                    ('feed_id=' + CHAINLINK_FEED_ID,), 1, started_ns,
+                    round(self._monotonic() * 1_000_000_000), started_wall,
+                    round(self._clock_seconds() * 1_000_000), status,
+                    'error' if error_code else 'success', error_code, bytes(body), complete))
 
     def get_latest_report(self, feed_id, deadline):
         validate_feed(feed_id)

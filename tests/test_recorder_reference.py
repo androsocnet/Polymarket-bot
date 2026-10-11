@@ -95,6 +95,65 @@ class ReferenceTests(unittest.TestCase):
         self.assertEqual(reference.reconcile_due_reference_boundaries(store, reader, NOW_US, 0,
             monotonic=lambda: 0), 0)
 
+    def test_rest_evidence_adapter_keeps_original_body_and_exact_timestamp(self):
+        import httpx
+        import json
+        from polymarket_bot.recorder.chainlink_rest import ChainlinkRestClient
+        reference = self.reference()
+        self.assertTrue(hasattr(reference, 'ReferenceRestEvidence'))
+        raw = b'{ "report": {"feedId":"' + models.CHAINLINK_FEED_ID.encode() + b'", "fullReport":"616263", "validFromTimestamp":1,"observationsTimestamp":2,"expiresAt":3,"benchmarkPrice":"100"}}'
+        sent = []
+        client = ChainlinkRestClient('https://api.dataengine.chain.link', 'synthetic-id', 'synthetic-secret',
+            httpx.MockTransport(lambda r: sent.append(r) or httpx.Response(200, content=raw)),
+            monotonic=lambda: 1, clock_seconds=lambda: NOW_US/1_000_000)
+        self.addCleanup(client.close)
+        reader = reference.ReferenceRestEvidence(client, run_id='offline', price_scale=8,
+            decoder_revision='structural', project=lambda ns: NOW_US, anchor_id=None)
+        row = models.ReferenceAssociationDraft(MARKET_ID, 'OPENING', WINDOW_START_US,
+            'PENDING', 'NOT_FETCHED', False, NOW_US, NOW_US)
+        fetch, reports = reader.fetch_boundary(row, 3)
+        self.assertEqual(sent[0].url.params['timestamp'], str(WINDOW_START_US//1_000_000))
+        self.assertEqual(fetch.raw_response, raw)
+        self.assertEqual(fetch.origin, 'HISTORICAL_LOOKUP')
+        self.assertEqual(reports[0].verification_status, 'UNVERIFIED')
+        self.assertEqual(reports[0].raw_signed_report, b'abc')
+
+    def test_boundary_due_queue_uses_latest_id_and_survives_reopen(self):
+        reference = self.reference()
+        store, run = self.database()
+        plan = reference.boundary_reference(MARKET_ID, 'OPENING', window_start_us=WINDOW_START_US,
+            window_end_us=WINDOW_START_US+900_000_000, learned_wall_us=NOW_US, learned_server_us=NOW_US)
+        store.save_reference_plan(plan)
+        store.save_reference_plan(replace(plan, learned_wall_us=NOW_US-1, next_due_us=NOW_US+60_000_000))
+        self.assertEqual(reference.due_reference_boundaries(store, NOW_US), ())
+        store.close()
+        reopened = RecorderStore.open(store.path)
+        self.addCleanup(reopened.close)
+        due = reference.due_reference_boundaries(reopened, NOW_US+60_000_000)
+        self.assertEqual(len(due), 1)
+        self.assertEqual(due[0].target_us, WINDOW_START_US)
+
+    def test_offline_live_buffer_empty_uses_fallback_and_fresh_buffer_skips_it(self):
+        reference = self.reference()
+        calls = []
+        fields = {'feedId': models.CHAINLINK_FEED_ID, 'fullReport': '616263',
+            'validFromTimestamp': 1, 'observationsTimestamp': 2, 'expiresAt': 3, 'benchmarkPrice': '100'}
+        session = reference.OfflineReferenceSession(price_scale=8, decoder_revision='structural',
+            discovery_payload={'feedId': models.CHAINLINK_FEED_ID, 'name': models.CHAINLINK_FEED_NAME,
+                'schemaVersion': 2, 'decimals': 8, 'status': 'active'},
+            evidence=reference.ActivationEvidence(True, True, True, True, True, True),
+            latest=lambda deadline: calls.append(deadline) or fields, live=lambda age, now: (b'abc', fields),
+            monotonic_ns=lambda: 1_000_000_000, wall_us=lambda: NOW_US)
+        row = models.ReferenceAssociationDraft(MARKET_ID, 'SLOT_CURRENT', NOW_US,
+            'UNAVAILABLE', 'NOT_FETCHED', False, NOW_US, NOW_US, slot_id=1)
+        result = session.fetch(row, 3, run_id='offline', anchor_id=None, project=lambda ns: NOW_US)
+        self.assertEqual(len(result[2]), 1)
+        self.assertEqual(result[2][0].raw_signed_report, b'abc')
+        self.assertEqual(calls, [])
+        session.live = lambda age, now: None
+        session.fetch(row, 3, run_id='offline', anchor_id=None, project=lambda ns: NOW_US)
+        self.assertEqual(calls, [3])
+
     def test_scale_and_source_times_are_independent_of_actual_receipt(self):
         with localcontext() as context:
             context.prec = 3
