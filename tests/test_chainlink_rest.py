@@ -11,9 +11,12 @@ from polymarket_bot.recorder.models import CHAINLINK_FEED_ID
 
 
 def make_valid_report_payload(report_bytes=b'signed-report', valid_from=100, obs=160, exp=220, price=6500012345678):
-    return {'report': {'feedId': CHAINLINK_FEED_ID, 'fullReport': report_bytes.hex(),
-                       'validFromTimestamp': valid_from, 'observationsTimestamp': obs,
-                       'expiresAt': exp, 'benchmarkPrice': str(price)}}
+    from tests.test_schema_v2_decoder import build_schema_v2_report_payload
+    payload, raw = build_schema_v2_report_payload(valid_from=valid_from,
+        observations=obs, expires=exp, price_int=price)
+    raw = report_bytes.ljust(96, b'\x00')[:96] + raw[96:]
+    payload['report']['fullReport'] = raw.hex() if report_bytes else ''
+    return payload
 
 
 class ChainlinkRestClientTests(unittest.TestCase):
@@ -49,7 +52,7 @@ class ChainlinkRestClientTests(unittest.TestCase):
             value = {'reports': [make_valid_report_payload()]} if request.url.path.endswith('/page') else make_valid_report_payload()
             return httpx.Response(200, json=value, headers={'Set-Cookie': 'session=secret'})
         reader = self.reader(handler)
-        self.assertEqual(reader.get_latest_report(CHAINLINK_FEED_ID, 102)[0], b'signed-report')
+        self.assertEqual(reader.get_latest_report(CHAINLINK_FEED_ID, 102)[0], bytes.fromhex(make_valid_report_payload()['report']['fullReport']))
         reader.get_report_at_timestamp(CHAINLINK_FEED_ID, 160, 102)
         self.assertEqual(len(reader.get_reports_page(CHAINLINK_FEED_ID, 100, 200, 1, 102)), 1)
         self.assertEqual(len(requests), 3)
@@ -113,7 +116,7 @@ class ChainlinkRestClientTests(unittest.TestCase):
         requests = []
         reader = self.reader(lambda r: requests.append(r) or httpx.Response(200, stream=Stream()))
         reader._monotonic = lambda: clock[0]
-        self.assertEqual(reader.get_latest_report(CHAINLINK_FEED_ID, 102)[0], b'signed-report')
+        self.assertEqual(reader.get_latest_report(CHAINLINK_FEED_ID, 102)[0], bytes.fromhex(make_valid_report_payload()['report']['fullReport']))
 
     def test_http_500_error_code(self):
         reader = self.reader(lambda r: httpx.Response(500))

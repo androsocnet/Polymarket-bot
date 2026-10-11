@@ -25,7 +25,12 @@ def build_schema_v2_report_payload(
     bid_int=6499000000000,
     ask_int=6501000000000,
 ):
-    signed_report = b"synthetic-signed-report-" + str(price_int).encode()
+    word = lambda value: (value % (1 << 256)).to_bytes(32, 'big')
+    feed = bytes.fromhex(feed_id[2:]) if len(feed_id) == 66 else bytes(32)
+    blob = feed + b''.join(word(value) for value in
+        (valid_from, observations, 0, 0, expires, price_int))
+    signed_report = (bytes(96) + word(224) + word(480) + word(544) + bytes(32)
+        + word(224) + blob + word(1) + word(1) + word(1) + word(2))
     report_blob = signed_report.hex()
     return {
         "report": {
@@ -42,6 +47,23 @@ def build_schema_v2_report_payload(
 
 
 class SchemaV2DecoderTests(unittest.TestCase):
+    def test_signed_content_without_envelope_fields(self):
+        payload, raw = build_schema_v2_report_payload()
+        result = decode_schema_v2_report({'fullReport': raw.hex()}, price_scale=8,
+            decoder_revision='abi-v2', receipt_wall_us=NOW_US, receipt_server_us=NOW_US)
+        self.assertEqual(result.decode_status, 'DECODED')
+        self.assertEqual(result.observations_seconds, 160)
+        self.assertEqual(result.decoded_price, Decimal('65000.12345678'))
+
+    def test_truncated_signed_content_rejected(self):
+        payload, raw = build_schema_v2_report_payload()
+        for size in (0, 31, 223, 255, 479, 575, len(raw)-1):
+            with self.subTest(size=size):
+                payload['report']['fullReport'] = raw[:size].hex()
+                result = decode_schema_v2_report(payload, price_scale=8,
+                    decoder_revision='abi-v2', receipt_wall_us=NOW_US, receipt_server_us=NOW_US)
+                self.assertEqual(result.decode_status, 'INVALID')
+
     def test_decode_valid_schema_v2_report(self):
         payload, raw_report = build_schema_v2_report_payload(price_int=6500012345678)
         result = decode_schema_v2_report(
@@ -281,15 +303,8 @@ class SchemaV2DecoderTests(unittest.TestCase):
         self.assertIsNone(result.decoded_price)
 
     def test_decode_flat_report_payload(self):
-        signed_report = b"flat-signed-report"
-        payload = {
-            "feedId": models.CHAINLINK_FEED_ID,
-            "fullReport": signed_report.hex(),
-            "validFromTimestamp": 100,
-            "observationsTimestamp": 160,
-            "expiresAt": 220,
-            "benchmarkPrice": "5000000000000",
-        }
+        nested, signed_report = build_schema_v2_report_payload(price_int=5000000000000)
+        payload = nested['report']
         result = decode_schema_v2_report(
             payload,
             price_scale=8,

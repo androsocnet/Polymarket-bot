@@ -176,6 +176,46 @@ def boundary_retry_due(target_us: int, *, attempt_count: int, now_us: int) -> in
     return now_us + delay_seconds * 1_000_000
 
 
+def decode_signed_report(raw: bytes) -> dict:
+    def invalid():
+        raise MarketDataError('invalid_reference_abi', 'Noncanonical or truncated signed report.')
+    if type(raw) is not bytes or len(raw) < 224 or len(raw) > 10_485_760 or len(raw) % 32:
+        invalid()
+    def word(offset):
+        if offset < 0 or offset + 32 > len(raw):
+            invalid()
+        return int.from_bytes(raw[offset:offset+32], 'big')
+    cursor = 224
+    segments = []
+    for position, is_blob in ((96, True), (128, False), (160, False)):
+        if word(position) != cursor:
+            invalid()
+        count = word(cursor)
+        if (is_blob and count != 224) or (not is_blob and not 1 <= count <= 32):
+            invalid()
+        size = count if is_blob else count * 32
+        end = cursor + 32 + size
+        if end > len(raw):
+            invalid()
+        segments.append(raw[cursor+32:end])
+        cursor = end
+    if cursor != len(raw) or len(segments[1]) != len(segments[2]):
+        invalid()
+    blob = segments[0]
+    values = [int.from_bytes(blob[i:i+32], 'big') for i in range(0, 224, 32)]
+    for index, bits in ((1, 32), (2, 32), (3, 192), (4, 192), (5, 32)):
+        if values[index] >= 1 << bits:
+            invalid()
+    price = int.from_bytes(blob[192:224], 'big', signed=True)
+    if not -(1 << 191) <= price < (1 << 191):
+        invalid()
+    feed = '0x' + blob[:32].hex()
+    if feed != CHAINLINK_FEED_ID:
+        raise MarketDataError('invalid_reference_identity', 'Signed feed identity mismatch.')
+    return dict(feed_id=feed, valid_from_seconds=values[1], observations_seconds=values[2],
+        expires_at_seconds=values[5], price_integer=price)
+
+
 def decode_schema_v2_report(payload: object, *, price_scale: int | None,
                             decoder_revision: str | None,
                             receipt_wall_us: int,
@@ -207,10 +247,6 @@ def decode_schema_v2_report(payload: object, *, price_scale: int | None,
         if not isinstance(report, dict):
             raise MarketDataError("invalid_reference_payload", "Inner report must be a dict.")
 
-        raw_feed_id = str(report.get("feedId") or report.get("feed_id") or "").strip().lower()
-        if raw_feed_id != CHAINLINK_FEED_ID.lower():
-            raise MarketDataError("invalid_reference_identity", "Feed ID mismatch in report.")
-
         full_report_hex = report.get("fullReport") or report.get("full_report")
         if not isinstance(full_report_hex, str) or not full_report_hex:
             raise MarketDataError("invalid_reference_payload", "Missing fullReport hex field.")
@@ -227,22 +263,23 @@ def decode_schema_v2_report(payload: object, *, price_scale: int | None,
         if len(raw_signed_report) > 10_485_760:
             raise MarketDataError("invalid_reference", "Raw report exceeds the evidence budget.")
 
-        for api_key, field_name in (
-            (("validFromTimestamp", "valid_from_timestamp", "valid_from"), "valid_from_seconds"),
-            (("observationsTimestamp", "observations_timestamp", "observations"), "observations_seconds"),
-            (("expiresAt", "expires_at", "expires"), "expires_at_seconds"),
+        signed = decode_signed_report(raw_signed_report)
+        for aliases, name in (
+            (('feedId', 'feed_id'), 'feed_id'),
+            (('validFromTimestamp', 'valid_from_timestamp', 'valid_from'), 'valid_from_seconds'),
+            (('observationsTimestamp', 'observations_timestamp', 'observations'), 'observations_seconds'),
+            (('expiresAt', 'expires_at', 'expires'), 'expires_at_seconds'),
+            (('benchmarkPrice', 'benchmark_price', 'price'), 'price_integer'),
         ):
-            raw_value = None
-            for key in api_key:
-                if key in report:
-                    raw_value = report[key]
-                    break
-            times[field_name] = parse_integer(raw_value, field=field_name, minimum=0, maximum=253_402_300_799)
+            for key in aliases:
+                if key in report and str(report[key]).lower() != str(signed[name]).lower():
+                    raise MarketDataError('invalid_reference_identity', 'Envelope conflicts with signed content.')
+        times.update({name: signed[name] for name in times})
 
         if not times["valid_from_seconds"] <= times["observations_seconds"] <= times["expires_at_seconds"]:
             raise MarketDataError("invalid_reference_interval", "Invalid report time interval.")
 
-        price_str = report.get("benchmarkPrice") or report.get("benchmark_price") or report.get("price")
+        price_str = signed['price_integer']
         if price_str is None:
             raise MarketDataError("invalid_numeric", "Missing benchmark price in report.")
 

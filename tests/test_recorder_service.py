@@ -745,9 +745,10 @@ class RecorderServiceTests(unittest.TestCase):
         for offset, delay, reason in ((-10, 0, 'STALE_REFERENCE'), (0, 3, 'LATE_REFERENCE')):
             fixture = self.fixture()
             def live(age, now):
-                return (str(int(now)).encode(), {'feedId': CHAINLINK_FEED_ID,
-                    'validFromTimestamp': int(now)-60, 'observationsTimestamp': int(now)+offset,
-                    'expiresAt': int(now)+60, 'benchmarkPrice': '100'})
+                from tests.test_schema_v2_decoder import build_schema_v2_report_payload
+                payload, signed = build_schema_v2_report_payload(valid_from=int(now)-60,
+                    observations=int(now)+offset, expires=int(now)+60, price_int=100)
+                return signed, payload['report']
             session = self.review_session(fixture, latest=lambda d: None, live=live)
             def slow(request, payload, f):
                 if request.url.path == '/books':

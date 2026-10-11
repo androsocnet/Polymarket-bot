@@ -101,7 +101,9 @@ class ReferenceTests(unittest.TestCase):
         from polymarket_bot.recorder.chainlink_rest import ChainlinkRestClient
         reference = self.reference()
         self.assertTrue(hasattr(reference, 'ReferenceRestEvidence'))
-        raw = b'{ "report": {"feedId":"' + models.CHAINLINK_FEED_ID.encode() + b'", "fullReport":"616263", "validFromTimestamp":1,"observationsTimestamp":2,"expiresAt":3,"benchmarkPrice":"100"}}'
+        from tests.test_schema_v2_decoder import build_schema_v2_report_payload
+        payload, signed = build_schema_v2_report_payload(valid_from=1, observations=2, expires=3, price_int=100)
+        raw = json.dumps(payload, indent=2).encode()
         sent = []
         client = ChainlinkRestClient('https://api.dataengine.chain.link', 'synthetic-id', 'synthetic-secret',
             httpx.MockTransport(lambda r: sent.append(r) or httpx.Response(200, content=raw)),
@@ -116,7 +118,7 @@ class ReferenceTests(unittest.TestCase):
         self.assertEqual(fetch.raw_response, raw)
         self.assertEqual(fetch.origin, 'HISTORICAL_LOOKUP')
         self.assertEqual(reports[0].verification_status, 'UNVERIFIED')
-        self.assertEqual(reports[0].raw_signed_report, b'abc')
+        self.assertEqual(reports[0].raw_signed_report, signed)
 
     def test_boundary_due_queue_uses_latest_id_and_survives_reopen(self):
         reference = self.reference()

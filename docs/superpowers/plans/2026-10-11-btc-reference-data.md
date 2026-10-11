@@ -191,6 +191,16 @@
 - **CP4:** Safe Runtime Validation (refusal check without credentials, public Discovery verification only)
 - **CP5:** Authenticated 15-Minute Pilot (separately authorized live pilot)
 
+## Authoritative CP3 remediation rulings (2026-10-12)
+
+User authority supersedes earlier continuation rulings below: both exact integer-second boundaries use inclusive signed `validFrom <= T <= observations`; gap-absorbing observations after T are historical only, never backdated live. Missing reports retain pending retries; multiple distinct containing hashes fail closed as ambiguous. No rounding. Structurally decoded UNVERIFIED evidence may be timely live availability without DON verification; live coverage measures point-in-time availability, with verification counts separate. Managed production lifecycle must gate permission before credential factories, validate and persist Discovery identity, manage REST/WS and workers, and clean up startup failures and shutdown. BOOK_ONLY creates no credential resources. Schema v1 remains unchanged. No runtime network, actual credentials, CP4, trading, push or merge authorized by this remediation.
+
+Decoder reference: official SDK commit `a97b40369b3af22e8bc416602d3298c96399af3f`, `go/report/report.go`, outer ABI `bytes32[3],bytes,bytes32[],bytes32[],bytes32`. Current SDK `go/report/v2/data.go` uses uint64 timestamp words; requested pinned-feed remediation deliberately enforces narrower uint32 bounds, compatible for uint32 values. Synthetic local vectors explicitly contain fabricated context/signatures, not authenticated DON evidence.
+
+Decoder remediation: canonical contiguous outer ABI, exact seven-word report blob, bounded signature arrays with equal lengths, canonical uint32/uint192/int192 words, signed feed identity and signed timestamps/price authoritative; envelope conflicts invalid. Full raw report hash preserved, verification remains UNVERIFIED. RED: absent envelope fields and truncation accepted/rejected incorrectly. GREEN: 19 decoder tests; exact full offline command 433 tests in 231.977 seconds OK. Transport/service fixtures migrated from arbitrary ASCII to synthetic canonical ABI without removing assertions.
+
+Remaining ordinary engineering: inclusive boundary selection/reconciliation, availability/store/metric rulings, managed production lifecycle, comprehensive malformed/vector and lifecycle coverage, independent Gate C review. These are not design blockers. No completion claim for CP3. No configured lint/typecheck commands in pyproject.toml; no lint/typecheck run.
+
 ## CP3 continuation ledger
 
 Base: b5fef873a2efa454c162fec526254099130d31f8. Scope: offline partial implementation only; independent review pending.
