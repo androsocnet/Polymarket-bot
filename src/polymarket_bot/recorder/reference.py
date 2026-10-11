@@ -289,6 +289,47 @@ def decode_schema_v2_report(payload: object, *, price_scale: int | None,
     )
 
 
+def reconcile_due_reference_boundaries(store, rest_client, now_server_us, deadline, *,
+                                       monotonic=None, selection_policy=None,
+                                       policy_revision=None, limit=2):
+    import time
+    from dataclasses import replace
+    monotonic = monotonic or time.monotonic
+    if monotonic() >= deadline:
+        return 0
+    rows = store._rows("SELECT * FROM reference_associations WHERE role IN ('OPENING','CLOSING') ORDER BY association_id")
+    drafts = tuple(ReferenceAssociationDraft(**{name: row[name] for name in
+        ReferenceAssociationDraft.__dataclass_fields__ if name != 'report_hash'}) for row in rows)
+    completed = 0
+    for row in reference_due_work(drafts, now_us=now_server_us, limit=limit):
+        if monotonic() >= deadline:
+            break
+        fetch, reports = rest_client.fetch_boundary(row, deadline)
+        selected = selection_policy(reports, row.target_us) if selection_policy and policy_revision else None
+        if selected is not None and selected not in reports:
+            raise ValueError("Boundary policy selected evidence outside retrieval.")
+        reason = 'BOUNDARY_POLICY_UNVERIFIED' if not selection_policy or not policy_revision else 'BOUNDARY_PENDING'
+        status = 'AMBIGUOUS' if reason == 'BOUNDARY_POLICY_UNVERIFIED' else 'PENDING'
+        if selected is not None:
+            status, reason = 'UNAVAILABLE', 'DON_UNVERIFIED'
+            if selected.decode_status != 'DECODED':
+                reason = 'INVALID_REFERENCE'
+            elif selected.verification_status == 'VERIFIED':
+                status, reason = 'AVAILABLE', None
+        if monotonic() >= deadline:
+            status, reason = 'UNAVAILABLE', 'LATE_REFERENCE'
+        learned = fetch.received_server_us
+        association = replace(row, status=status, origin='HISTORICAL_LOOKUP', available_live=False,
+            learned_wall_us=fetch.attempt.ended_wall_us, learned_server_us=learned,
+            fetch_id=None, report_id=None, report_hash=selected.report_hash if selected else None,
+            selection_policy_revision=policy_revision, reason=reason, attempt_count=row.attempt_count + 1,
+            next_due_us=None if status == 'AVAILABLE' else boundary_retry_due(row.target_us,
+                attempt_count=row.attempt_count + 1, now_us=max(now_server_us, learned or now_server_us)))
+        store.save_reference_evidence(fetch, reports, (association,))
+        completed += 1
+    return completed
+
+
 def reference_page_plan(*, reports_per_call: int = 100, calls: int = 2) -> tuple[int, ...]:
     """Bounded inert page sizes for later short-gap repair, with no requests."""
     if (type(reports_per_call) is not int or not 1 <= reports_per_call <= 100

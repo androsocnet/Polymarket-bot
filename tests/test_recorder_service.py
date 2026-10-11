@@ -479,6 +479,26 @@ class RecorderServiceTests(unittest.TestCase):
         self.assertEqual((result.exit_code, result.reason), (1, "fatal_invariant"))
         self.assertEqual(fixture.book_count, 1)
 
+    def test_reference_worker_never_blocks_book_owner_or_writes_sqlite(self):
+        import threading
+        from polymarket_bot.recorder import service
+        self.assertTrue(hasattr(service, 'ReferenceWorker'))
+        entered, release = threading.Event(), threading.Event()
+        def slow():
+            entered.set()
+            release.wait(2)
+            return 'evidence'
+        worker = service.ReferenceWorker()
+        self.addCleanup(release.set)
+        self.assertTrue(worker.submit(slow))
+        self.assertTrue(entered.wait(1))
+        self.assertIsNone(worker.take())
+        self.assertFalse(worker.submit(slow))
+        release.set()
+        worker.stop(timeout=2)
+        self.assertEqual(worker.take(), 'evidence')
+        self.assertFalse(worker.submit(slow))
+
     def test_reference_required_refused_before_startup(self):
         fixture = self.fixture()
         result = self.run_recorder(fixture, config=RunConfig(mode="REFERENCE_REQUIRED"))

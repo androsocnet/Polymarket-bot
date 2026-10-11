@@ -291,6 +291,16 @@ class RecorderMetricsTests(unittest.TestCase):
         report = metrics.measure(store,start_us=NOW_US,end_us=NOW_US)
         self.assertTrue(all(value is None for value in report.status_percentages.values()))
 
+    def test_research_collection_does_not_inflate_verified_coverage(self):
+        store, run = self.fixture()
+        slot = self.slot(store, run, 150, 'COMPLETE')
+        self.reference(store, run, slot, verified='UNVERIFIED')
+        report = self.metrics().measure(store, start_us=NOW_US, end_us=NOW_US+2_000_000)
+        self.assertEqual(report.reference_coverage['live_slots'], 0)
+        self.assertEqual(report.reference_coverage['research_collected_reports'], 1)
+        self.assertEqual(report.reference_coverage['don_unverified_reports'], 1)
+        self.assertEqual(report.reference_coverage['cryptographically_verified_reports'], 0)
+
     def test_percentiles_and_disabled_reference(self):
         metrics = self.metrics()
         store, run_id = self.fixture()

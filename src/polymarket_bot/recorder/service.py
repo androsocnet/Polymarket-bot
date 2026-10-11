@@ -17,6 +17,55 @@ from .schedule import classify_wake, select_future_slot, slot_grid
 from .store import RecorderStore, RecorderStoreError
 
 
+class ReferenceWorker:
+    def __init__(self):
+        import threading
+        self._lock = threading.Lock()
+        self._thread = None
+        self._result = None
+        self._error = None
+        self._stopped = False
+
+    def submit(self, operation):
+        import threading
+        with self._lock:
+            if self._stopped or self._thread is not None:
+                return False
+            def run():
+                try:
+                    result = operation()
+                except Exception as exc:
+                    with self._lock:
+                        self._error = exc
+                else:
+                    with self._lock:
+                        self._result = result
+            self._thread = threading.Thread(target=run, name='reference-fetch', daemon=False)
+            self._thread.start()
+            return True
+
+    def take(self):
+        with self._lock:
+            if self._thread is None or self._thread.is_alive():
+                return None
+            self._thread.join()
+            self._thread = None
+            result, error = self._result, self._error
+            self._result = self._error = None
+        if error is not None:
+            raise error
+        return result
+
+    def stop(self, timeout=5):
+        with self._lock:
+            self._stopped = True
+            thread = self._thread
+        if thread is not None:
+            thread.join(timeout)
+            if thread.is_alive():
+                raise MarketDataError('reference_shutdown_failed', 'Reference worker remains active; owner must retain lifecycle handle.')
+
+
 class _StopRequested(Exception):
     """Internal normal-stop signal raised before an actual HTTP attempt."""
 

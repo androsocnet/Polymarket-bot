@@ -190,3 +190,21 @@
 - **CP3:** Full Recorder Integration / Gate C (Tasks 6–8: boundary reconciler, service integration, metrics & security audit)
 - **CP4:** Safe Runtime Validation (refusal check without credentials, public Discovery verification only)
 - **CP5:** Authenticated 15-Minute Pilot (separately authorized live pilot)
+
+## CP3 continuation ledger
+
+Base: b5fef873a2efa454c162fec526254099130d31f8. Scope: offline partial implementation only; independent review pending.
+
+Ruling: preserve legacy VERIFIED eligibility and never generate VERIFIED — user continuation explicitly requires UNVERIFIED structural evidence to remain unavailable; cost: no verified live coverage from this collector.
+Ruling: boundary selection is injected with a policy revision; absent policy records AMBIGUOUS, no selection records PENDING — no verified Polymarket policy supplied; cost: unresolved boundaries remain due.
+Ruling: live service and CLI remain refused — missing signed-binary decoder and verified boundary gates; this does not excuse missing offline integration, which remains outstanding.
+
+Task 6 partial: dormant reconciler persists injected retrieval evidence, exact historical targets, UNAVAILABLE/DON_UNVERIFIED and retry schedule. RED observed missing reconciler assertion; focused GREEN observed persisted raw/report status and retry. The injected reader exposes fetch_boundary; real ChainlinkRestClient adapter is not yet supplied. Synchronous reconciler is not hooked into housekeeping; it does not guarantee nonblocking capture. Missing transport errors/malformed/delayed/restart integration coverage remains work, not a verified feature.
+
+Task 7 partial: single-flight ReferenceWorker has nonblocking take, bounded join, retained active handle on shutdown failure, and no built-in SQLite access. RED observed missing worker assertion; GREEN full suite observed. Worker remains unwired to Recorder. Offline gated service, slot capture/fallback, boundary scheduling and connection-gap persistence remain outstanding. BOOK_ONLY unchanged and runtime REFERENCE_REQUIRED refuses.
+
+Task 8 partial: metrics separate decoded research-collected, DON-unverified and cryptographically-verified report counts from legacy verified live coverage. Counts are cumulative as of report end, not interval collection counts. RED metric run emitted missing-key ERROR (not assertion failure); full GREEN observed. Existing security tests retained; no new integrated security audit yet.
+
+Verification: exact user full offline unittest command ran 410 tests in 212.029 seconds, OK; baseline previously 407 tests. No existing tests deleted or weakened. No configured lint/typecheck command in pyproject.toml or README. No network, credential loading, installs, live runtime, CP4, push or merge.
+
+Author review: partial only. Independent reviewer unavailable; parent dispatch required. Review new reconciler trust boundary, unbounded queue read, reader interface mismatch, policy validation, evidence learning times, worker cleanup and missing service integration first. CP3 BLOCKED/PARTIAL; no checkpoint PASS or strategy-complete claim.

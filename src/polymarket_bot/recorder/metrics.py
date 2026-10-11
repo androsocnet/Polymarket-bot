@@ -198,7 +198,14 @@ def _references(store, eligible, slots, markets, runs, end_us):
                 and (market["market_id"],"OPENING") in boundaries
                 and (market["market_id"],"CLOSING") in boundaries):
             covered_windows += 1
-    return dict(live_slots=len(live),live_percent=_percent(len(live),len(eligible)),
+    research = store._one("""SELECT COUNT(*) AS collected,
+        COALESCE(SUM(verification_status='UNVERIFIED'),0) AS unverified,
+        COALESCE(SUM(verification_status='VERIFIED'),0) AS verified
+        FROM reference_reports WHERE first_received_wall_us<=? AND decode_status='DECODED'""", (end_us,))
+    return dict(research_collected_reports=research['collected'],
+                don_unverified_reports=research['unverified'],
+                cryptographically_verified_reports=research['verified'],
+                live_slots=len(live),live_percent=_percent(len(live),len(eligible)),
                 paired_slots=len(live & complete),paired_denominator=len(complete),
                 paired_percent=_percent(len(live & complete),len(complete)),
                 opening_count=sum(role=="OPENING" for _,role in boundaries),

@@ -67,6 +67,34 @@ class ReferenceTests(unittest.TestCase):
             "price_integer": "6000012345678"}, price_scale=scale, decoder_revision=revision,
             received_wall_us=receipt + 123, received_server_us=receipt)
 
+    def test_boundary_reconciler_retains_unverified_and_retries_exact_target(self):
+        reference = self.reference()
+        self.assertTrue(hasattr(reference, "reconcile_due_reference_boundaries"))
+        store, run = self.database()
+        plan = reference.boundary_reference(MARKET_ID, "OPENING",
+            window_start_us=WINDOW_START_US, window_end_us=WINDOW_START_US + 900_000_000,
+            learned_wall_us=NOW_US, learned_server_us=NOW_US)
+        store.save_reference_plan(plan)
+        fetch = self.fetch(run)
+        report = self.normalize()
+        class Reader:
+            def fetch_boundary(self, row, deadline):
+                self.target = row.target_us
+                return fetch, (report,)
+        reader = Reader()
+        count = reference.reconcile_due_reference_boundaries(store, reader, NOW_US, 10,
+            monotonic=lambda: 0, selection_policy=lambda reports, target: reports[0],
+            policy_revision="offline-policy")
+        self.assertEqual(count, 1)
+        self.assertEqual(reader.target, WINDOW_START_US)
+        row = store._one("SELECT * FROM reference_associations ORDER BY association_id DESC LIMIT 1")
+        self.assertEqual((row["status"], row["origin"], row["available_live"], row["reason"]),
+                         ("UNAVAILABLE", "HISTORICAL_LOOKUP", 0, "DON_UNVERIFIED"))
+        self.assertEqual(row["next_due_us"], NOW_US + 60_000_000)
+        self.assertEqual(store._one("SELECT verification_status FROM reference_reports")["verification_status"], "UNVERIFIED")
+        self.assertEqual(reference.reconcile_due_reference_boundaries(store, reader, NOW_US, 0,
+            monotonic=lambda: 0), 0)
+
     def test_scale_and_source_times_are_independent_of_actual_receipt(self):
         with localcontext() as context:
             context.prec = 3
