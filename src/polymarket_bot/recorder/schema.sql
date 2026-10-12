@@ -2,7 +2,7 @@ CREATE TABLE recording_runs (
     run_id TEXT PRIMARY KEY NOT NULL,
     started_wall_us INTEGER NOT NULL,
     ended_wall_us INTEGER,
-    mode TEXT NOT NULL CHECK (mode IN ('BOOK_ONLY', 'REFERENCE_REQUIRED')),
+    mode TEXT NOT NULL CHECK (mode IN ('BOOK_ONLY', 'REFERENCE_REQUIRED', 'APPROXIMATE_REFERENCE')),
     reference_activation TEXT NOT NULL CHECK (reference_activation IN ('DISABLED', 'VERIFIED')),
     state TEXT NOT NULL CHECK (state IN ('RUNNING', 'STOPPED', 'FAILED', 'INTERRUPTED')),
     app_revision TEXT NOT NULL,

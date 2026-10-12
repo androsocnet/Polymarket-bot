@@ -18,6 +18,7 @@ from .models import (CHAINLINK_FEED_ID, CHAINLINK_FEED_NAME, ClockAnchor, RunCon
                      MarketRevision, ReferenceFetchDraft, ReferenceReportDraft,
                      ResolutionObservation, SlotCommit, SlotTarget)
 from .metadata import _normalize_clob_numbers, _selected_market
+from .free_reference import ApproximateObservation, ApproximateReferenceReport
 
 
 MAX_EVIDENCE_BYTES = 10 * 1024 * 1024
@@ -376,8 +377,8 @@ class RecorderStore:
                 _require(pinned is None or pinned['price_scale'] is None or
                     (pinned['price_scale'] == offline_reference.price_scale and pinned['decoder_revision'] == offline_reference.decoder_revision),
                     'Discovery conflicts with persisted reference pin.')
-        _require(isinstance(config, RunConfig) and (config.mode == "BOOK_ONLY" or offline) and type(config.use_fast_path) is bool,
-                 "Only BOOK_ONLY can start without verified reference activation gates.")
+        _require(isinstance(config, RunConfig) and (config.mode in ("BOOK_ONLY", "APPROXIMATE_REFERENCE") or offline) and type(config.use_fast_path) is bool,
+                 "Only BOOK_ONLY or APPROXIMATE_REFERENCE can start without verified reference activation gates.")
         _integer(wall_us, "started_wall_us")
         _require(isinstance(app_revision, str) and bool(app_revision), "Application revision is required.")
         run_id = str(uuid4())
@@ -1268,3 +1269,107 @@ and (fetch.attempt.path == '/ws/v1' or association.target_us <= fetch.received_s
                 self._connection.execute("""UPDATE recording_runs SET state='INTERRUPTED',ended_wall_us=?,
                     exit_reason=? WHERE state='RUNNING'""" + (" AND run_id=?" if run_id is not None else ""),
                     (wall_us, reason, run_id) if run_id is not None else (wall_us, reason))
+
+    def save_approximate_observation(
+        self, run_id: str, observation: ApproximateObservation
+    ) -> int:
+        """Insert into approximate_observations. Returns observation_id."""
+        self._check_writer()
+        _require(isinstance(observation, ApproximateObservation), "Approximate observation record is required.")
+        _require(observation.provider and observation.pair and observation.quote_currency,
+                 "Approximate observation requires provider, pair, and quote_currency.")
+        _require(observation.result in ("success", "error"), "Observation result must be success or error.")
+        _require(type(observation.receipt_wall_us) is int and observation.receipt_wall_us >= 0,
+                 "Observation receipt_wall_us must be a non-negative integer.")
+        if observation.receipt_server_us is not None:
+            _require(type(observation.receipt_server_us) is int and observation.receipt_server_us >= 0,
+                     "Observation receipt_server_us must be a non-negative integer.")
+        if observation.source_timestamp_us is not None:
+            _require(type(observation.source_timestamp_us) is int and observation.source_timestamp_us >= 0,
+                     "Observation source_timestamp_us must be a non-negative integer.")
+        _require(type(observation.raw_payload_size) is int and 0 <= observation.raw_payload_size <= 10_485_760,
+                 "Observation raw_payload_size out of bounds.")
+        _require(type(observation.raw_payload_hash) is str and 1 <= len(observation.raw_payload_hash) <= 64,
+                 "Observation raw_payload_hash must be a non-empty string.")
+        _require(type(observation.transport_type) is str and observation.transport_type in ("rest", "ws"),
+                 "Observation transport_type must be rest or ws.")
+        _require(type(observation.parser_revision) is str and 1 <= len(observation.parser_revision) <= 64,
+                 "Observation parser_revision must be a non-empty string.")
+        if observation.http_status is not None:
+            _require(type(observation.http_status) is int and 100 <= observation.http_status <= 599,
+                     "Observation http_status out of range.")
+        if observation.error_code is not None:
+            _require(type(observation.error_code) is str and 1 <= len(observation.error_code) <= 64,
+                     "Observation error_code must be a non-empty string.")
+
+        price_text = decimal_text(observation.price)
+        bid_price_text = decimal_text(observation.bid_price) if observation.bid_price is not None else None
+        ask_price_text = decimal_text(observation.ask_price) if observation.ask_price is not None else None
+
+        with self._transaction():
+            self._run(run_id)
+            return self._insert("approximate_observations", dict(
+                run_id=run_id,
+                provider=observation.provider,
+                pair=observation.pair,
+                quote_currency=observation.quote_currency,
+                price_text=price_text,
+                bid_price_text=bid_price_text,
+                ask_price_text=ask_price_text,
+                source_timestamp_us=observation.source_timestamp_us,
+                receipt_wall_us=observation.receipt_wall_us,
+                receipt_server_us=observation.receipt_server_us,
+                raw_payload_hash=observation.raw_payload_hash,
+                raw_payload_size=observation.raw_payload_size,
+                transport_type=observation.transport_type,
+                parser_revision=observation.parser_revision,
+                http_status=observation.http_status,
+                result=observation.result,
+                error_code=observation.error_code
+            ))
+
+    def save_approximate_reference(
+        self, run_id: str, report: ApproximateReferenceReport
+    ) -> int:
+        """Insert into approximate_references. Returns reference_id."""
+        self._check_writer()
+        _require(isinstance(report, ApproximateReferenceReport), "Approximate reference report is required.")
+        _require(report.reference_kind == "APPROXIMATE_SAMPLE_MEAN_60S",
+                 "Reference kind must be APPROXIMATE_SAMPLE_MEAN_60S.")
+        _require(report.mode == "APPROXIMATE", "Reference mode must be APPROXIMATE.")
+        _require(report.verification_status == "UNVERIFIED",
+                 "Approximate reference verification_status must be UNVERIFIED.")
+        _require(type(report.window_start_us) is int and report.window_start_us >= 0,
+                 "Reference window_start_us must be a non-negative integer.")
+        _require(type(report.window_end_us) is int and report.window_end_us >= report.window_start_us,
+                 "Reference window_end_us must be >= window_start_us.")
+        _require(type(report.observation_count) is int and report.observation_count >= 0,
+                 "Reference observation_count must be a non-negative integer.")
+        _require(type(report.source_provider) is str, "Reference source_provider must be a string.")
+        _require(type(report.was_fallback) is bool, "Reference was_fallback must be a boolean.")
+        _require(type(report.receipt_wall_us) is int and report.receipt_wall_us >= 0,
+                 "Reference receipt_wall_us must be a non-negative integer.")
+        if report.receipt_server_us is not None:
+            _require(type(report.receipt_server_us) is int and report.receipt_server_us >= 0,
+                     "Reference receipt_server_us must be a non-negative integer.")
+
+        value_text = decimal_text(report.value) if report.value is not None else None
+        diagnostics_json = _json(report.diagnostics) if report.diagnostics else "[]"
+
+        with self._transaction():
+            self._run(run_id)
+            return self._insert("approximate_references", dict(
+                run_id=run_id,
+                mode=report.mode,
+                reference_kind=report.reference_kind,
+                value_text=value_text,
+                window_start_us=report.window_start_us,
+                window_end_us=report.window_end_us,
+                observation_count=report.observation_count,
+                source_provider=report.source_provider,
+                was_fallback=int(report.was_fallback),
+                verification_status=report.verification_status,
+                receipt_wall_us=report.receipt_wall_us,
+                receipt_server_us=report.receipt_server_us,
+                diagnostics_json=diagnostics_json
+            ))
