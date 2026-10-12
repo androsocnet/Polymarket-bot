@@ -66,6 +66,55 @@ class ReferenceWorker:
                 raise MarketDataError('reference_shutdown_failed', 'Reference worker remains active; owner must retain lifecycle handle.')
 
 
+class ApproximateReferenceWorker:
+    def __init__(self):
+        import threading
+        self._lock = threading.Lock()
+        self._thread = None
+        self._result = None
+        self._error = None
+        self._stopped = False
+
+    def submit(self, operation):
+        import threading
+        with self._lock:
+            if self._stopped or self._thread is not None:
+                return False
+            def run():
+                try:
+                    result = operation()
+                except Exception as exc:
+                    with self._lock:
+                        self._error = exc
+                else:
+                    with self._lock:
+                        self._result = result
+            self._thread = threading.Thread(target=run, name='approximate-reference-fetch', daemon=False)
+            self._thread.start()
+            return True
+
+    def take(self):
+        with self._lock:
+            if self._thread is None or self._thread.is_alive():
+                return None
+            self._thread.join()
+            self._thread = None
+            result, error = self._result, self._error
+            self._result = self._error = None
+        if error is not None:
+            raise error
+        return result
+
+    def stop(self, timeout=5):
+        with self._lock:
+            self._stopped = True
+            thread = self._thread
+        if thread is not None:
+            thread.join(timeout)
+            if thread.is_alive():
+                raise MarketDataError('approximate_reference_shutdown_failed', 'Approximate reference worker remains active; owner must retain lifecycle handle.')
+
+
 class _StopRequested(Exception):
     """Internal normal-stop signal raised before an actual HTTP attempt."""
 
@@ -78,9 +127,12 @@ def _epoch_us(value):
 class Recorder:
     def __init__(self, store: RecorderStore, public: PublicGet, *,
                  monotonic_ns: Callable[[], int], wall_us: Callable[[], int],
-                 sleep: Callable[[float], None], offline_reference=None):
+                 sleep: Callable[[float], None], offline_reference=None,
+                 approximate_reference=None):
         self.offline_reference = offline_reference
+        self.approximate_reference = approximate_reference
         self.reference_worker = None
+        self.approximate_worker = None
         self.reference_gap_end = None
         self.reference_plan_cursor = ''
         self.store, self.public = store, public
@@ -209,6 +261,33 @@ class Recorder:
                     durable_server_us=self._now() if self.clock.usable() else None))
         if fetch.error_code in ('chainlink_auth_failed', 'websocket_failed'):
             raise MarketDataError(fetch.error_code, 'Reference permission or worker gate lost.')
+
+    def _approximate_drain(self, *, stopping=False, result=None):
+        if self.approximate_worker is None:
+            return
+        try:
+            result = self.approximate_worker.take() if result is None else result
+        except MarketDataError:
+            raise
+        except Exception:
+            raise MarketDataError('approximate_reference_worker_failed', 'Approximate reference worker failed.') from None
+        if result is None:
+            return
+        report, observations = result
+        for observation in observations:
+            self.store.save_approximate_observation(self.run_id, observation)
+        self.store.save_approximate_reference(self.run_id, report)
+
+    def _approximate_submit(self, deadline_ns):
+        if self.approximate_worker is None or not self.clock.usable() or self.monotonic_ns() >= deadline_ns:
+            return False
+        anchor, run_id = self.clock.anchor, self.run_id
+        anchor_id = self.anchor_id
+        deadline = self.wall_us()/1_000_000 + (deadline_ns-self.monotonic_ns())/1_000_000_000
+        project = lambda ns: anchor.server_us + (ns-anchor.midpoint_ns)//1000
+        return self.approximate_worker.submit(lambda: self.approximate_reference.fetch(
+            run_id=run_id, anchor_id=anchor_id, project=project,
+            deadline=deadline))
 
     def _reference_housekeeping(self, deadline_ns):
         if self.reference_worker is None or not self.clock.usable() or self.monotonic_ns() >= deadline_ns:
@@ -454,7 +533,17 @@ class Recorder:
 
     def _execute_started_run(self, config, *, should_stop):
         from .reference import OfflineReferenceSession
-        if config.mode != "BOOK_ONLY" and (config.mode != 'REFERENCE_REQUIRED'
+        if config.mode == "REFERENCE_REQUIRED" and self.approximate_reference is not None:
+            self.store.close()
+            return RunResult("", "FAILED", 2, 0, "mixed_modes_rejected")
+        if config.mode == "APPROXIMATE_REFERENCE":
+            if self.approximate_reference is None:
+                self.store.close()
+                return RunResult("", "FAILED", 2, 0, "approximate_session_required")
+            if self.store._connection.execute('PRAGMA user_version').fetchone()[0] != 2:
+                raise RecorderStoreError('schema_version_mismatch', 'Approximate mode requires a v2 database.')
+            self.approximate_worker = ApproximateReferenceWorker()
+        elif config.mode != "BOOK_ONLY" and (config.mode != 'REFERENCE_REQUIRED'
                 or not isinstance(self.offline_reference, OfflineReferenceSession)):
             self.store.close()
             return RunResult("", "FAILED", 2, 0, "reference_runtime_unavailable")
@@ -519,16 +608,23 @@ class Recorder:
                     self.reference_worker.stop()
             finally:
                 try:
-                    from .reference import ManagedReferenceSession
-                    if config.mode == 'REFERENCE_REQUIRED' and isinstance(self.offline_reference, ManagedReferenceSession):
-                        self.offline_reference.stop()
+                    if self.approximate_worker is not None:
+                        self.approximate_worker.stop()
                 finally:
-                    self.store.close()
+                    try:
+                        from .reference import ManagedReferenceSession
+                        if config.mode == 'REFERENCE_REQUIRED' and isinstance(self.offline_reference, ManagedReferenceSession):
+                            self.offline_reference.stop()
+                    finally:
+                        self.store.close()
 
     def _shutdown(self, state, reason):
         if self.reference_worker is not None:
             self.reference_worker.stop()
             self._reference_drain(stopping=True)
+        if self.approximate_worker is not None:
+            self.approximate_worker.stop()
+            self._approximate_drain(stopping=True)
         self.store.record_event(self.run_id, "SHUTDOWN", started_us=self.wall_us(),
                                 detail={"reason": reason})
         self.store.finish_run(self.run_id, state=state, wall_us=self.wall_us(), reason=reason)
@@ -671,6 +767,10 @@ class Recorder:
                 started_server_us=self._now())
             anchor = self.clock.anchor
             project = lambda moment_ns: anchor.server_us + (moment_ns-anchor.midpoint_ns)//1000
+            if self.approximate_worker is not None:
+                reference_deadline_ns = self.clock.deadline_ns(min(target.scheduled_us+2_000_000, end_us))
+                self._approximate_drain()
+                self._approximate_submit(reference_deadline_ns)
             if self.reference_worker is not None:
                 from .models import ReferenceAssociationDraft
                 row = ReferenceAssociationDraft(market.market_id, 'SLOT_CURRENT', target.scheduled_us,
@@ -692,6 +792,9 @@ class Recorder:
             ended_ns = self.monotonic_ns()
             reference = disabled_reference(market.market_id, target.scheduled_us,
                 learned_wall_us=self.wall_us(), learned_server_us=project(ended_ns))
+            if self.approximate_worker is not None:
+                from dataclasses import replace
+                reference = replace(reference, status='UNAVAILABLE', reason='APPROXIMATE_REFERENCE')
             if self.reference_worker is not None:
                 from dataclasses import replace
                 reference = replace(reference, status='UNAVAILABLE',
@@ -700,6 +803,8 @@ class Recorder:
                 self.anchor_id, self.revision_id, books, reference, started_ns, ended_ns),
                 committed_wall_us=self.wall_us())
             self.finalized += 1
+            if self.approximate_worker is not None:
+                self._approximate_drain()
             if self.reference_worker is not None and self.offline_reference.live is not None:
                 current_reference_result = self.offline_reference.fetch(row, reference_deadline_ns/1_000_000_000,
                     run_id=self.run_id, anchor_id=self.anchor_id, project=project, buffer_only=True)

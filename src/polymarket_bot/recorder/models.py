@@ -44,7 +44,7 @@ class ResolutionObservation:
 
 @dataclass(frozen=True)
 class RunConfig:
-    mode: str = "BOOK_ONLY"
+    mode: str = "BOOK_ONLY"  # "BOOK_ONLY", "REFERENCE_REQUIRED", "APPROXIMATE_REFERENCE"
     use_fast_path: bool = True
     policy_revision: str = field(default="recorder-v1", init=False)
     cadence_us: int = field(default=2_000_000, init=False)
