@@ -200,7 +200,7 @@ class SchemaTests(unittest.TestCase):
 
     def test_unknown_schema_preserves_file(self):
         with closing(sqlite3.connect(self.fixture.path)) as connection:
-            connection.execute("PRAGMA user_version=2")
+            connection.execute("PRAGMA user_version=3")
             connection.execute("CREATE TABLE evidence (body TEXT)")
             connection.execute("INSERT INTO evidence VALUES ('original')")
             connection.commit()

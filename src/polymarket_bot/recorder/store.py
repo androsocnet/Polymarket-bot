@@ -102,11 +102,34 @@ def _schema_contract(script: str) -> dict[tuple[str, str], str]:
         normalized = " ".join(statement.split())
         if not normalized:
             continue
+        if not normalized.startswith("CREATE "):
+            continue
         match = re.match(r"CREATE (?:UNIQUE )?(TABLE|INDEX) ([a-z_]+) ", normalized)
         if match is None:
             raise RecorderStoreError("invalid_schema", "Invalid bundled schema definition.")
         definitions[(match[1].lower(), match[2])] = normalized
     return definitions
+
+
+def _split_schema(script: str) -> tuple[str, str]:
+    """Split schema.sql into v1 portion (before marker) and v2 portion (full script)."""
+    parts = script.split("-- APPROXIMATE MODE ADDITIONS (v2 only)")
+    if len(parts) != 2:
+        raise RecorderStoreError("invalid_schema", "Schema marker not found.")
+    v1_script = parts[0]
+    v2_script = script  # full script includes v2 additions
+    return v1_script, v2_script
+
+
+def _load_v1_schema() -> str:
+    """Load v1-only schema (without approximate tables)."""
+    script = Path(__file__).with_name("schema.sql").read_text(encoding="utf-8")
+    return _split_schema(script)[0]
+
+
+def _load_v2_schema() -> str:
+    """Load full v2 schema (with approximate tables)."""
+    return Path(__file__).with_name("schema.sql").read_text(encoding="utf-8")
 
 
 class RecorderStore:
@@ -128,8 +151,8 @@ class RecorderStore:
         try:
             connection = sqlite3.connect(canonical.as_uri() + "?mode=ro", uri=True, timeout=0)
             connection.execute("PRAGMA query_only=ON")
-            script = Path(__file__).with_name("schema.sql").read_text(encoding="utf-8")
-            cls._verify_existing(connection, script)
+            script = _load_v2_schema()
+            cls._verify_existing(connection, script, approximate=False)
             store = cls(canonical, None, connection)
             store._read_only = True
             return store
@@ -142,6 +165,16 @@ class RecorderStore:
 
     @classmethod
     def open(cls, path: Path) -> "RecorderStore":
+        """Open a v1 database for BOOK_ONLY mode (accepts existing v1 or v2)."""
+        return cls._open(path, approximate=False)
+
+    @classmethod
+    def open_approximate(cls, path: Path) -> "RecorderStore":
+        """Open or create a v2 database for approximate mode."""
+        return cls._open(path, approximate=True)
+
+    @classmethod
+    def _open(cls, path: Path, *, approximate: bool) -> "RecorderStore":
         canonical = Path(os.path.normcase(str(Path(path).resolve())))
         lock_file = None
         connection = None
@@ -161,7 +194,8 @@ class RecorderStore:
             except OSError as exc:
                 raise RecorderStoreError("writer_locked", "The recorder database already has a writer.") from exc
 
-            script = Path(__file__).with_name("schema.sql").read_text(encoding="utf-8")
+            v2_script = _load_v2_schema()
+            v1_script = _load_v1_schema()
             is_new = not canonical.exists()
             # Claim a new file without truncating a path created by another actor.
             if is_new:
@@ -172,9 +206,12 @@ class RecorderStore:
             if is_new:
                 connection.execute("PRAGMA journal_mode=DELETE")
                 connection.execute("PRAGMA synchronous=FULL")
-                connection.executescript("BEGIN IMMEDIATE;\n" + script + "\nPRAGMA user_version=1;\nCOMMIT;")
+                if approximate:
+                    connection.executescript("BEGIN IMMEDIATE;\n" + v2_script + "\nPRAGMA user_version=2;\nCOMMIT;")
+                else:
+                    connection.executescript("BEGIN IMMEDIATE;\n" + v1_script + "\nPRAGMA user_version=1;\nCOMMIT;")
             else:
-                cls._verify_existing(connection, script)
+                cls._verify_existing(connection, v2_script, approximate=approximate)
                 connection.execute("PRAGMA journal_mode=DELETE")
                 connection.execute("PRAGMA synchronous=FULL")
             return cls(canonical, lock_file, connection)
@@ -192,14 +229,23 @@ class RecorderStore:
             raise
 
     @staticmethod
-    def _verify_existing(connection: sqlite3.Connection, script: str) -> None:
+    def _verify_existing(connection: sqlite3.Connection, v2_script: str, *, approximate: bool = False) -> None:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-        if version != 1:
+        if version == 1 and approximate:
+            raise RecorderStoreError("schema_version_mismatch",
+                "Approximate mode requires a v2 database; existing database is v1.")
+        if version not in (1, 2):
             raise RecorderStoreError("unknown_schema", "Existing recorder database schema version is unsupported.")
+        if version == 1:
+            v1_script = _split_schema(v2_script)[0]
+            expected = _schema_contract(v1_script)
+        else:
+            expected = _schema_contract(v2_script)
         actual = {(kind, name): " ".join(sql.split()) for kind, name, sql in connection.execute(
             "SELECT type, name, sql FROM sqlite_master WHERE sql IS NOT NULL")}
-        if actual != _schema_contract(script):
-            raise RecorderStoreError("invalid_schema", "Existing recorder database does not match schema version 1.")
+        if actual != expected:
+            raise RecorderStoreError("invalid_schema",
+                f"Existing recorder database does not match schema version {version}.")
         if connection.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
             raise RecorderStoreError("database_integrity", "Recorder database integrity check failed.")
         if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
