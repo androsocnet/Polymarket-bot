@@ -90,7 +90,8 @@ class ChainlinkLiveConsumer:
                     raise MarketDataError('websocket_shutdown_failed', 'Consumer did not stop within shutdown bound.')
                 self._thread = None
                 with self._lock:
-                    self._ws = None
+                    if not close_failed and self._ws is ws:
+                        self._ws = None
             if close_failed:
                 self._failure = 'close_failed'
                 raise MarketDataError('websocket_shutdown_failed', 'Connection close failed; consumer joined.') from None
@@ -135,7 +136,6 @@ class ChainlinkLiveConsumer:
             finally:
                 with self._lock:
                     ws = self._ws
-                    self._ws = None
                     self._connected = False
                 if ws is not None:
                     try:
@@ -145,6 +145,10 @@ class ChainlinkLiveConsumer:
                             self._failure = 'close_failed'
                         self._stop_event.set()
                         raise
+                    else:
+                        with self._lock:
+                            if self._ws is ws:
+                                self._ws = None
             if not self._stop_event.is_set():
                 start = self._monotonic()
                 self._stop_event.wait(backoff)

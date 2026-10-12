@@ -322,11 +322,14 @@ class SchemaTests(unittest.TestCase):
             self.assertEqual(raised.exception.code, "invalid_evidence")
 
     def child_owner(self):
-        """Use the same installed interpreter, with no HTTP or production sampling."""
+        """Use explicit src-layout imports, with no HTTP or production sampling."""
+        from pathlib import Path
+        root = Path(__file__).resolve().parents[1]
         script = """
 import os
 from pathlib import Path
 import sys
+sys.path[:0] = [str(Path(sys.argv[2]) / 'src'), sys.argv[2]]
 import tests
 from polymarket_bot.recorder.store import RecorderStore
 store = RecorderStore.open(Path(sys.argv[1]))
@@ -335,8 +338,8 @@ print('OWNER_READY', flush=True)
 sys.stdin.readline()
 os._exit(0)
 """
-        child = subprocess.Popen([sys.executable, "-c", script, str(self.fixture.path)],
-                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        child = subprocess.Popen([sys.executable, "-c", script, str(self.fixture.path), str(root)],
+                                 cwd=root, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE, text=True)
 
         def cleanup():
@@ -351,9 +354,13 @@ os._exit(0)
             ready = executor.submit(child.stdout.readline)
             try:
                 self.assertEqual(ready.result(timeout=10).strip(), "OWNER_READY")
-            except Exception:
-                child.kill()
-                raise
+            except Exception as exc:
+                if child.poll() is None:
+                    child.kill()
+                _, stderr = child.communicate(timeout=10)
+                self.fail(f'Child owner readiness failed: executable={sys.executable!r}, cwd={str(root)!r}, '
+                          f'PYTHONPATH={os.environ.get("PYTHONPATH")!r}, exit={child.returncode}, '
+                          f'stderr={stderr!r}, readiness={exc!r}')
         return child
 
     @unittest.skipUnless(os.name == "nt", "Windows process ownership contract")

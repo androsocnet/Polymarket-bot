@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from urllib.parse import urlparse
 import httpx
 
 from polymarket_bot.market_data.models import MarketDataError
@@ -119,7 +118,7 @@ def fetch_feed_discovery(client: httpx.Client, endpoint_url: str = CHAINLINK_DIS
     request = httpx.Request('GET', CHAINLINK_DISCOVERY_URL, headers={'Accept-Encoding': 'identity'},
         extensions={'timeout': {p: remaining() for p in ('connect','read','write','pool')}})
     try:
-        with closing(client.send(request, stream=True, follow_redirects=False)) as response:
+        with closing(client.send(request, stream=True, auth=None, follow_redirects=False)) as response:
             remaining()
             if response.status_code != 200:
                 raise MarketDataError('discovery_http_error', 'Discovery request rejected.', http_status=response.status_code)

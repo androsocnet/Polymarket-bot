@@ -345,16 +345,37 @@ class ReferenceTests(unittest.TestCase):
             slot_id=1, report_hash=report.report_hash, selection_policy_revision='managed-signed-inclusive-seconds-v1')
         self.assertFalse(reference.eligible_as_of(association, report, decision_us=NOW_US+1_500_000, role='SLOT_CURRENT'))
         proof = dict(reason='REFERENCE_DURABLE', market_id=MARKET_ID, role='SLOT_CURRENT', slot_id=1,
-            learned_wall_us=association.learned_wall_us, report_hash=report.report_hash,
-            durable_server_us=NOW_US+1_600_000, available_live=True)
+            target_us=NOW_US, learned_wall_us=association.learned_wall_us, report_hash=report.report_hash,
+            durable_server_us=NOW_US+1_600_000, available_live=True,
+            durability_basis='POST_COMMIT_BARRIER_V1', commit_event_id=1)
         self.assertFalse(reference.eligible_as_of(association, report, decision_us=NOW_US+1_500_000,
             role='SLOT_CURRENT', durable_proof=proof))
-        self.assertTrue(reference.eligible_as_of(association, report, decision_us=NOW_US+1_700_000,
+        commit = dict(event_id=1, run_id='fetch-run', kind='DISCOVERY_GAP', started_us=association.learned_wall_us,
+            detail=dict(proof, reason='REFERENCE_COMMIT'))
+        receipt = dict(event_id=2, run_id='fetch-run', kind='DISCOVERY_GAP',
+            started_us=NOW_US+1_600_000, detail=proof)
+        self.assertFalse(reference.eligible_as_of(association, report, decision_us=NOW_US+1_700_000,
             role='SLOT_CURRENT', durable_proof=proof))
-        for changes in ({'report_hash': 'foreign'}, {'slot_id': 2}, {'durable_server_us': None},
-                        {'learned_wall_us': 0}, {'available_live': False}):
+        self.assertTrue(reference.eligible_as_of(association, report, decision_us=NOW_US+1_700_000,
+            role='SLOT_CURRENT', durable_proof=proof, commit_event=commit,
+            receipt_event=receipt, fetch_run_id='fetch-run'))
+        for changes in ({'report_hash': 'foreign'}, {'slot_id': 2}, {'target_us': NOW_US+2_000_000},
+                        {'durable_server_us': None}, {'learned_wall_us': 0}, {'available_live': False}):
             self.assertFalse(reference.eligible_as_of(association, report, decision_us=NOW_US+1_700_000,
-                role='SLOT_CURRENT', durable_proof=dict(proof, **changes)))
+                role='SLOT_CURRENT', durable_proof=dict(proof, **changes), commit_event=commit,
+                receipt_event=dict(receipt, detail=dict(proof, **changes)), fetch_run_id='fetch-run'))
+        receipt = dict(event_id=2, run_id='fetch-run', kind='DISCOVERY_GAP',
+            started_us=NOW_US+1_600_000, detail=proof)
+        commit['run_id'] = 'foreign-run'
+        self.assertFalse(reference.eligible_as_of(association, report, decision_us=NOW_US+1_700_000,
+            role='SLOT_CURRENT', durable_proof=proof, commit_event=commit,
+            receipt_event=receipt, fetch_run_id='fetch-run'))
+        commit['run_id'] = 'fetch-run'
+        for changes in ({'event_id': 1}, {'started_us': association.learned_wall_us-1},
+                        {'run_id': 'foreign-run'}):
+            self.assertFalse(reference.eligible_as_of(association, report, decision_us=NOW_US+1_700_000,
+                role='SLOT_CURRENT', durable_proof=proof, commit_event=commit,
+                receipt_event=dict(receipt, **changes), fetch_run_id='fetch-run'))
 
     def test_live_current_requires_actual_receipt_verification_and_five_second_age(self):
         report = replace(self.normalize(receipt=NOW_US + 1_000_000), verification_status="VERIFIED")

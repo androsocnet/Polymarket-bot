@@ -96,8 +96,51 @@ def normalize_reference_fields(raw_signed_report: bytes, fields: dict, *,
         diagnostics=diagnostics)
 
 
+def managed_durable_evidence(association: ReferenceAssociationDraft, report_hash: str,
+                             proof: dict | None, *, decision_us: int,
+                             commit_event: dict | None = None, receipt_event: dict | None = None,
+                             fetch_run_id: str | None = None) -> bool:
+    """One managed identity/commit contract for replay and coverage metrics."""
+    return (association.selection_policy_revision == 'managed-signed-inclusive-seconds-v1'
+        and type(proof) is dict and proof.get('reason') == 'REFERENCE_DURABLE'
+        and proof.get('durability_basis') == 'POST_COMMIT_BARRIER_V1'
+        and type(proof.get('commit_event_id')) is int and proof['commit_event_id'] > 0
+        and type(commit_event) is dict and type(receipt_event) is dict
+        and type(fetch_run_id) is str and bool(fetch_run_id)
+        and commit_event.get('run_id') == receipt_event.get('run_id') == fetch_run_id
+        and receipt_event.get('kind') == 'DISCOVERY_GAP'
+        and receipt_event.get('detail') == proof
+        and type(receipt_event.get('event_id')) is int
+        and proof['commit_event_id'] < receipt_event['event_id']
+        and type(receipt_event.get('started_us')) is int
+        and type(commit_event.get('started_us')) is int
+        and commit_event['started_us'] <= receipt_event['started_us']
+        and commit_event.get('event_id') == proof['commit_event_id']
+        and commit_event.get('kind') == 'DISCOVERY_GAP'
+        and type(commit_event.get('started_us')) is int
+        and association.learned_wall_us <= commit_event['started_us']
+        and type(commit_event.get('detail')) is dict
+        and commit_event['detail'].get('reason') == 'REFERENCE_COMMIT'
+        and all(name in commit_event['detail'] and commit_event['detail'][name] == proof.get(name)
+            for name in ('market_id', 'role', 'slot_id', 'target_us', 'learned_wall_us',
+                         'report_hash', 'available_live'))
+        and all(name in proof and proof[name] == getattr(association, name) for name in
+            ('market_id', 'role', 'slot_id', 'target_us', 'learned_wall_us'))
+        and proof.get('report_hash') == report_hash
+        and type(proof.get('available_live')) is bool
+        and proof['available_live'] == association.available_live
+        and type(proof.get('durable_server_us')) is int
+        and association.learned_server_us is not None
+        and association.learned_server_us <= proof['durable_server_us'] <= decision_us
+        and (association.role != 'SLOT_CURRENT' or
+            (proof['available_live'] is True and
+             proof['durable_server_us'] < association.target_us+2_000_000)))
+
+
 def eligible_as_of(association: ReferenceAssociationDraft, report: ReferenceReportDraft | None,
-                   *, decision_us: int, role: str, durable_proof: dict | None = None) -> bool:
+                   *, decision_us: int, role: str, durable_proof: dict | None = None,
+                   commit_event: dict | None = None, receipt_event: dict | None = None,
+                             fetch_run_id: str | None = None) -> bool:
     """Current/opening input eligibility, never closing-label eligibility.
 
     VERIFIED is externally supplied evidence, not produced by this normalizer.
@@ -117,15 +160,12 @@ def eligible_as_of(association: ReferenceAssociationDraft, report: ReferenceRepo
             or report.observations_seconds * 1_000_000 > decision_us
             or (association.report_hash is not None and association.report_hash != report.report_hash)):
         return False
+    if association.selection_policy_revision == 'offline-reconcile-only-v1':
+        return False
     if (association.selection_policy_revision or '').startswith('managed-'):
-        if (type(durable_proof) is not dict or durable_proof.get('reason') != 'REFERENCE_DURABLE'
-                or any(durable_proof.get(name) != getattr(association, name) for name in
-                    ('market_id', 'role', 'slot_id', 'learned_wall_us'))
-                or durable_proof.get('report_hash') != report.report_hash
-                or type(durable_proof.get('durable_server_us')) is not int
-                or not association.learned_server_us <= durable_proof['durable_server_us'] <= decision_us
-                or (role == 'SLOT_CURRENT' and (durable_proof.get('available_live') is not True
-                    or durable_proof['durable_server_us'] >= association.target_us+2_000_000))):
+        if not managed_durable_evidence(association, report.report_hash, durable_proof,
+                decision_us=decision_us, commit_event=commit_event,
+                receipt_event=receipt_event, fetch_run_id=fetch_run_id):
             return False
     if role == "OPENING":
         return (association.origin in ("LIVE_LATEST", "HISTORICAL_LOOKUP")
@@ -362,7 +402,6 @@ class ReferenceRestEvidence:
         return self.fetch(row, deadline)
 
     def fetch(self, row, deadline):
-        from dataclasses import replace
         from .models import ReferenceFetchDraft
         attempts, reports, error = [], (), None
         previous = self.client.on_attempt
@@ -496,6 +535,7 @@ class ManagedReferenceSession(OfflineReferenceSession):
         self.decoder_revision = decoder_revision
         self.rest_factory, self.live_factory = rest_factory, live_factory
         self.rest = self.consumer = None
+        self._stream_receipt: tuple[tuple[str, int, int], int, int | None] | None = None
         self.live = None
         self.selection_policy, self.policy_revision = select_boundary_report, 'signed-inclusive-seconds-v1'
         self.started = False
@@ -512,6 +552,8 @@ class ManagedReferenceSession(OfflineReferenceSession):
             raise MarketDataError('activation_required', 'Trusted permission and structural decoder records required.')
         if self.started:
             return
+        if self.consumer is not None or self.rest is not None:
+            raise MarketDataError('reference_shutdown_failed', 'Retained reference resources require successful cleanup before restart.')
         from .chainlink_discovery import verify_feed_identity
         from .chainlink_auth import validate_credentials
         from .chainlink_rest import ChainlinkRestClient
@@ -523,7 +565,8 @@ class ManagedReferenceSession(OfflineReferenceSession):
         if self.metadata.name != 'BTC/USD-Streams-TWAP-60s-mainnet-production':
             raise MarketDataError('identity_conflict', 'Discovery feed name conflicts.')
         self.price_scale = self.metadata.price_scale
-        if persisted_pin is not None and persisted_pin['price_scale'] is not None and (
+        if persisted_pin is not None and (
+                persisted_pin['price_scale'] is not None or persisted_pin['decoder_revision'] is not None) and (
                 persisted_pin['price_scale'] != self.price_scale or persisted_pin['decoder_revision'] != self.decoder_revision):
             raise MarketDataError('identity_conflict', 'Discovery conflicts with persisted reference pin.')
         if type(self.decoder_revision) is not str or not 0 < len(self.decoder_revision) <= 128:
@@ -545,10 +588,13 @@ class ManagedReferenceSession(OfflineReferenceSession):
             self.stop()
             raise
 
-    def get_live_report(self, max_age_s, now_server_s):
+    def check_health(self):
         health = getattr(self.consumer, 'check_health', None)
         if health is not None:
             health()
+
+    def get_live_report(self, max_age_s, now_server_s):
+        self.check_health()
         return self.consumer.get_freshest_report(max_age_s, now_server_s)
 
     def stop(self):
@@ -584,20 +630,24 @@ class ManagedReferenceSession(OfflineReferenceSession):
                 from dataclasses import replace
                 return row, replace(result[1], error_code='STALE_REFERENCE'), (), deadline
             if buffered is not None:
-                signed, fields = buffered
+                _, fields = buffered
                 arrival_ns, arrival_wall = fields['receipt_mono_ns'], fields['receipt_wall_us']
                 if arrival_ns > now_ns:
                     raise MarketDataError('invalid_reference_receipt', 'Future stream arrival.')
                 raw = fields['raw_message']
+                identity = (run_id, arrival_ns, arrival_wall)
+                if self._stream_receipt is None or self._stream_receipt[0] != identity:
+                    self._stream_receipt = (identity, project(arrival_ns), anchor_id)
+                _, receipt_server_us, receipt_anchor_id = self._stream_receipt
                 report = decode_schema_v2_report(fields, price_scale=self.price_scale,
                     decoder_revision=self.decoder_revision, receipt_wall_us=arrival_wall,
-                    receipt_server_us=project(arrival_ns))
+                    receipt_server_us=receipt_server_us)
                 attempt = HttpAttempt('REFERENCE_LATEST', 'GET', '/ws/v1',
                     ('feed_id='+CHAINLINK_FEED_ID,), 1, arrival_ns, arrival_ns,
                     arrival_wall, arrival_wall, 200, 'success', None, raw, True)
-                fetch = ReferenceFetchDraft(attempt, run_id, CHAINLINK_FEED_ID, row.role,
-                    'LIVE_LATEST', row.target_us, 'UNAVAILABLE', None, raw,
-                    project(arrival_ns), row.market_id, anchor_id)
+                fetch = ReferenceFetchDraft(attempt, run_id, CHAINLINK_FEED_ID, 'SLOT_CURRENT',
+                    'LIVE_LATEST', None, 'UNAVAILABLE', None, raw,
+                    receipt_server_us, None, receipt_anchor_id)
                 return row, fetch, (report,), deadline
         if buffer_only or payload_override is not None:
             return super().fetch(row, deadline, run_id=run_id, anchor_id=anchor_id,
@@ -628,6 +678,11 @@ def reconcile_due_reference_boundaries(store, rest_client, now_server_us, deadli
                                        policy_revision=None, limit=2):
     import time
     from dataclasses import replace
+    # ponytail: legacy offline collection only; managed learning uses Recorder's commit events.
+    import json
+    if any(json.loads(run['activation_evidence_json'] or '{}').get('scope') == 'MANAGED_PRODUCTION'
+            for run in store._rows('SELECT activation_evidence_json FROM recording_runs')):
+        raise MarketDataError('activation_required', 'Offline reconciler cannot process managed runs.')
     monotonic = monotonic or time.monotonic
     if monotonic() >= deadline:
         return 0
@@ -656,7 +711,7 @@ def reconcile_due_reference_boundaries(store, rest_client, now_server_us, deadli
         association = replace(row, status=status, origin='HISTORICAL_LOOKUP', available_live=False,
             learned_wall_us=fetch.attempt.ended_wall_us, learned_server_us=learned,
             fetch_id=None, report_id=None, report_hash=selected.report_hash if selected else None,
-            selection_policy_revision='signed-inclusive-seconds-v1', reason=reason, attempt_count=row.attempt_count + 1,
+            selection_policy_revision='offline-reconcile-only-v1', reason=reason, attempt_count=row.attempt_count + 1,
             next_due_us=boundary_retry_due(row.target_us,
                 attempt_count=row.attempt_count + 1, now_us=max(now_server_us, learned or now_server_us)))
         store.save_reference_evidence(fetch, reports, (association,))

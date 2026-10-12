@@ -859,6 +859,13 @@ class RecorderServiceTests(unittest.TestCase):
         self.assertIsNone(session.rest)
         self.assertIsNone(session.consumer)
         self.assertIsNotNone(fixture.rows('SELECT verified_us FROM reference_feeds')[0]['verified_us'])
+        proofs = [__import__('json').loads(row['detail_json']) for row in fixture.rows(
+            "SELECT detail_json FROM recorder_events WHERE detail_json LIKE '%REFERENCE_DURABLE%'")]
+        self.assertTrue(proofs)
+        for proof in proofs:
+            row = fixture.rows('SELECT target_us FROM reference_associations WHERE market_id=? AND role=? AND slot_id IS ? AND learned_wall_us=?',
+                (proof['market_id'], proof['role'], proof['slot_id'], proof['learned_wall_us']))[0]
+            self.assertEqual(proof.get('target_us'), row['target_us'])
 
     def test_stale_and_late_buffer_evidence_never_eligible(self):
         from polymarket_bot.recorder.service import Recorder

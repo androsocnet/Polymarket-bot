@@ -132,9 +132,11 @@ def _union_duration(intervals):
     return total
 
 
-def _references(store, eligible, slots, markets, runs, end_us):
+def _references(store, eligible, slots, markets, runs, end_us, server_end_us):
     """Count original timely live receipt separately from verified boundaries."""
-    rows = store._rows("""SELECT a.*,r.decode_status,r.verification_status,
+    from .models import ReferenceAssociationDraft
+    from .reference import managed_durable_evidence
+    rows = store._rows("""SELECT a.*,r.report_hash,r.decode_status,r.verification_status,
         r.decoded_price_text,r.decoder_revision,r.first_received_wall_us,
         r.first_received_server_us,r.valid_from_seconds,r.observations_seconds,
         r.expires_at_seconds,f.origin AS fetch_origin,f.purpose AS fetch_purpose,
@@ -144,15 +146,19 @@ def _references(store, eligible, slots, markets, runs, end_us):
         LEFT JOIN reference_fetches f ON f.fetch_id=a.fetch_id AND f.feed_id=r.feed_id
         LEFT JOIN request_attempts q ON q.request_id=f.request_id WHERE a.learned_wall_us<=?
         ORDER BY a.learned_wall_us,a.association_id""",(end_us,))
-    import json
-    durable = {}
-    for event in store._rows("SELECT started_us,detail_json FROM recorder_events WHERE kind='DISCOVERY_GAP' AND started_us<=?", (end_us,)):
+    durable = defaultdict(list)
+    commits = {}
+    for event in store._rows("SELECT event_id,kind,run_id,started_us,detail_json FROM recorder_events WHERE kind='DISCOVERY_GAP' AND started_us<=?", (end_us,)):
         detail = json.loads(event['detail_json'])
-        if detail.get('reason') == 'REFERENCE_DURABLE':
-            durable[(detail.get('slot_id'), detail.get('learned_wall_us'))] = detail
+        if type(detail) is dict and detail.get('reason') == 'REFERENCE_COMMIT':
+            commits[(event['run_id'], event['event_id'])] = dict(event, detail=detail)
+        if type(detail) is dict and detail.get('reason') == 'REFERENCE_DURABLE':
+            durable[event['run_id']].append((event['started_us'], event['event_id'], detail))
     live, boundaries = set(), {}
     by_id = {slot["slot_id"]:slot for slot in slots.values()}
     by_market = {row["market_id"]:row for row in markets}
+    managed_scope = any(json.loads(r.get('activation_evidence_json') or '{}').get('scope') == 'MANAGED_PRODUCTION'
+                        for r in runs.values())
     for row in rows:
         market = by_market.get(row["market_id"])
         if (market is not None and row["role"] in ("OPENING", "CLOSING")
@@ -170,6 +176,36 @@ def _references(store, eligible, slots, markets, runs, end_us):
                 continue
         except MarketDataError:
             continue
+        run = runs.get(row['fetch_run_id'])
+        managed = (row['selection_policy_revision'] or '').startswith('managed-')
+        if row['selection_policy_revision'] == 'offline-reconcile-only-v1':
+            continue
+        if managed_scope and not managed:
+            continue
+        eligibility_us = row['learned_server_us']
+        if managed:
+            association = ReferenceAssociationDraft(**{name: row[name] for name in
+                ReferenceAssociationDraft.__dataclass_fields__ if name != 'available_live'},
+                available_live=bool(row['available_live']))
+            if run is None or run['mode'] != 'REFERENCE_REQUIRED' or server_end_us is None:
+                continue
+            proof_times = []
+            for started, event_id, proof in durable[row['fetch_run_id']]:
+                commit_id = proof.get('commit_event_id')
+                if type(commit_id) is not int:
+                    continue
+                commit = commits.get((row['fetch_run_id'], commit_id))
+                if (commit is not None and commit_id < event_id
+                        and commit['started_us'] <= started
+                        and managed_durable_evidence(association, row['report_hash'], proof,
+                            decision_us=server_end_us, commit_event=commit,
+                            receipt_event=dict(event_id=event_id, run_id=row['fetch_run_id'],
+                                kind='DISCOVERY_GAP', started_us=started, detail=proof),
+                            fetch_run_id=row['fetch_run_id'])):
+                    proof_times.append(proof['durable_server_us'])
+            if not proof_times:
+                continue
+            eligibility_us = min(proof_times)
         if row["role"] in ("OPENING","CLOSING"):
             if row["selection_policy_revision"] and row["target_us"]==market[
                     "window_start_us" if row["role"]=="OPENING" else "window_end_us"]:
@@ -182,13 +218,6 @@ def _references(store, eligible, slots, markets, runs, end_us):
         if run is None or run["mode"]=="BOOK_ONLY":
             continue
         receipt, learned, target = row["fetch_received_server_us"],row["learned_server_us"],slot["scheduled_us"]
-        proof = durable.get((row['slot_id'], row['learned_wall_us']))
-        activation = json.loads(run.get('activation_evidence_json') or '{}')
-        if activation.get('scope') == 'MANAGED_PRODUCTION' and proof is None:
-            continue
-        if proof is not None and (not proof.get('available_live') or proof.get('durable_server_us') is None
-                or proof['durable_server_us'] >= min(target+2_000_000, market['window_end_us'])):
-            continue
         if (row["origin"]!="LIVE_LATEST" or not row["available_live"] or row["target_us"]!=target
                 or receipt is None or learned is None or receipt>learned
                 or row["fetch_origin"]!="LIVE_LATEST" or row["fetch_purpose"]!="SLOT_CURRENT"
@@ -199,8 +228,8 @@ def _references(store, eligible, slots, markets, runs, end_us):
                 or not (receipt<min(target+2_000_000,market["window_end_us"]) and (row['fetch_path']=='/ws/v1' or target<=receipt))
                 or not target<=learned<min(target+2_000_000,market["window_end_us"])
                 or any(row[name] is None for name in ("valid_from_seconds","observations_seconds","expires_at_seconds"))
-                or not row["valid_from_seconds"]*1_000_000<=learned<=row["expires_at_seconds"]*1_000_000
-                or not 0<=learned-row["observations_seconds"]*1_000_000<=5_000_000):
+                or not row["valid_from_seconds"]*1_000_000<=eligibility_us<=row["expires_at_seconds"]*1_000_000
+                or not 0<=eligibility_us-row["observations_seconds"]*1_000_000<=5_000_000):
             continue
         live.add(slot["slot_id"])
     complete = {s["slot_id"] for key,s in slots.items() if key in eligible and s["status"]=="COMPLETE"}
@@ -470,7 +499,7 @@ def measure(store: RecorderStore, *, start_us: int, end_us: int) -> MeasurementR
     diagnostics["quality_status_count_bounds"] = {status:(sum(key in slots and slots[key]["status"]==status for key in lower),
         sum(key in slots and slots[key]["status"]==status for key in upper)) if bounds is not None else None
         for status in percentages}
-    reference = _references(store,grid,slots,markets,runs,end_us)
+    reference = _references(store,grid,slots,markets,runs,end_us,server_end)
     discovery_by_domain = {domain:_union_duration((gap["started_us"],gap["ended_us"])
         for gap in discovery if gap["time_domain"]==domain)/1_000_000
         for domain in {gap["time_domain"] for gap in discovery}}

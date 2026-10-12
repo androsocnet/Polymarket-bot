@@ -146,10 +146,29 @@ class Recorder:
                 status, reason = 'AVAILABLE', None
         if self.monotonic_ns()/1_000_000_000 >= deadline and status != 'AMBIGUOUS':
             status, reason = 'UNAVAILABLE', 'LATE_REFERENCE'
-        learned_wall = max(self.wall_us(), fetch.attempt.ended_wall_us)
+        from .reference import ManagedReferenceSession
+        managed = isinstance(self.offline_reference, ManagedReferenceSession)
+        learned_wall = self.wall_us()
         prior = self.store._one('SELECT MAX(learned_wall_us) AS learned FROM reference_associations WHERE market_id=? AND role=? AND slot_id IS ?',
             (row.market_id, row.role, row.slot_id))['learned']
-        learned_wall = max(learned_wall, (prior+1) if prior is not None else learned_wall)
+        if managed and learned_wall == prior:
+            self.sleep(0.000001)
+            learned_wall = self.wall_us()
+        if managed and (learned_wall < fetch.attempt.ended_wall_us or
+                        (prior is not None and learned_wall < prior)):
+            self.store.record_event(self.run_id, 'DISCOVERY_GAP', started_us=learned_wall,
+                detail={'reason': 'REFERENCE_CLOCK_ORDER_INVALID', 'diagnostic_only': True,
+                    'receipt_wall_us': fetch.attempt.ended_wall_us, 'prior_learned_wall_us': prior,
+                    'market_id': row.market_id, 'role': row.role, 'slot_id': row.slot_id})
+            return
+        if managed and learned_wall == prior:
+            self.store.record_event(self.run_id, 'DISCOVERY_GAP', started_us=learned_wall,
+                detail={'reason': 'REFERENCE_LEARNING_TIME_COLLISION', 'diagnostic_only': True,
+                    'market_id': row.market_id, 'role': row.role, 'slot_id': row.slot_id})
+            return
+        if not managed:
+            learned_wall = max(learned_wall, fetch.attempt.ended_wall_us,
+                (prior+1) if prior is not None else learned_wall)
         association = replace(row, status=status, reason=reason, origin=fetch.origin,
             available_live=status == 'AVAILABLE' and row.role == 'SLOT_CURRENT' and fetch.origin == 'LIVE_LATEST',
             learned_wall_us=learned_wall, learned_server_us=max(now, fetch.received_server_us),
@@ -157,10 +176,9 @@ class Recorder:
             attempt_count=row.attempt_count+1, selection_policy_revision='signed-inclusive-seconds-v1',
             next_due_us=None if row.role == 'SLOT_CURRENT' else boundary_retry_due(row.target_us,
                 attempt_count=row.attempt_count+1, now_us=max(now, fetch.received_server_us)))
-        from .reference import ManagedReferenceSession
-        if isinstance(self.offline_reference, ManagedReferenceSession):
+        if managed:
             association = replace(association, selection_policy_revision='managed-signed-inclusive-seconds-v1')
-        if association.available_live:
+        if association.available_live and not managed:
             self.store.save_reference_evidence(fetch, reports, (replace(association,
                 status='UNAVAILABLE', available_live=False, reason='PERSISTENCE_PENDING'),))
             association = replace(association, learned_wall_us=max(self.wall_us(), association.learned_wall_us+1),
@@ -168,17 +186,27 @@ class Recorder:
             if self.monotonic_ns()/1_000_000_000 >= deadline:
                 association = replace(association, status='UNAVAILABLE', available_live=False, reason='LATE_REFERENCE')
         self.store.save_reference_evidence(fetch, reports, (association,))
-        if association.available_live and self.monotonic_ns()/1_000_000_000 >= deadline:
+        if association.available_live and not managed and self.monotonic_ns()/1_000_000_000 >= deadline:
             association = replace(association, status='UNAVAILABLE', available_live=False,
                 reason='LATE_REFERENCE', learned_wall_us=max(self.wall_us(), association.learned_wall_us+1),
                 learned_server_us=self._now() if self.clock.usable() else association.learned_server_us)
             self.store.save_reference_evidence(fetch, reports, (association,))
-        self.store.record_event(self.run_id, 'DISCOVERY_GAP', started_us=self.wall_us(),
-            detail={'reason': 'REFERENCE_DURABLE', 'diagnostic_only': True, 'time_domain': 'LOCAL_WALL',
-                'slot_id': row.slot_id, 'market_id': row.market_id, 'role': row.role,
-                'learned_wall_us': association.learned_wall_us, 'report_hash': association.report_hash,
-                'durable_server_us': self._now() if self.clock.usable() else None,
-                'available_live': association.available_live})
+        identity = {'slot_id': row.slot_id, 'market_id': row.market_id, 'role': row.role,
+            'target_us': row.target_us, 'learned_wall_us': association.learned_wall_us,
+            'report_hash': association.report_hash, 'available_live': association.available_live}
+        # Evidence barrier commits first; receipt timestamps observe its completed commit.
+        commit_event_id = self.store.record_event(self.run_id, 'DISCOVERY_GAP', started_us=self.wall_us(),
+            detail=dict(identity, reason='REFERENCE_COMMIT', diagnostic_only=True))
+        durable_wall = self.wall_us()
+        if durable_wall < association.learned_wall_us:
+            self.store.record_event(self.run_id, 'DISCOVERY_GAP', started_us=durable_wall,
+                detail=dict(identity, reason='REFERENCE_CLOCK_ORDER_INVALID', diagnostic_only=True,
+                    commit_event_id=commit_event_id))
+        else:
+            self.store.record_event(self.run_id, 'DISCOVERY_GAP', started_us=durable_wall,
+                detail=dict(identity, reason='REFERENCE_DURABLE', diagnostic_only=True, time_domain='LOCAL_WALL',
+                    durability_basis='POST_COMMIT_BARRIER_V1', commit_event_id=commit_event_id,
+                    durable_server_us=self._now() if self.clock.usable() else None))
         if fetch.error_code in ('chainlink_auth_failed', 'websocket_failed'):
             raise MarketDataError(fetch.error_code, 'Reference permission or worker gate lost.')
 
@@ -544,6 +572,10 @@ class Recorder:
         self.discovery_gap_id = None
         self.discovery_gap_start = None
         while not should_stop():
+            if self.reference_worker is not None:
+                health = getattr(self.offline_reference, 'check_health', None)
+                if health is not None:
+                    health()
             if self.revision is None or not self.clock.usable():
                 self._checkpoint_due()
             if not self.clock.usable():
