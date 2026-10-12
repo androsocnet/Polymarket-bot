@@ -6,10 +6,14 @@ for research and fallback only.
 """
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable, Callable
+from datetime import datetime, timezone
 import hashlib
 import httpx
 import time
+
+from polymarket_bot.market_data.models import MarketDataError
+from polymarket_bot.market_data.numeric import parse_decimal
 
 
 @runtime_checkable
@@ -222,6 +226,175 @@ class KrakenRestProvider:
     ) -> ApproximateObservation:
         return ApproximateObservation(
             provider="kraken",
+            pair="BTC/USD",
+            quote_currency="USD",
+            price=Decimal("0"),
+            bid_price=None,
+            ask_price=None,
+            source_timestamp_us=None,
+            receipt_wall_us=receipt_wall_us,
+            receipt_server_us=receipt_server_us,
+            raw_payload_hash=raw_payload_hash or "",
+            raw_payload_size=raw_payload_size,
+            transport_type="rest",
+            parser_revision=self._PARSER_REVISION,
+            http_status=http_status,
+            result="error",
+            error_code=error_code,
+        )
+
+
+class CoinbaseRestProvider:
+    """Coinbase REST provider implementing ApproximateReferenceProvider.
+
+    Fetches ticker from GET /products/BTC-USD/ticker.
+    Per-trade price parsed from 'price' field. Exchange timestamp from 'time' field.
+    source_timestamp_us is parsed from the 'time' ISO 8601 field (trustworthy).
+    """
+
+    _ENDPOINT = "https://api.exchange.coinbase.com/products/BTC-USD/ticker"
+    _TIMEOUT_SECONDS = 5.0
+    _MAX_PAYLOAD_BYTES = 1 * 1024 * 1024
+    _PARSER_REVISION = "coinbase-ticker-v1"
+
+    def __init__(
+        self,
+        client: httpx.Client,
+        *,
+        monotonic_ns: Callable[[], int],
+        wall_us: Callable[[], int],
+        clock_seconds: Callable[[], float] | None = None,
+    ):
+        self._client = client
+        self._monotonic_ns = monotonic_ns
+        self._wall_us = wall_us
+        self._clock_seconds = clock_seconds
+
+    @property
+    def provider_name(self) -> str:
+        return "coinbase"
+
+    @property
+    def pair(self) -> str:
+        return "BTC/USD"
+
+    @property
+    def quote_currency(self) -> str:
+        return "USD"
+
+    def fetch_ticker(self, *, deadline: float) -> ApproximateObservation:
+        now_wall_us = self._wall_us()
+        now_server_us = self._monotonic_ns() // 1000
+        now_epoch = now_wall_us / 1_000_000
+        if now_epoch > deadline:
+            return self._error_obs(
+                now_wall_us, now_server_us, None, 0, 0, "DEADLINE_EXPIRED"
+            )
+
+        remaining = deadline - now_epoch
+        if remaining <= 0:
+            return self._error_obs(
+                now_wall_us, now_server_us, None, 0, 0, "DEADLINE_EXPIRED"
+            )
+
+        timeout = min(self._TIMEOUT_SECONDS, remaining)
+        try:
+            response = self._client.get(
+                self._ENDPOINT,
+                timeout=timeout,
+            )
+        except httpx.TimeoutException:
+            return self._error_obs(
+                now_wall_us, now_server_us, None, 0, 0, "TRANSPORT_TIMEOUT"
+            )
+        except httpx.HTTPError:
+            return self._error_obs(
+                now_wall_us, now_server_us, None, 0, 0, "TRANSPORT_ERROR"
+            )
+
+        body = response.content
+        raw_payload_size = len(body)
+        if raw_payload_size > self._MAX_PAYLOAD_BYTES:
+            return self._error_obs(
+                now_wall_us, now_server_us, None, response.status_code, raw_payload_size, "PAYLOAD_TOO_LARGE"
+            )
+
+        raw_payload_hash = hashlib.sha256(body).hexdigest()
+
+        if response.status_code != 200:
+            return self._error_obs(
+                now_wall_us, now_server_us, raw_payload_hash, response.status_code, raw_payload_size, "HTTP_ERROR"
+            )
+
+        try:
+            payload = response.json()
+        except Exception:
+            return self._error_obs(
+                now_wall_us, now_server_us, raw_payload_hash, response.status_code, raw_payload_size, "MALFORMED_JSON"
+            )
+
+        try:
+            price = parse_decimal(payload["price"], field="price")
+            bid_price = parse_decimal(payload["bid"], field="bid")
+            ask_price = parse_decimal(payload["ask"], field="ask")
+            time_str = payload["time"]
+        except (KeyError, TypeError, MarketDataError):
+            return self._error_obs(
+                now_wall_us, now_server_us, raw_payload_hash, response.status_code, raw_payload_size, "MALFORMED_JSON"
+            )
+
+        if price <= 0:
+            return self._error_obs(
+                now_wall_us, now_server_us, raw_payload_hash, response.status_code, raw_payload_size, "NON_POSITIVE_PRICE"
+            )
+
+        try:
+            dt = datetime.fromisoformat(time_str.replace("Z", "+00:00"))
+            if dt.tzinfo is None or dt.utcoffset() is None:
+                raise ValueError("Timezone required")
+            dt = dt.astimezone(timezone.utc)
+            delta = dt - datetime(1970, 1, 1, tzinfo=timezone.utc)
+            source_timestamp_us = (delta.days * 86400 + delta.seconds) * 1_000_000 + delta.microseconds
+        except (ValueError, TypeError, OverflowError):
+            return self._error_obs(
+                now_wall_us, now_server_us, raw_payload_hash, response.status_code, raw_payload_size, "MALFORMED_JSON"
+            )
+
+        if source_timestamp_us > now_wall_us:
+            return self._error_obs(
+                now_wall_us, now_server_us, raw_payload_hash, response.status_code, raw_payload_size, "FUTURE_SOURCE_TIME"
+            )
+
+        return ApproximateObservation(
+            provider="coinbase",
+            pair="BTC/USD",
+            quote_currency="USD",
+            price=price,
+            bid_price=bid_price,
+            ask_price=ask_price,
+            source_timestamp_us=source_timestamp_us,
+            receipt_wall_us=now_wall_us,
+            receipt_server_us=now_server_us,
+            raw_payload_hash=raw_payload_hash,
+            raw_payload_size=raw_payload_size,
+            transport_type="rest",
+            parser_revision=self._PARSER_REVISION,
+            http_status=response.status_code,
+            result="success",
+            error_code=None,
+        )
+
+    def _error_obs(
+        self,
+        receipt_wall_us: int,
+        receipt_server_us: int | None,
+        raw_payload_hash: str | None,
+        http_status: int | None,
+        raw_payload_size: int,
+        error_code: str,
+    ) -> ApproximateObservation:
+        return ApproximateObservation(
+            provider="coinbase",
             pair="BTC/USD",
             quote_currency="USD",
             price=Decimal("0"),
