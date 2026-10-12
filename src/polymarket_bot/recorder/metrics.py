@@ -34,6 +34,10 @@ class MeasurementReport:
     evidence_bytes: dict = field(default_factory=dict)
     depth_breakdown: dict = field(default_factory=dict)
     diagnostics: dict = field(default_factory=dict)
+    approximate_observations_by_provider: dict = field(default_factory=dict)
+    approximate_references_count: int | None = None
+    approximate_fallback_count: int | None = None
+    approximate_coverage: dict = field(default_factory=dict)
 
 
 def _evidence_bytes(store, start_us=None, end_us=None):
@@ -288,7 +292,54 @@ def _resolutions(store, markets, server_end_us, wall_end_us):
     return dict(tracked_expired_markets=len(expired),directional=directional,other=other,
                 pending=len(expired-finals.keys()),conflict=len(conflicts),
                 success_percent=_percent(directional+other,len(expired)),
-                learning_delay_seconds=nearest_rank_percentiles(delays),unknown_learning_delay_count=unknown)
+                 learning_delay_seconds=nearest_rank_percentiles(delays),unknown_learning_delay_count=unknown)
+
+
+def _approximate_coverage(store, grid, slots, markets, runs, end_us):
+    """Read-only approximate reference coverage from approximate_* tables only.
+
+    Approximate observations and references are credential-free, unverified
+    sample-mean evidence. This reads only from approximate_* tables and never
+    touches Chainlink reference_reports, reference_associations, or
+    reference_fetches. On v1 databases (no approximate tables) returns None
+    fields gracefully.
+    """
+    tables = store._rows("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('approximate_references','approximate_observations')")
+    existing = {row["name"] for row in tables}
+    if "approximate_references" not in existing:
+        return dict(
+            approximate_observations_by_provider={},
+            approximate_references_count=None,
+            approximate_fallback_count=None,
+            approximate_coverage={},
+        )
+    provider_observations: Counter = Counter()
+    if "approximate_observations" in existing:
+        observation_rows = store._rows("""SELECT provider,result FROM approximate_observations
+            WHERE receipt_wall_us<=?""", (end_us,))
+        for row in observation_rows:
+            provider_observations[row["provider"]] += 1
+    reference_rows = store._rows("""SELECT reference_id,source_provider,was_fallback
+        FROM approximate_references WHERE receipt_wall_us<=?""", (end_us,))
+    fallback_references = 0
+    coverage_by_provider: dict[str, dict] = defaultdict(lambda: dict(observations=0,references=0,fallbacks=0))
+    for row in reference_rows:
+        providers = [p for p in (row.get("source_provider") or "").split(",") if p]
+        for provider in providers:
+            coverage_by_provider[provider]["references"] += 1
+        was_fallback = bool(row.get("was_fallback"))
+        if was_fallback:
+            fallback_references += 1
+            for provider in providers:
+                coverage_by_provider[provider]["fallbacks"] += 1
+    for provider, count in provider_observations.items():
+        coverage_by_provider[provider]["observations"] = count
+    return dict(
+        approximate_observations_by_provider=dict(provider_observations),
+        approximate_references_count=len(reference_rows),
+        approximate_fallback_count=fallback_references,
+        approximate_coverage=dict(coverage_by_provider),
+    )
 
 
 def _quality_projection(store, runs, wall_start_us, wall_end_us):
@@ -500,6 +551,7 @@ def measure(store: RecorderStore, *, start_us: int, end_us: int) -> MeasurementR
         sum(key in slots and slots[key]["status"]==status for key in upper)) if bounds is not None else None
         for status in percentages}
     reference = _references(store,grid,slots,markets,runs,end_us,server_end)
+    approximate = _approximate_coverage(store,grid,slots,markets,runs,end_us)
     discovery_by_domain = {domain:_union_duration((gap["started_us"],gap["ended_us"])
         for gap in discovery if gap["time_domain"]==domain)/1_000_000
         for domain in {gap["time_domain"] for gap in discovery}}
@@ -549,4 +601,8 @@ def measure(store: RecorderStore, *, start_us: int, end_us: int) -> MeasurementR
         reference_coverage=reference,resolution_summary=_resolutions(store,markets,server_end,end_us),
         denominators=denominators,depth_breakdown=depth_breakdown,diagnostics=diagnostics,
         evidence_bytes=dict(_evidence_bytes(store,start_us,end_us),reference_report_count=store._one(
-            "SELECT COUNT(*) n FROM reference_reports WHERE first_received_wall_us>=? AND first_received_wall_us<=?",(start_us,end_us))["n"]))
+            "SELECT COUNT(*) n FROM reference_reports WHERE first_received_wall_us>=? AND first_received_wall_us<=?",(start_us,end_us))["n"]),
+        approximate_observations_by_provider=approximate["approximate_observations_by_provider"],
+        approximate_references_count=approximate["approximate_references_count"],
+        approximate_fallback_count=approximate["approximate_fallback_count"],
+        approximate_coverage=approximate["approximate_coverage"])
