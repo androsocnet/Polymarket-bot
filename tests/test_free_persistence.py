@@ -2,6 +2,7 @@
 import unittest
 import tempfile
 import shutil
+from typing import Any
 from pathlib import Path
 from decimal import Decimal
 
@@ -19,7 +20,7 @@ class FreePersistenceTests(unittest.TestCase):
         # Create temp directory manually for better Windows cleanup control
         self.temp_dir = Path(tempfile.mkdtemp(prefix="free-persistence-test-"))
         self.db_path = self.temp_dir / "recorder.sqlite3"
-        self.store = RecorderStore.open_approximate(self.db_path)
+        self.store: Any = RecorderStore.open_approximate(self.db_path)
         self.addCleanup(self._cleanup)
         self.run_id = self.store.start_run(
             RunConfig(mode="APPROXIMATE_REFERENCE"),
@@ -263,11 +264,9 @@ class FreePersistenceTests(unittest.TestCase):
         obs_id1 = self.store.save_approximate_observation(self.run_id, obs)
         assert obs_id1 > 0
 
-        # Second save with same run_id, provider, receipt_wall_us should fail (unique constraint)
-        with self.assertRaises(RecorderStoreError) as raised:
-            self.store.save_approximate_observation(self.run_id, obs)
-        # SQLite constraint error wraps in storage_failure
-        self.assertEqual(raised.exception.code, "storage_failure")
+        obs_id2 = self.store.save_approximate_observation(self.run_id, obs)
+        self.assertNotEqual(obs_id1, obs_id2)
+        self.assertEqual(len(self.store._rows("SELECT * FROM approximate_observations")), 2)
 
 
 if __name__ == "__main__":

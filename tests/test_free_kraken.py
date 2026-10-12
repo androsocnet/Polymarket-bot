@@ -44,7 +44,7 @@ class KrakenProviderTests(unittest.TestCase):
 
         client = self._make_client(handler)
         provider = KrakenRestProvider(client, monotonic_ns=lambda: self.monotonic_ns, wall_us=lambda: self.wall_us)
-        deadline = self.wall_us / 1_000_000 + 5.0
+        deadline = self.monotonic_ns / 1_000_000_000 + 5.0
         obs = provider.fetch_ticker(deadline=deadline)
 
         self.assertEqual(obs.provider, "kraken")
@@ -55,7 +55,8 @@ class KrakenProviderTests(unittest.TestCase):
         self.assertEqual(obs.ask_price, Decimal("30300.10000"))
         self.assertIsNone(obs.source_timestamp_us)
         self.assertEqual(obs.receipt_wall_us, self.wall_us)
-        self.assertEqual(obs.receipt_server_us, self.monotonic_ns // 1000)
+        self.assertIsNone(obs.receipt_server_us)
+        self.assertEqual(obs.receipt_mono_ns, self.monotonic_ns)
         self.assertEqual(obs.transport_type, "rest")
         self.assertEqual(obs.parser_revision, "kraken-ticker-v1")
         self.assertEqual(obs.http_status, 200)
@@ -72,7 +73,7 @@ class KrakenProviderTests(unittest.TestCase):
 
         client = self._make_client(handler)
         provider = KrakenRestProvider(client, monotonic_ns=lambda: self.monotonic_ns, wall_us=lambda: self.wall_us)
-        deadline = self.wall_us / 1_000_000 + 5.0
+        deadline = self.monotonic_ns / 1_000_000_000 + 5.0
         obs = provider.fetch_ticker(deadline=deadline)
 
         self.assertIsNone(obs.source_timestamp_us, "Kraken Ticker has NO trustworthy exchange timestamp")
@@ -88,12 +89,12 @@ class KrakenProviderTests(unittest.TestCase):
 
         client = self._make_client(handler)
         provider = KrakenRestProvider(client, monotonic_ns=lambda: self.monotonic_ns, wall_us=lambda: self.wall_us)
-        deadline = self.wall_us / 1_000_000 + 5.0
+        deadline = self.monotonic_ns / 1_000_000_000 + 5.0
         obs = provider.fetch_ticker(deadline=deadline)
 
         self.assertEqual(obs.result, "error")
         self.assertIsNotNone(obs.error_code)
-        self.assertIn("WRONG_PAIR_KEY", obs.error_code)
+        self.assertIn("WRONG_PAIR_KEY", obs.error_code or "")
 
     def test_wrong_pair_rejected(self):
         """XETHZUSD → rejected."""
@@ -106,12 +107,12 @@ class KrakenProviderTests(unittest.TestCase):
 
         client = self._make_client(handler)
         provider = KrakenRestProvider(client, monotonic_ns=lambda: self.monotonic_ns, wall_us=lambda: self.wall_us)
-        deadline = self.wall_us / 1_000_000 + 5.0
+        deadline = self.monotonic_ns / 1_000_000_000 + 5.0
         obs = provider.fetch_ticker(deadline=deadline)
 
         self.assertEqual(obs.result, "error")
         self.assertIsNotNone(obs.error_code)
-        self.assertIn("WRONG_PAIR_KEY", obs.error_code)
+        self.assertIn("WRONG_PAIR_KEY", obs.error_code or "")
 
     def test_nonpositive_price_rejected(self):
         """Non-positive price → rejected."""
@@ -123,12 +124,12 @@ class KrakenProviderTests(unittest.TestCase):
 
         client = self._make_client(handler)
         provider = KrakenRestProvider(client, monotonic_ns=lambda: self.monotonic_ns, wall_us=lambda: self.wall_us)
-        deadline = self.wall_us / 1_000_000 + 5.0
+        deadline = self.monotonic_ns / 1_000_000_000 + 5.0
         obs = provider.fetch_ticker(deadline=deadline)
 
         self.assertEqual(obs.result, "error")
         self.assertIsNotNone(obs.error_code)
-        self.assertIn("NON_POSITIVE_PRICE", obs.error_code)
+        self.assertIn("NON_POSITIVE_PRICE", obs.error_code or "")
 
     def test_negative_price_rejected(self):
         """Negative price → rejected."""
@@ -140,12 +141,12 @@ class KrakenProviderTests(unittest.TestCase):
 
         client = self._make_client(handler)
         provider = KrakenRestProvider(client, monotonic_ns=lambda: self.monotonic_ns, wall_us=lambda: self.wall_us)
-        deadline = self.wall_us / 1_000_000 + 5.0
+        deadline = self.monotonic_ns / 1_000_000_000 + 5.0
         obs = provider.fetch_ticker(deadline=deadline)
 
         self.assertEqual(obs.result, "error")
         self.assertIsNotNone(obs.error_code)
-        self.assertIn("NON_POSITIVE_PRICE", obs.error_code)
+        self.assertIn("NON_POSITIVE_PRICE", obs.error_code or "")
 
     def test_kraken_error_array_rejected(self):
         """Error array non-empty → rejected."""
@@ -157,12 +158,12 @@ class KrakenProviderTests(unittest.TestCase):
 
         client = self._make_client(handler)
         provider = KrakenRestProvider(client, monotonic_ns=lambda: self.monotonic_ns, wall_us=lambda: self.wall_us)
-        deadline = self.wall_us / 1_000_000 + 5.0
+        deadline = self.monotonic_ns / 1_000_000_000 + 5.0
         obs = provider.fetch_ticker(deadline=deadline)
 
         self.assertEqual(obs.result, "error")
         self.assertIsNotNone(obs.error_code)
-        self.assertIn("KRAKEN_API_ERROR", obs.error_code)
+        self.assertIn("KRAKEN_API_ERROR", obs.error_code or "")
 
     def test_malformed_json_rejected(self):
         """Malformed JSON → rejected."""
@@ -171,12 +172,12 @@ class KrakenProviderTests(unittest.TestCase):
 
         client = self._make_client(handler)
         provider = KrakenRestProvider(client, monotonic_ns=lambda: self.monotonic_ns, wall_us=lambda: self.wall_us)
-        deadline = self.wall_us / 1_000_000 + 5.0
+        deadline = self.monotonic_ns / 1_000_000_000 + 5.0
         obs = provider.fetch_ticker(deadline=deadline)
 
         self.assertEqual(obs.result, "error")
         self.assertIsNotNone(obs.error_code)
-        self.assertIn("MALFORMED_JSON", obs.error_code)
+        self.assertIn("MALFORMED_JSON", obs.error_code or "")
 
     def test_transport_timeout(self):
         """Transport timeout → error observation."""
@@ -185,12 +186,12 @@ class KrakenProviderTests(unittest.TestCase):
 
         client = self._make_client(handler)
         provider = KrakenRestProvider(client, monotonic_ns=lambda: self.monotonic_ns, wall_us=lambda: self.wall_us)
-        deadline = self.wall_us / 1_000_000 + 5.0
+        deadline = self.monotonic_ns / 1_000_000_000 + 5.0
         obs = provider.fetch_ticker(deadline=deadline)
 
         self.assertEqual(obs.result, "error")
         self.assertIsNotNone(obs.error_code)
-        self.assertIn("TRANSPORT_TIMEOUT", obs.error_code)
+        self.assertIn("TRANSPORT_TIMEOUT", obs.error_code or "")
 
     def test_http_error_status(self):
         """HTTP error status (e.g., 500) → error observation."""
@@ -199,12 +200,12 @@ class KrakenProviderTests(unittest.TestCase):
 
         client = self._make_client(handler)
         provider = KrakenRestProvider(client, monotonic_ns=lambda: self.monotonic_ns, wall_us=lambda: self.wall_us)
-        deadline = self.wall_us / 1_000_000 + 5.0
+        deadline = self.monotonic_ns / 1_000_000_000 + 5.0
         obs = provider.fetch_ticker(deadline=deadline)
 
         self.assertEqual(obs.result, "error")
         self.assertIsNotNone(obs.error_code)
-        self.assertIn("HTTP_ERROR", obs.error_code)
+        self.assertIn("HTTP_ERROR", obs.error_code or "")
 
     def test_raw_payload_hash_computed(self):
         """Raw payload hash is computed correctly from raw JSON bytes."""
@@ -214,14 +215,14 @@ class KrakenProviderTests(unittest.TestCase):
         }
         import json
         payload_bytes = json.dumps(payload, separators=(",", ":")).encode()
-        expected_hash = hashlib.sha256(payload_bytes).hexdigest()[:16]
+        expected_hash = hashlib.sha256(payload_bytes).hexdigest()
 
         def handler(request):
             return httpx.Response(200, json=payload)
 
         client = self._make_client(handler)
         provider = KrakenRestProvider(client, monotonic_ns=lambda: self.monotonic_ns, wall_us=lambda: self.wall_us)
-        deadline = self.wall_us / 1_000_000 + 5.0
+        deadline = self.monotonic_ns / 1_000_000_000 + 5.0
         obs = provider.fetch_ticker(deadline=deadline)
 
         self.assertEqual(obs.raw_payload_hash, expected_hash)
@@ -250,7 +251,7 @@ class KrakenProviderTests(unittest.TestCase):
 
         client = self._make_client(handler)
         provider = KrakenRestProvider(client, monotonic_ns=lambda: self.monotonic_ns, wall_us=lambda: self.wall_us)
-        deadline = self.wall_us / 1_000_000 + 5.0
+        deadline = self.monotonic_ns / 1_000_000_000 + 5.0
         obs = provider.fetch_ticker(deadline=deadline)
 
         self.assertEqual(obs.result, "success")
@@ -265,7 +266,7 @@ class KrakenProviderTests(unittest.TestCase):
 
         client = self._make_client(handler)
         provider = KrakenRestProvider(client, monotonic_ns=lambda: self.monotonic_ns, wall_us=lambda: self.wall_us)
-        deadline = self.wall_us / 1_000_000 + 5.0
+        deadline = self.monotonic_ns / 1_000_000_000 + 5.0
         obs = provider.fetch_ticker(deadline=deadline)
 
         self.assertEqual(obs.parser_revision, "kraken-ticker-v1")
@@ -286,7 +287,7 @@ class KrakenProviderTests(unittest.TestCase):
 
         client = self._make_client(handler)
         provider = KrakenRestProvider(client, monotonic_ns=lambda: self.monotonic_ns, wall_us=lambda: self.wall_us)
-        deadline = self.wall_us / 1_000_000 + 5.0
+        deadline = self.monotonic_ns / 1_000_000_000 + 5.0
         obs = provider.fetch_ticker(deadline=deadline)
 
         self.assertEqual(obs.bid_price, Decimal("49999.50"))
@@ -302,7 +303,7 @@ class KrakenProviderTests(unittest.TestCase):
 
         client = self._make_client(handler)
         provider = KrakenRestProvider(client, monotonic_ns=lambda: self.monotonic_ns, wall_us=lambda: self.wall_us)
-        deadline = self.wall_us / 1_000_000 + 5.0
+        deadline = self.monotonic_ns / 1_000_000_000 + 5.0
         obs = provider.fetch_ticker(deadline=deadline)
 
         self.assertEqual(obs.result, "success")

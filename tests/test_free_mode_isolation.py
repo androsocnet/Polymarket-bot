@@ -1,6 +1,7 @@
 import threading
 import unittest
 from decimal import Decimal
+from typing import Any
 from unittest.mock import Mock
 
 from polymarket_bot.recorder.free_reference import ApproximateObservation, ApproximateReferenceReport
@@ -13,7 +14,7 @@ from tests.recorder_support import RecorderFixture
 
 class FreeModeIsolationTests(unittest.TestCase):
     def fixture(self, approximate=False):
-        fixture = RecorderFixture()
+        fixture: Any = RecorderFixture()
         self.addCleanup(fixture.close)
         if approximate:
             fixture.store.close()
@@ -21,9 +22,115 @@ class FreeModeIsolationTests(unittest.TestCase):
             fixture.store = RecorderStore.open_approximate(fixture.db.path)
         return fixture
 
-    def recorder(self, fixture, **kwargs):
+    def recorder(self, fixture, **kwargs) -> Any:
         return Recorder(fixture.store, fixture.public, monotonic_ns=fixture.monotonic_ns,
             wall_us=fixture.wall_us, sleep=fixture.sleep, **kwargs)
+
+    def test_failed_join_keeps_store_open_and_worker_handle(self):
+        from polymarket_bot.market_data.models import MarketDataError
+        fixture = self.fixture(True)
+        recorder = self.recorder(fixture, approximate_reference=Mock())
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        def fetch(**kwargs):
+            entered.set()
+            release.wait(10)
+            return None
+        recorder.approximate_reference.fetch.side_effect = fetch
+        def hook(request, payload, f):
+            if request.url.path == '/books':
+                entered.wait(1)
+        fixture.hook = hook
+        from unittest.mock import patch
+        from polymarket_bot.recorder.service import ApproximateReferenceWorker
+        original = ApproximateReferenceWorker.stop
+        def execute(*args, **kwargs):
+            recorder.approximate_worker = ApproximateReferenceWorker()
+            recorder.approximate_worker.submit(lambda: fetch())
+            self.assertTrue(entered.wait(1))
+            raise MarketDataError('original_failure', 'original')
+        with patch.object(recorder, '_record', side_effect=execute), patch.object(
+                ApproximateReferenceWorker, 'stop', lambda worker: original(worker, timeout=0.01)):
+            result = recorder.run(RunConfig(mode='APPROXIMATE_REFERENCE'), should_stop=lambda: False)
+            self.assertEqual(result.reason, 'original_failure')
+        self.assertFalse(fixture.store._closed)
+        self.assertIsNotNone(recorder.approximate_worker._thread)
+        release.set()
+        recorder.approximate_worker.stop()
+
+    def test_storage_failure_survives_failed_worker_stop(self):
+        from unittest.mock import patch
+        from polymarket_bot.recorder.service import ApproximateReferenceWorker
+        fixture = self.fixture(True)
+        recorder = self.recorder(fixture, approximate_reference=Mock())
+        release = threading.Event()
+        self.addCleanup(release.set)
+        def record(*args, **kwargs):
+            recorder.approximate_worker.submit(lambda: release.wait(10))
+            raise RecorderStoreError('storage_failure', 'original storage error')
+        stop = ApproximateReferenceWorker.stop
+        with patch.object(recorder, '_record', side_effect=record), patch.object(
+                ApproximateReferenceWorker, 'stop', lambda worker: stop(worker, timeout=0.01)):
+            result = recorder.run(RunConfig(mode='APPROXIMATE_REFERENCE'), should_stop=lambda: False)
+        self.assertEqual(result.reason, 'storage_failure')
+        self.assertEqual(result.exit_code, 1)
+        self.assertFalse(fixture.store._closed)
+        release.set()
+        recorder.approximate_worker.stop()
+
+    def test_run_deadline_stops_during_worker_and_joins(self):
+        from unittest.mock import patch
+        fixture = self.fixture(True)
+        session = Mock()
+        recorder = self.recorder(fixture, approximate_reference=session)
+        entered, release = threading.Event(), threading.Event()
+        def fetch(**kwargs):
+            entered.set()
+            self.assertLessEqual(kwargs['deadline'], recorder.run_deadline_ns / 1000000000)
+            release.wait(1)
+            return None
+        session.fetch.side_effect = fetch
+        def record(config, *, should_stop):
+            recorder.run_id = fixture.store.start_run(config, wall_us=fixture.wall_us(), app_revision='pilot-test')
+            recorder._calibrate(recorder.public.monotonic() + 10)
+            recorder._approximate_submit(recorder.run_deadline_ns + 10000000000)
+            self.assertTrue(entered.wait(1))
+            fixture.sleep(2)
+            self.assertTrue(should_stop())
+            release.set()
+            recorder._shutdown('STOPPED', 'STOP_REQUESTED')
+            from polymarket_bot.recorder.models import RunResult
+            return RunResult('', 'STOPPED', 0, 0, 'STOP_REQUESTED')
+        with patch.object(recorder, '_record', side_effect=record):
+            result = recorder.run(RunConfig(mode='APPROXIMATE_REFERENCE'), should_stop=lambda: False,
+                                  deadline_ns=fixture.monotonic_ns() + 1000000000)
+        self.assertEqual(result.exit_code, 0)
+        self.assertFalse(recorder.approximate_worker._thread is not None
+                         and recorder.approximate_worker._thread.is_alive())
+        self.assertTrue(fixture.store._closed)
+
+    def test_stop_and_interrupt_recovery_errors_survive_failed_join(self):
+        from unittest.mock import patch
+        from polymarket_bot.recorder.service import ApproximateReferenceWorker, _StopRequested
+        for signal in (_StopRequested, KeyboardInterrupt):
+            fixture = self.fixture(True)
+            recorder = self.recorder(fixture, approximate_reference=Mock())
+            release = threading.Event()
+            self.addCleanup(release.set)
+            def record(config, **kwargs):
+                recorder.run_id = fixture.store.start_run(config, wall_us=fixture.wall_us(), app_revision='recovery')
+                recorder.approximate_worker.submit(lambda: release.wait(10))
+                raise signal()
+            stop = ApproximateReferenceWorker.stop
+            with patch.object(recorder, '_record', side_effect=record), patch.object(
+                    fixture.store, 'recover_interrupted', side_effect=RecorderStoreError('recovery_failure', 'original')), patch.object(
+                    ApproximateReferenceWorker, 'stop', lambda worker: stop(worker, timeout=0.01)):
+                result = recorder.run(RunConfig(mode='APPROXIMATE_REFERENCE'), should_stop=lambda: False)
+            self.assertEqual(result.reason, 'recovery_failure')
+            self.assertEqual(result.exit_code, 1)
+            self.assertFalse(fixture.store._closed)
+            release.set()
+            recorder.approximate_worker.stop()
 
     def test_book_only_no_approximate_worker(self):
         for session in (None, Mock()):
@@ -58,7 +165,7 @@ class FreeModeIsolationTests(unittest.TestCase):
         session = Mock()
         def fetch(**kwargs):
             self.assertNotEqual(threading.get_ident(), owner)
-            self.assertGreater(kwargs['deadline'], fixture.wall_us() / 1_000_000)
+            self.assertGreater(kwargs['deadline'], fixture.monotonic_ns() / 1_000_000_000)
             entered.set()
             self.assertTrue(release.wait(2))
             wall = fixture.wall_us()

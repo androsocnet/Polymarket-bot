@@ -16,6 +16,11 @@ from .metrics import measure
 from .models import RunConfig
 from .service import Recorder
 from .store import RecorderStore, RecorderStoreError
+from .free_reference import (
+    ApproximateReferenceSession,
+    CoinbaseRestProvider,
+    KrakenRestProvider,
+)
 
 
 def _utc_us(value: str) -> int:
@@ -35,13 +40,24 @@ def _wall_us() -> int:
     return (now.days * 86400 + now.seconds) * 1_000_000 + now.microseconds
 
 
+def _duration_seconds(value: str) -> float:
+    try:
+        seconds = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError('Duration must be > 0 and <= 120 seconds.') from exc
+    if not 0 < seconds <= 120:
+        raise argparse.ArgumentTypeError('Duration must be > 0 and <= 120 seconds.')
+    return seconds
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Public BTC market recorder; reference runtime disabled.")
     subcommands = parser.add_subparsers(dest="command", required=True)
     record = subcommands.add_parser("record", help="Record public books at fixed two-second slots.")
-    record.add_argument("--mode", required=True, choices=("book-only", "reference-required"))
+    record.add_argument("--mode", required=True, choices=("book-only", "reference-required", "approximate-reference"))
     record.add_argument("--db", required=True, type=Path)
     record.add_argument("--no-fast-path", action="store_true")
+    record.add_argument("--duration-seconds", type=_duration_seconds)
     report = subcommands.add_parser("report", help="Measure an existing database without writes or APIs.")
     report.add_argument("--db", required=True, type=Path)
     report.add_argument("--start", required=True, type=_utc_us, metavar="UTC")
@@ -49,7 +65,61 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _record(path: Path, use_fast_path: bool) -> int:
+_retained_approximate_runs = []
+
+
+def _record(path: Path, use_fast_path: bool, mode: str, duration_seconds: float | None = None) -> int:
+    deadline_ns = None if duration_seconds is None else time.monotonic_ns() + int(
+        _duration_seconds(str(duration_seconds)) * 1_000_000_000)
+    if mode == "approximate-reference":
+        print("APPROXIMATE_REFERENCE: public book evidence with approximate free-source reference; UNVERIFIED.")
+        store = client = exchange_client = recorder = None
+        try:
+            store = RecorderStore.open_approximate(path)
+            client = httpx.Client(trust_env=False, follow_redirects=False)
+            exchange_client = httpx.Client(trust_env=False, follow_redirects=False)
+            if True:
+                public = PublicGet(client, monotonic=time.monotonic, monotonic_ns=time.monotonic_ns,
+                                   sleep=time.sleep, utcnow=lambda: datetime.now(timezone.utc),
+                                   max_attempts=2)
+                coinbase = CoinbaseRestProvider(exchange_client, monotonic_ns=time.monotonic_ns, wall_us=_wall_us)
+                kraken = KrakenRestProvider(exchange_client, monotonic_ns=time.monotonic_ns, wall_us=_wall_us)
+                session = ApproximateReferenceSession(
+                    providers={'coinbase': coinbase, 'kraken': kraken},
+                    monotonic_ns=time.monotonic_ns,
+                    wall_us=_wall_us,
+                    sleep=time.sleep,
+                )
+                recorder = Recorder(store, public, monotonic_ns=time.monotonic_ns,
+                                    wall_us=_wall_us, sleep=time.sleep,
+                                    offline_reference=None, approximate_reference=session)
+                result = recorder.run(RunConfig(mode="APPROXIMATE_REFERENCE", use_fast_path=use_fast_path),
+                                      should_stop=lambda: False, deadline_ns=deadline_ns)
+            print(f"run_id={result.run_id} state={result.state} slots_finalized={result.slots_finalized} reason={result.reason}")
+            return result.exit_code
+        except (RecorderStoreError, sqlite3.DatabaseError, OSError) as exc:
+            print(f"recorder_error: {exc.code if isinstance(exc, RecorderStoreError) else 'storage_failure'}", file=sys.stderr)
+            return 1
+        finally:
+            worker = recorder.approximate_worker if recorder is not None else None
+            active = worker is not None and worker._thread is not None and worker._thread.is_alive()
+            if active:
+                _retained_approximate_runs.append((recorder, client, exchange_client, store))
+            else:
+                if exchange_client is not None:
+                    exchange_client.close()
+                if client is not None:
+                    client.close()
+                if store is not None:
+                    store.close()
+    elif mode == "reference-required":
+        print("activation_required: verified Chainlink reference runtime is unavailable.", file=sys.stderr)
+        return 2
+    else:
+        return _record_book_only(path, use_fast_path, deadline_ns=deadline_ns)
+
+
+def _record_book_only(path: Path, use_fast_path: bool, *, deadline_ns: int | None = None) -> int:
     print("BOOK_ONLY / REFERENCE_INCOMPLETE: public book evidence; no verified live reference coverage.")
     store = None
     try:
@@ -61,7 +131,8 @@ def _record(path: Path, use_fast_path: bool) -> int:
             recorder = Recorder(store, public, monotonic_ns=time.monotonic_ns,
                                 wall_us=_wall_us,
                                 sleep=time.sleep)
-            result = recorder.run(RunConfig(use_fast_path=use_fast_path), should_stop=lambda: False)
+            result = recorder.run(RunConfig(use_fast_path=use_fast_path), should_stop=lambda: False,
+                                  deadline_ns=deadline_ns)
         print(f"run_id={result.run_id} state={result.state} slots_finalized={result.slots_finalized} reason={result.reason}")
         return result.exit_code
     except (RecorderStoreError, sqlite3.DatabaseError, OSError) as exc:
@@ -115,5 +186,5 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.mode == "reference-required":
             print("activation_required: verified Chainlink reference runtime is unavailable.", file=sys.stderr)
             return 2
-        return _record(args.db, not args.no_fast_path)
+        return _record(args.db, not args.no_fast_path, args.mode, args.duration_seconds)
     return _report(args.db, args.start, args.end)

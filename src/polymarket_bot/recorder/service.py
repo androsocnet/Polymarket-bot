@@ -105,7 +105,7 @@ class ApproximateReferenceWorker:
             raise error
         return result
 
-    def stop(self, timeout=5):
+    def stop(self, timeout=10.1):
         with self._lock:
             self._stopped = True
             thread = self._thread
@@ -282,10 +282,13 @@ class Recorder:
         if self.approximate_worker is None or not self.clock.usable() or self.monotonic_ns() >= deadline_ns:
             return False
         anchor, run_id = self.clock.anchor, self.run_id
+        session = self.approximate_reference
+        if anchor is None or session is None:
+            return False
         anchor_id = self.anchor_id
-        deadline = self.wall_us()/1_000_000 + (deadline_ns-self.monotonic_ns())/1_000_000_000
+        deadline = min(deadline_ns, self.run_deadline_ns) / 1_000_000_000
         project = lambda ns: anchor.server_us + (ns-anchor.midpoint_ns)//1000
-        return self.approximate_worker.submit(lambda: self.approximate_reference.fetch(
+        return self.approximate_worker.submit(lambda: session.fetch(
             run_id=run_id, anchor_id=anchor_id, project=project,
             deadline=deadline))
 
@@ -335,11 +338,12 @@ class Recorder:
         return self.clock.server_us_at(self.monotonic_ns())
 
     def _wait(self, deadline_ns):
-        remaining = deadline_ns - self.monotonic_ns()
+        remaining = min(deadline_ns, self.run_deadline_ns) - self.monotonic_ns()
         if remaining > 0:
             self.sleep(remaining / 1_000_000_000)
 
     def _calibrate(self, deadline):
+        deadline = min(deadline, self.run_deadline_ns / 1_000_000_000)
         try:
             read = self._control(lambda: self.public.get_json("clob", "/time", deadline=deadline))
             anchor = self.clock.calibrate(read)
@@ -384,7 +388,7 @@ class Recorder:
 
     def _housekeeping(self, target_ns, *, before_boundary=False):
         """Serial logical jobs share the writer and stop at the armed target."""
-        deadline_ns = target_ns - 1_000_000
+        deadline_ns = min(target_ns - 1_000_000, self.run_deadline_ns)
         if self.monotonic_ns() >= deadline_ns:
             return
         self._reference_housekeeping(deadline_ns)
@@ -507,7 +511,11 @@ class Recorder:
                 self.store.expire_market(market["market_id"], observed_us=now)
         self.known_recovered = True
 
-    def run(self, config: RunConfig, *, should_stop: Callable[[], bool]) -> RunResult:
+    def run(self, config: RunConfig, *, should_stop: Callable[[], bool],
+            deadline_ns: int | None = None) -> RunResult:
+        self.run_deadline_ns = deadline_ns if deadline_ns is not None else 2**63 - 1
+        requested_stop = should_stop
+        should_stop = lambda: self.monotonic_ns() >= self.run_deadline_ns or requested_stop()
         self.run_id, self.finalized = "", 0
         try:
             return self._execute_run(config, should_stop=should_stop)
@@ -529,7 +537,9 @@ class Recorder:
                 if config.mode == 'REFERENCE_REQUIRED' and isinstance(self.offline_reference, ManagedReferenceSession):
                     self.offline_reference.stop()
             finally:
-                self.store.close()
+                worker = self.approximate_worker
+                if worker is None or worker._thread is None or not worker._thread.is_alive():
+                    self.store.close()
 
     def _execute_started_run(self, config, *, should_stop):
         from .reference import OfflineReferenceSession
@@ -563,6 +573,7 @@ class Recorder:
                 self.store.close()
                 return RunResult('', 'FAILED', 2, 0, exc.code)
             self.reference_worker = ReferenceWorker()
+        original_error = None
         original_attempts = self.public.max_attempts
         original_guard = self.public.before_attempt
         def stop_guard():
@@ -578,6 +589,7 @@ class Recorder:
                                                    finish_runs=False, reason="STOP_REQUESTED")
                     self._shutdown("STOPPED", "STOP_REQUESTED")
                 except (RecorderStoreError, sqlite3.DatabaseError, OSError) as exc:
+                    original_error = exc
                     return RunResult(self.run_id, "FAILED", 1, self.finalized,
                         exc.code if isinstance(exc, RecorderStoreError) else "storage_failure")
             return RunResult(self.run_id, "STOPPED", 0, self.finalized, "STOP_REQUESTED")
@@ -588,14 +600,17 @@ class Recorder:
                                                    finish_runs=False, reason="KEYBOARD_INTERRUPT")
                     self._shutdown("INTERRUPTED", "KEYBOARD_INTERRUPT")
             except (RecorderStoreError, sqlite3.DatabaseError, OSError) as exc:
+                original_error = exc
                 return RunResult(self.run_id, "FAILED", 1, self.finalized,
                                  exc.code if isinstance(exc, RecorderStoreError) else "storage_failure")
             return RunResult(self.run_id, "INTERRUPTED", 130, self.finalized, "KEYBOARD_INTERRUPT")
         except (RecorderStoreError, sqlite3.DatabaseError, OSError) as exc:
+            original_error = exc
             # No further persistence or HTTP follows a failed writer/invariant.
             return RunResult(self.run_id, "FAILED", 1, self.finalized,
                              exc.code if isinstance(exc, RecorderStoreError) else "storage_failure")
         except MarketDataError as exc:
+            original_error = exc
             if self.run_id and not self.store._write_failed:
                 self.store.recover_interrupted(wall_us=self.wall_us(), run_id=self.run_id, finish_runs=False)
                 self.store.finish_run(self.run_id, state='FAILED', wall_us=self.wall_us(), reason=exc.code)
@@ -609,14 +624,20 @@ class Recorder:
             finally:
                 try:
                     if self.approximate_worker is not None:
-                        self.approximate_worker.stop()
+                        try:
+                            self.approximate_worker.stop()
+                        except MarketDataError:
+                            if original_error is None:
+                                raise
                 finally:
                     try:
                         from .reference import ManagedReferenceSession
                         if config.mode == 'REFERENCE_REQUIRED' and isinstance(self.offline_reference, ManagedReferenceSession):
                             self.offline_reference.stop()
                     finally:
-                        self.store.close()
+                        worker = self.approximate_worker
+                        if worker is None or worker._thread is None or not worker._thread.is_alive():
+                            self.store.close()
 
     def _shutdown(self, state, reason):
         if self.reference_worker is not None:
@@ -695,7 +716,7 @@ class Recorder:
                 started_us = self._now()
                 try:
                     candidate = self._control(lambda: acquire_market(self.gamma, self.public,
-                        clock=self.clock, deadline=self.public.monotonic()+10,
+                        clock=self.clock, deadline=min(self.public.monotonic()+10, self.run_deadline_ns/1_000_000_000),
                         use_fast_path=config.use_fast_path))
                 except MarketDataError as exc:
                     self._clock_ready_after_io("ANCHOR_EXPIRED_DURING_DISCOVERY")
@@ -784,7 +805,7 @@ class Recorder:
             self.public.on_attempt = None
             try:
                 books = collect_books(self.public, market,
-                    deadline=self.clock.deadline_ns(min(target.scheduled_us+2_000_000, end_us))/1_000_000_000,
+                    deadline=min(self.run_deadline_ns, self.clock.deadline_ns(min(target.scheduled_us+2_000_000, end_us)))/1_000_000_000,
                     receipt_server_us=lambda moment: project(round(moment*1_000_000_000)),
                     uncertainty_us=self.clock.anchor.uncertainty_us)
             finally:

@@ -125,12 +125,16 @@ def _split_schema(script: str) -> tuple[str, str]:
 def _load_v1_schema() -> str:
     """Load v1-only schema (without approximate tables)."""
     script = Path(__file__).with_name("schema.sql").read_text(encoding="utf-8")
-    return _split_schema(script)[0]
+    return script
 
 
 def _load_v2_schema() -> str:
     """Load full v2 schema (with approximate tables)."""
-    return Path(__file__).with_name("schema.sql").read_text(encoding="utf-8")
+    base = _load_v1_schema().replace(
+        "mode IN ('BOOK_ONLY', 'REFERENCE_REQUIRED')",
+        "mode IN ('BOOK_ONLY', 'REFERENCE_REQUIRED', 'APPROXIMATE_REFERENCE')",
+    )
+    return base + Path(__file__).with_name("schema_v2.sql").read_text(encoding="utf-8")
 
 
 class RecorderStore:
@@ -152,7 +156,8 @@ class RecorderStore:
         try:
             connection = sqlite3.connect(canonical.as_uri() + "?mode=ro", uri=True, timeout=0)
             connection.execute("PRAGMA query_only=ON")
-            script = _load_v2_schema()
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            script = _load_v1_schema() if version == 1 else _load_v2_schema()
             cls._verify_existing(connection, script, approximate=False)
             store = cls(canonical, None, connection)
             store._read_only = True
@@ -238,7 +243,7 @@ class RecorderStore:
         if version not in (1, 2):
             raise RecorderStoreError("unknown_schema", "Existing recorder database schema version is unsupported.")
         if version == 1:
-            v1_script = _split_schema(v2_script)[0]
+            v1_script = _load_v1_schema()
             expected = _schema_contract(v1_script)
         else:
             expected = _schema_contract(v2_script)
@@ -1276,7 +1281,7 @@ and (fetch.attempt.path == '/ws/v1' or association.target_us <= fetch.received_s
         """Insert into approximate_observations. Returns observation_id."""
         self._check_writer()
         _require(isinstance(observation, ApproximateObservation), "Approximate observation record is required.")
-        _require(observation.provider and observation.pair and observation.quote_currency,
+        _require(bool(observation.provider and observation.pair and observation.quote_currency),
                  "Approximate observation requires provider, pair, and quote_currency.")
         _require(observation.result in ("success", "error"), "Observation result must be success or error.")
         _require(type(observation.receipt_wall_us) is int and observation.receipt_wall_us >= 0,
@@ -1302,7 +1307,10 @@ and (fetch.attempt.path == '/ws/v1' or association.target_us <= fetch.received_s
             _require(type(observation.error_code) is str and 1 <= len(observation.error_code) <= 64,
                      "Observation error_code must be a non-empty string.")
 
-        price_text = decimal_text(observation.price)
+        if observation.result == "success":
+            _require(observation.price is not None and observation.price.is_finite()
+                     and observation.price > 0, "Successful observation requires positive finite price.")
+        price_text = decimal_text(observation.price) if observation.price is not None else None
         bid_price_text = decimal_text(observation.bid_price) if observation.bid_price is not None else None
         ask_price_text = decimal_text(observation.ask_price) if observation.ask_price is not None else None
 
@@ -1325,7 +1333,8 @@ and (fetch.attempt.path == '/ws/v1' or association.target_us <= fetch.received_s
                 parser_revision=observation.parser_revision,
                 http_status=observation.http_status,
                 result=observation.result,
-                error_code=observation.error_code
+                error_code=observation.error_code,
+                receipt_mono_ns=observation.receipt_mono_ns
             ))
 
     def save_approximate_reference(
@@ -1371,5 +1380,7 @@ and (fetch.attempt.path == '/ws/v1' or association.target_us <= fetch.received_s
                 verification_status=report.verification_status,
                 receipt_wall_us=report.receipt_wall_us,
                 receipt_server_us=report.receipt_server_us,
-                diagnostics_json=diagnostics_json
+                diagnostics_json=diagnostics_json,
+                receipt_mono_ns=report.receipt_mono_ns,
+                window_time_domain=report.window_time_domain
             ))

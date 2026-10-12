@@ -9,10 +9,7 @@ from tests.recorder_support import DatabaseFixture
 
 class FreeSchemaTests(unittest.TestCase):
     def setUp(self):
-        try:
-            self.module = importlib.import_module("polymarket_bot.recorder.store")
-        except ModuleNotFoundError:
-            self.module = None
+        self.module = importlib.import_module("polymarket_bot.recorder.store")
         self.assertIsNotNone(self.module, "RecorderStore module is missing")
         self.fixture = DatabaseFixture()
         self.addCleanup(self.fixture.close)
@@ -28,6 +25,40 @@ class FreeSchemaTests(unittest.TestCase):
         reader.execute("PRAGMA foreign_keys=ON")
         self.addCleanup(reader.close)
         return reader
+
+    def test_trusted_v1_schema_opens_without_changes(self):
+        import subprocess
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parents[1]
+        trusted = subprocess.check_output(
+            ["git", "show", "e115b2f:src/polymarket_bot/recorder/schema.sql"],
+            cwd=root,
+        ).decode("utf-8")
+        with closing(sqlite3.connect(self.fixture.path)) as connection:
+            connection.executescript(trusted + "\nPRAGMA user_version=1;")
+        before = self.fixture.path.read_bytes()
+        self.open().close()
+        self.assertEqual(self.fixture.path.read_bytes(), before)
+        self.assertEqual(self.module._load_v1_schema(), trusted)
+
+    def test_failed_observations_persist_without_price(self):
+        import hashlib
+        from polymarket_bot.recorder.free_reference import ApproximateObservation
+        from polymarket_bot.recorder.models import RunConfig
+        store = self.module.RecorderStore.open_approximate(self.fixture.path)
+        self.addCleanup(store.close)
+        run = store.start_run(RunConfig(mode="APPROXIMATE_REFERENCE"), wall_us=100000000,
+                              app_revision="regression")
+        obs = ApproximateObservation("coinbase", "BTC/USD", "USD", None, None, None,
+            None, 100000000, None, hashlib.sha256(b"").hexdigest(), 0, "rest",
+            "coinbase-ticker-v1", None, "error", "TRANSPORT_TIMEOUT", 1000)
+        for _ in range(2):
+            store.save_approximate_observation(run, obs)
+        rows = store._rows("SELECT * FROM approximate_observations")
+        self.assertEqual(len(rows), 2)
+        self.assertIsNone(rows[0]["price_text"])
+        self.assertEqual(rows[0]["receipt_mono_ns"], 1000)
 
     def test_v1_database_rejects_approximate_mode(self):
         """Create v1 database (BOOK_ONLY), then try to open for approximate -> expect schema_version_mismatch."""

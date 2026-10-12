@@ -76,6 +76,11 @@ class ReadOnlyBoundaryTests(unittest.TestCase):
                             self.assertEqual(path, root/"polymarket_bot"/"recorder"/"store.py")
                         elif re.search(r"^https?://[^/]*dataengine\.chain\.link", node.value):
                             self.assertIn(path.name, ("chainlink_discovery.py", "chainlink_rest.py", "chainlink_ws.py"))
+                        elif path.name == "free_reference.py":
+                            self.assertIn(node.value, (
+                                "https://api.exchange.coinbase.com/products/BTC-USD/ticker",
+                                "https://api.kraken.com/0/public/Ticker?pair=XBTUSD&assetVersion=1",
+                            ))
                         else:
                             self.assertIn(node.value,("https://gamma-api.polymarket.com","https://clob.polymarket.com",
                                                       "https://data-api.polymarket.com", "https://clob.polymarket.com/books"))
@@ -88,12 +93,15 @@ class ReadOnlyBoundaryTests(unittest.TestCase):
                         self.assertEqual({kw.arg: ast.literal_eval(kw.value) for kw in node.keywords},
                                           {"stream": True, "auth": None, "follow_redirects": False})
                     if node.func.attr == "send" and path.name != "chainlink_discovery.py":
-                        self.assertEqual(path.name, "chainlink_rest.py")
+                        self.assertIn(path.name, ("chainlink_rest.py", "free_reference.py"))
                         self.assertEqual(ast.unparse(node.func.value), "self._client")
                         self.assertEqual(ast.unparse(node.args[0]), "request")
                         self.assertEqual({kw.arg: ast.literal_eval(kw.value) for kw in node.keywords},
-                                         {"stream": True, "follow_redirects": False})
-                        chainlink_sends.append(node)
+                                          {"stream": True, "auth": None, "follow_redirects": False}
+                                          if path.name == "free_reference.py" else
+                                          {"stream": True, "follow_redirects": False})
+                        if path.name == "chainlink_rest.py":
+                            chainlink_sends.append(node)
                     if node.func.attr in ("stream","request","post","put","patch","delete"):
                         raw_sites.append((path.name,node))
         self.assertEqual(len(chainlink_sends), 1)

@@ -184,6 +184,23 @@ class FreeMetricsTests(unittest.TestCase):
         self.assertEqual(report.approximate_coverage["coinbase"]["fallbacks"], 1)
         self.assertEqual(report.approximate_coverage["kraken"]["fallbacks"], 2)
 
+    def test_interval_counts_and_unavailable_slot_coverage(self):
+        store, run = self.fixture_v2()
+        self._seed_approximate_observation(store, run, "coinbase", NOW_US - 1)
+        self._seed_approximate_observation(store, run, "coinbase", NOW_US + 1)
+        self._seed_approximate_observation(store, run, "coinbase", NOW_US + 2, result="error")
+        self._seed_approximate_reference(store, run, NOW_US + 1, "coinbase")
+        self._seed_approximate_reference(store, run, NOW_US + 2, "kraken", True)
+        store._connection.execute("UPDATE approximate_references SET value_text=NULL WHERE was_fallback=1")
+        store._connection.commit()
+        report = self.metrics().measure(store, start_us=NOW_US, end_us=NOW_US + 5)
+        self.assertEqual(report.approximate_observations_by_provider["coinbase"], 2)
+        self.assertEqual(report.approximate_coverage["coinbase"]["successes"], 1)
+        self.assertEqual(report.approximate_fallback_count, 0)
+        self.assertIsNone(report.approximate_coverage["coinbase"]["slot_coverage_percent"])
+        self.assertEqual(report.approximate_coverage["coinbase"]["coverage_unavailable_reason"],
+                         "MISSING_SLOT_LINKAGE_AND_DURABLE_AS_OF_EVIDENCE")
+
     def test_v1_database_approximate_metrics_none(self):
         """v1 DB has no approximate tables → metrics return None or zero."""
         metrics = self.metrics()

@@ -32,7 +32,7 @@ class FreeReferenceModelTests(unittest.TestCase):
             error_code=None,
         )
         with self.assertRaises(FrozenInstanceError):
-            obs.price = Decimal("1")
+            setattr(obs, "price", Decimal("1"))
 
     def test_report_mode_hardcoded_approximate(self):
         report = ApproximateReferenceReport(
@@ -107,6 +107,7 @@ class FreeReferenceModelTests(unittest.TestCase):
             result="success",
             error_code=None,
         )
+        assert obs.price is not None
         self.assertTrue(obs.price < 0)
 
     def test_observation_source_timestamp_us_can_be_none(self):

@@ -6,6 +6,7 @@ bytes supplement the measured file size; they never stand in for file growth.
 from dataclasses import dataclass, field
 from collections import Counter, defaultdict
 from fractions import Fraction
+from typing import Any
 import json
 import math
 
@@ -295,7 +296,7 @@ def _resolutions(store, markets, server_end_us, wall_end_us):
                  learning_delay_seconds=nearest_rank_percentiles(delays),unknown_learning_delay_count=unknown)
 
 
-def _approximate_coverage(store, grid, slots, markets, runs, end_us):
+def _approximate_coverage(store, grid, slots, markets, runs, end_us, start_us=0) -> dict[str, Any]:
     """Read-only approximate reference coverage from approximate_* tables only.
 
     Approximate observations and references are credential-free, unverified
@@ -314,24 +315,42 @@ def _approximate_coverage(store, grid, slots, markets, runs, end_us):
             approximate_coverage={},
         )
     provider_observations: Counter = Counter()
+    observation_rows = []
     if "approximate_observations" in existing:
         observation_rows = store._rows("""SELECT provider,result FROM approximate_observations
-            WHERE receipt_wall_us<=?""", (end_us,))
+            WHERE receipt_wall_us>=? AND receipt_wall_us<=?""", (start_us, end_us))
         for row in observation_rows:
             provider_observations[row["provider"]] += 1
-    reference_rows = store._rows("""SELECT reference_id,source_provider,was_fallback
-        FROM approximate_references WHERE receipt_wall_us<=?""", (end_us,))
+    reference_rows = store._rows("""SELECT reference_id,source_provider,was_fallback,value_text,observation_count
+        FROM approximate_references WHERE receipt_wall_us>=? AND receipt_wall_us<=?""", (start_us, end_us))
     fallback_references = 0
-    coverage_by_provider: dict[str, dict] = defaultdict(lambda: dict(observations=0,references=0,fallbacks=0))
+    coverage_by_provider: dict[str, dict[str, Any]] = defaultdict(lambda: dict(
+        observations=0, attempts=0, successes=0, missing=0, references=0,
+        reference_valid=0, fallbacks=0, fallback_valid=0,
+        slot_coverage_percent=None, slot_denominator=None,
+        coverage_unavailable_reason="MISSING_SLOT_LINKAGE_AND_DURABLE_AS_OF_EVIDENCE"))
+    for row in observation_rows:
+        counts = coverage_by_provider[row["provider"]]
+        counts["attempts"] += 1
+        counts["successes"] += row["result"] == "success"
+        counts["missing"] += row["result"] != "success"
     for row in reference_rows:
         providers = [p for p in (row.get("source_provider") or "").split(",") if p]
         for provider in providers:
             coverage_by_provider[provider]["references"] += 1
-        was_fallback = bool(row.get("was_fallback"))
+        valid = False
+        try:
+            valid = row["observation_count"] > 0 and parse_decimal(row["value_text"], field="approximate metric") > 0
+        except MarketDataError:
+            pass
+        for provider in providers:
+            coverage_by_provider[provider]["reference_valid"] += valid
+        was_fallback = bool(row.get("was_fallback")) and valid
         if was_fallback:
             fallback_references += 1
             for provider in providers:
                 coverage_by_provider[provider]["fallbacks"] += 1
+                coverage_by_provider[provider]["fallback_valid"] += 1
     for provider, count in provider_observations.items():
         coverage_by_provider[provider]["observations"] = count
     return dict(
@@ -551,7 +570,7 @@ def measure(store: RecorderStore, *, start_us: int, end_us: int) -> MeasurementR
         sum(key in slots and slots[key]["status"]==status for key in upper)) if bounds is not None else None
         for status in percentages}
     reference = _references(store,grid,slots,markets,runs,end_us,server_end)
-    approximate = _approximate_coverage(store,grid,slots,markets,runs,end_us)
+    approximate = _approximate_coverage(store,grid,slots,markets,runs,end_us,start_us)
     discovery_by_domain = {domain:_union_duration((gap["started_us"],gap["ended_us"])
         for gap in discovery if gap["time_domain"]==domain)/1_000_000
         for domain in {gap["time_domain"] for gap in discovery}}

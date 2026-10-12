@@ -32,7 +32,7 @@ class SampleMeanEngineTests(unittest.TestCase):
             ask_price=Decimal(price),
             source_timestamp_us=source_ts_us,
             receipt_wall_us=receipt,
-            receipt_server_us=receipt // 1000,
+            receipt_server_us=None,
             raw_payload_hash="abc",
             raw_payload_size=100,
             transport_type="rest",
@@ -53,7 +53,7 @@ class SampleMeanEngineTests(unittest.TestCase):
             ask_price=Decimal(price),
             source_timestamp_us=None,
             receipt_wall_us=receipt,
-            receipt_server_us=receipt // 1000,
+            receipt_server_us=None,
             raw_payload_hash="def",
             raw_payload_size=100,
             transport_type="rest",
@@ -62,6 +62,21 @@ class SampleMeanEngineTests(unittest.TestCase):
             result="error" if error_code else "success",
             error_code=error_code,
         )
+
+    def test_mean_independent_of_ambient_decimal_context(self):
+        from decimal import localcontext, Inexact, ROUND_DOWN, ROUND_UP
+        observations = [self._make_coinbase_obs(value) for value in ('1', '1', '2')]
+        results = []
+        for precision, rounding in ((3, ROUND_DOWN), (19, ROUND_UP)):
+            with localcontext() as context:
+                context.prec = precision
+                context.rounding = rounding
+                context.traps[Inexact] = True
+                results.append(compute_approximate_sample_mean_60s(observations,
+                    receipt_server_us=None, receipt_wall_us=self.receipt_wall_us).value)
+        self.assertEqual(results[0], results[1])
+        assert results[0] is not None
+        self.assertEqual(len(results[0].as_tuple().digits), 512)
 
     def test_coinbase_selected_when_valid(self):
         """Coinbase observation within window and valid → used as primary."""
@@ -240,7 +255,7 @@ class ApproximateReferenceSessionTests(unittest.TestCase):
             ask_price=Decimal(price),
             source_timestamp_us=receipt - 1_000_000 if provider == "coinbase" else None,
             receipt_wall_us=receipt,
-            receipt_server_us=receipt // 1000,
+            receipt_server_us=None,
             raw_payload_hash="abc",
             raw_payload_size=100,
             transport_type="rest",
@@ -249,6 +264,33 @@ class ApproximateReferenceSessionTests(unittest.TestCase):
             result="error" if error_code else "success",
             error_code=error_code,
         )
+
+    def test_rolling_history_mean_and_bounded_eviction(self):
+        providers = {name: MockProvider(name, self._make_obs(name, '10'))
+                     for name in ('coinbase', 'kraken')}
+        session = ApproximateReferenceSession(providers=providers,
+            monotonic_ns=lambda: self.monotonic_ns, wall_us=lambda: self.wall_us,
+            sleep=lambda seconds: None)
+        session.fetch(run_id='run', anchor_id=None, project=None,
+                      deadline=self.wall_us / 1000000 + 5)
+        self.wall_us += 2000000
+        self.monotonic_ns += 2000000000
+        providers['coinbase'] = MockProvider('coinbase', self._make_obs('coinbase', '20'))
+        session._providers = providers
+        report, observations = session.fetch(run_id='run', anchor_id=None, project=None,
+                                             deadline=self.wall_us / 1000000 + 5)
+        self.assertEqual(report.value, Decimal('15'))
+        self.assertEqual(report.observation_count, 2)
+        self.assertIn('OBSERVATION_GAP', report.diagnostics)
+        self.assertEqual(len(observations), 2)
+        self.wall_us += 61000000
+        self.monotonic_ns += 61000000000
+        providers['coinbase'] = MockProvider('coinbase', self._make_obs('coinbase', '30'))
+        report, _ = session.fetch(run_id='run', anchor_id=None, project=None,
+                                  deadline=self.wall_us / 1000000 + 5)
+        self.assertEqual(report.value, Decimal('30'))
+        self.assertIn('EXCLUDED_STALE_OBSERVATIONS', report.diagnostics)
+        self.assertLessEqual(len(session._history['coinbase']), 64)
 
     def test_fetch_returns_report_and_observations(self):
         """Session.fetch returns (report, tuple_of_observations)."""
@@ -271,7 +313,7 @@ class ApproximateReferenceSessionTests(unittest.TestCase):
         )
         self.assertIsInstance(report, ApproximateReferenceReport)
         self.assertIsInstance(observations, tuple)
-        self.assertEqual(len(observations), 1)
+        self.assertEqual(tuple(obs.provider for obs in observations), ("coinbase", "kraken"))
         self.assertEqual(observations[0].provider, "coinbase")
 
     def test_coinbase_primary(self):
@@ -296,7 +338,7 @@ class ApproximateReferenceSessionTests(unittest.TestCase):
         self.assertEqual(report.source_provider, "coinbase")
         self.assertFalse(report.was_fallback)
         self.assertEqual(report.value, Decimal("50000.00"))
-        self.assertEqual(len(observations), 1)
+        self.assertEqual(tuple(obs.provider for obs in observations), ("coinbase", "kraken"))
         self.assertEqual(observations[0].provider, "coinbase")
 
     def test_kraken_fallback_when_coinbase_fails(self):
@@ -322,8 +364,9 @@ class ApproximateReferenceSessionTests(unittest.TestCase):
         self.assertTrue(report.was_fallback)
         self.assertEqual(report.value, Decimal("50100.00"))
         self.assertIn("FALLBACK_COINBASE_HTTP_ERROR", report.diagnostics)
-        self.assertEqual(len(observations), 1)
-        self.assertEqual(observations[0].provider, "kraken")
+        self.assertEqual(tuple(obs.provider for obs in observations), ("coinbase", "kraken"))
+        self.assertEqual(observations[1].provider, "kraken")
+        self.assertEqual(observations[0].error_code, "HTTP_ERROR")
 
     def test_both_fail(self):
         """Both providers fail → value=None, diagnostics recorded."""

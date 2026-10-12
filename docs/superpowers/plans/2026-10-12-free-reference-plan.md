@@ -10,6 +10,14 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-12-free-reference-design.md`
 
+## Implementation ledger
+
+Controller approved extending the trusted static public-boundary test only for
+`free_reference.py` and the exact Coinbase BTC-USD ticker and Kraken public Ticker
+routes. Existing private/auth/trading prohibitions remain unchanged; streamed
+requests must retain `auth=None`, `follow_redirects=False`, and fixed routes.
+No commits, agents, or live network authorized during corrective wave.
+
 ## Global Constraints
 
 - Python >=3.12 (from `pyproject.toml`)
