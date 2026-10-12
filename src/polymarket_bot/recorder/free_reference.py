@@ -1,4 +1,4 @@
-"""FREE_REFERENCE approximate observation model and provider protocol.
+"""FREE_REFERENCE approximate observation model, provider protocol, engine, and session.
 
 Approximate observations are credential-free, never VERIFIED, and carry no
 Chainlink signature or boundary semantics. They provide sample-mean evidence
@@ -411,3 +411,238 @@ class CoinbaseRestProvider:
             result="error",
             error_code=error_code,
         )
+
+
+_WINDOW_US = 60_000_000
+
+
+def _observation_fresh(obs: ApproximateObservation, receipt_wall_us: int) -> bool:
+    if obs.result != "success" or obs.error_code is not None:
+        return False
+    if obs.receipt_wall_us is None or obs.receipt_wall_us > receipt_wall_us:
+        return False
+    if obs.receipt_wall_us < receipt_wall_us - _WINDOW_US:
+        return False
+    if obs.source_timestamp_us is not None and obs.source_timestamp_us > receipt_wall_us:
+        return False
+    return True
+
+
+def compute_approximate_sample_mean_60s(
+    observations: list[ApproximateObservation],
+    *,
+    receipt_server_us: int,
+    receipt_wall_us: int
+) -> ApproximateReferenceReport:
+    """Compute APPROXIMATE_SAMPLE_MEAN_60S from a 60-second observation window.
+
+    Window: receipt_wall_us - 60_000_000 to receipt_wall_us (inclusive bounds).
+    - Future observations (source_timestamp_us > receipt) are rejected.
+    - Observations with result='error' or error_code set are excluded.
+    - Arithmetic mean of price, bid_price, and ask_price across valid observations.
+    - Returns value=None with diagnostics if no observations fall within the window.
+    - was_fallback and source_provider are set by the session, not the engine.
+    """
+    window_start_us = receipt_wall_us - _WINDOW_US
+    valid: list[ApproximateObservation] = []
+    future_rejected = False
+    stale_excluded = False
+    error_excluded = False
+    for obs in observations:
+        if obs.result != "success" or obs.error_code is not None:
+            error_excluded = True
+            continue
+        if obs.source_timestamp_us is not None and obs.source_timestamp_us > receipt_wall_us:
+            future_rejected = True
+            continue
+        if obs.receipt_wall_us < window_start_us or obs.receipt_wall_us > receipt_wall_us:
+            stale_excluded = True
+            continue
+        valid.append(obs)
+
+    diagnostics: tuple[str, ...] = ()
+    if error_excluded:
+        diagnostics = diagnostics + ("EXCLUDED_ERROR_OBSERVATIONS",)
+    if future_rejected:
+        diagnostics = diagnostics + ("EXCLUDED_FUTURE_OBSERVATIONS",)
+    if stale_excluded:
+        diagnostics = diagnostics + ("EXCLUDED_STALE_OBSERVATIONS",)
+
+    if not valid:
+        if not diagnostics:
+            diagnostics = ("MISSING_OBSERVATIONS",)
+        return ApproximateReferenceReport(
+            reference_kind="APPROXIMATE_SAMPLE_MEAN_60S",
+            window_start_us=window_start_us,
+            window_end_us=receipt_wall_us,
+            observation_count=0,
+            source_provider="",
+            was_fallback=False,
+            receipt_wall_us=receipt_wall_us,
+            value=None,
+            receipt_server_us=receipt_server_us,
+            diagnostics=diagnostics,
+        )
+
+    prices = [obs.price for obs in valid]
+    bids = [obs.bid_price for obs in valid if obs.bid_price is not None]
+    asks = [obs.ask_price for obs in valid if obs.ask_price is not None]
+
+    count = len(valid)
+    mean_price = sum(prices, Decimal("0")) / count
+    bid_value = sum(bids, Decimal("0")) / len(bids) if bids else None
+    ask_value = sum(asks, Decimal("0")) / len(asks) if asks else None
+
+    provider_names = tuple(sorted({obs.provider for obs in valid}))
+
+    return ApproximateReferenceReport(
+        reference_kind="APPROXIMATE_SAMPLE_MEAN_60S",
+        window_start_us=window_start_us,
+        window_end_us=receipt_wall_us,
+        observation_count=count,
+        source_provider=",".join(provider_names),
+        was_fallback=False,
+        receipt_wall_us=receipt_wall_us,
+        value=mean_price,
+        receipt_server_us=receipt_server_us,
+        diagnostics=diagnostics,
+    )
+
+
+class ApproximateReferenceSession:
+    """Orchestrates Coinbase (primary) and Kraken (explicit fallback) for V1.
+
+    Fetches from the primary provider first; if that provider is missing,
+    stale, or errored, falls back to the fallback provider. Returns a report
+    and the observations from the *selected* provider for downstream persistence.
+    Both observations are preserved independently by the persistence layer.
+    """
+
+    _PRIMARY = "coinbase"
+    _FALLBACK = "kraken"
+    _REFERENCE_KIND = "APPROXIMATE_SAMPLE_MEAN_60S"
+
+    def __init__(
+        self,
+        *,
+        providers: dict[str, ApproximateReferenceProvider],
+        monotonic_ns: Callable[[], int],
+        wall_us: Callable[[], int],
+        sleep: Callable[[float], None],
+        project: Callable[[int], int] | None = None,
+    ):
+        self._providers = dict(providers)
+        self._monotonic_ns = monotonic_ns
+        self._wall_us = wall_us
+        self._sleep = sleep
+        self._project = project or (lambda ns: ns // 1000)
+        self._started = False
+
+    def start(self) -> None:
+        self._started = True
+
+    def stop(self) -> None:
+        self._started = False
+
+    def check_health(self) -> None:
+        pass
+
+    def fetch(
+        self,
+        *,
+        run_id: str,
+        anchor_id: int | None,
+        project: Callable[[int], int],
+        deadline: float,
+    ) -> tuple[ApproximateReferenceReport, tuple[ApproximateObservation, ...]]:
+        now_ns = self._monotonic_ns()
+        now_wall_us = self._wall_us()
+        receipt_server_us = project(now_ns)
+
+        primary_obs = self._try_fetch(self._PRIMARY, deadline)
+        primary_usable = self._is_usable(primary_obs, now_wall_us)
+
+        if primary_usable:
+            selected_obs = primary_obs
+            diagnostics: tuple[str, ...] = ()
+            source_provider = self._PRIMARY
+            was_fallback = False
+            all_obs = (primary_obs,)
+        else:
+            primary_error = self._get_error_code(primary_obs)
+            fallback_obs = self._try_fetch(self._FALLBACK, deadline)
+            fallback_usable = self._is_usable(fallback_obs, now_wall_us)
+
+            if fallback_usable:
+                selected_obs = fallback_obs
+                diagnostics = (f"FALLBACK_COINBASE_{primary_error}",)
+                source_provider = self._FALLBACK
+                was_fallback = True
+                all_obs = (fallback_obs,)
+                if primary_obs is not None and primary_obs.result == "success":
+                    all_obs = (primary_obs, fallback_obs)
+            else:
+                selected_obs = None
+                fallback_error = self._get_error_code(fallback_obs)
+                diagnostics = (f"FALLBACK_COINBASE_{primary_error}", f"FALLBACK_KRAKEN_{fallback_error}")
+                source_provider = ""
+                was_fallback = True
+                all_obs = ()
+                if primary_obs is not None:
+                    all_obs = (primary_obs,)
+                if fallback_obs is not None:
+                    all_obs += (fallback_obs,)
+
+        if selected_obs is None:
+            return ApproximateReferenceReport(
+                reference_kind=self._REFERENCE_KIND,
+                window_start_us=now_wall_us - _WINDOW_US,
+                window_end_us=now_wall_us,
+                observation_count=0,
+                source_provider="",
+                was_fallback=was_fallback,
+                receipt_wall_us=now_wall_us,
+                value=None,
+                receipt_server_us=receipt_server_us,
+                diagnostics=diagnostics,
+            ), all_obs
+
+        report = compute_approximate_sample_mean_60s(
+            [selected_obs],
+            receipt_server_us=receipt_server_us,
+            receipt_wall_us=now_wall_us,
+        )
+        report = ApproximateReferenceReport(
+            reference_kind=report.reference_kind,
+            window_start_us=report.window_start_us,
+            window_end_us=report.window_end_us,
+            observation_count=report.observation_count,
+            source_provider=source_provider,
+            was_fallback=was_fallback,
+            receipt_wall_us=report.receipt_wall_us,
+            value=report.value,
+            receipt_server_us=report.receipt_server_us,
+            diagnostics=diagnostics,
+        )
+        return report, all_obs
+
+    def _try_fetch(self, name: str, deadline: float) -> ApproximateObservation | None:
+        try:
+            return self._providers[name].fetch_ticker(deadline=deadline)
+        except (KeyError, Exception):
+            return None
+
+    def _get_error_code(self, obs: ApproximateObservation | None) -> str:
+        if obs is None:
+            return "MISSING_PROVIDER"
+        if obs.error_code:
+            return obs.error_code
+        if obs.result != "success":
+            return "UNKNOWN_ERROR"
+        return "STALE_OBSERVATION"
+
+    def _is_usable(self, obs: ApproximateObservation | None, receipt_wall_us: int) -> bool:
+        if obs is None:
+            return False
+        return _observation_fresh(obs, receipt_wall_us)
+    
