@@ -10,6 +10,14 @@ User-approved ruling overrides older boundary/availability wording: opening and 
 
 Managed production lifecycle must check permission evidence before credential factories, validate Discovery and persisted pins before loading credentials, manage real CP2 REST/WS through injectable interfaces, stop workers and close resources on failures/shutdown. BOOK_ONLY creates no credential resources. Schema v1 unchanged. No runtime network, actual credentials, CP4, private Polymarket, trading, push or merge during implementation. Offline synthetic vectors do not prove DON signatures or grant runtime permission.
 
+### CP3 remediation evidence contract
+
+Managed coverage and replay require exact `REFERENCE_DURABLE` identity: market, role, slot, target, learning wall time, report hash and live flag. Learning timestamps are raw owner observations, not SQLite completion timestamps. The evidence durability transaction is the linked `REFERENCE_COMMIT` barrier committed after association persistence. Only a calibrated receipt sampled after that barrier returns establishes eligibility, strictly before the live two-second deadline and no later than the as-of decision. `REFERENCE_DURABLE` is the subsequently persisted attestation of that already completed barrier, not a claim that its own recording transaction completed at its embedded timestamp. Replay and metrics require resolved persisted barrier and receipt events, both bound to the fetch run, exact identity, increasing event IDs and nondecreasing raw wall times. This resolves older literal proof-commit wording without permitting precommit, backdated or clamped eligibility timestamps. Untagged legacy associations do not count as newly validated managed coverage; pure legacy compatibility remains distinct.
+
+WebSocket fetch identity describes immutable transport arrival, not a later slot target or market. Each slot retains its own association. Conflicting authoritative decoded evidence remains fatal. Failed cleanup retains resource handles and blocks restart until cleanup succeeds. Partial persisted pins fail before credentials. Managed stream health is checked before clock or market work, including periods without slot sampling.
+
+`reconcile_due_reference_boundaries` is quarantined to legacy offline collection: databases containing managed production runs are refused before fetching. Its `offline-reconcile-only-v1` associations are ineligible for replay and coverage, and it never manufactures durability events. DON verification remains `UNVERIFIED`; schema remains `user_version=1`.
+
 ## 1. Purpose and Boundaries
 
 Build the independent BTC reference-price side required for a strategy-complete dataset for the Polymarket BTC 15-minute Up/Down market.
@@ -89,7 +97,7 @@ To maintain point-in-time validity across all research replays, four distinct ti
 1. `source_timestamp`: Consensus oracle observation time (`observations_seconds`, `valid_from_seconds`).
 2. `receipt_timestamp`: Arrival time at the recorder (`first_received_wall_us`, calibrated `first_received_server_us`).
 3. `server/chain_timestamp`: Polymarket CLOB server time from active `clock_anchors`, governing market window sampling.
-4. `learned_timestamp`: SQLite transaction commit time (`learned_wall_us`, `learned_server_us`).
+4. `learned_timestamp`: raw owner learning observation (`learned_wall_us`, `learned_server_us`), not transaction completion. Managed eligibility additionally requires linked post-barrier durability receipt as specified above.
 
 ### Point-in-Time Eligibility Rules (`eligible_as_of`)
 - **Current Reference:** To be used at decision time $T_{\text{decision}}$, a report must satisfy:
