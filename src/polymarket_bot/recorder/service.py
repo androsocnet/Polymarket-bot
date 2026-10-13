@@ -273,10 +273,14 @@ class Recorder:
             raise MarketDataError('approximate_reference_worker_failed', 'Approximate reference worker failed.') from None
         if result is None:
             return
-        report, observations = result
-        for observation in observations:
-            self.store.save_approximate_observation(self.run_id, observation)
-        self.store.save_approximate_reference(self.run_id, report)
+        report, observations, anchor_id = result
+        observation_ids = [self.store.save_approximate_observation(self.run_id, observation)
+                           for observation in observations]
+        reference_id = self.store.save_approximate_reference(self.run_id, report)
+        self.store.record_event(self.run_id, 'DISCOVERY_GAP', started_us=report.receipt_wall_us,
+            ended_us=report.receipt_wall_us, detail=dict(version=1, diagnostic_only=True,
+                type='APPROXIMATE_FETCH', anchor_id=anchor_id,
+                observation_ids=observation_ids, reference_id=reference_id))
 
     def _approximate_submit(self, deadline_ns):
         if self.approximate_worker is None or not self.clock.usable() or self.monotonic_ns() >= deadline_ns:
@@ -288,9 +292,10 @@ class Recorder:
         anchor_id = self.anchor_id
         deadline = min(deadline_ns, self.run_deadline_ns) / 1_000_000_000
         project = lambda ns: anchor.server_us + (ns-anchor.midpoint_ns)//1000
-        return self.approximate_worker.submit(lambda: session.fetch(
-            run_id=run_id, anchor_id=anchor_id, project=project,
-            deadline=deadline))
+        def fetch():
+            result = session.fetch(run_id=run_id, anchor_id=anchor_id, project=project, deadline=deadline)
+            return None if result is None else (*result, anchor_id)
+        return self.approximate_worker.submit(fetch)
 
     def _reference_housekeeping(self, deadline_ns):
         if self.reference_worker is None or not self.clock.usable() or self.monotonic_ns() >= deadline_ns:
