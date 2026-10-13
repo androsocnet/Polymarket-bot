@@ -113,6 +113,40 @@ class CoinbaseProviderTests(unittest.TestCase):
                 observation = provider.fetch_ticker(deadline=self.monotonic_ns / 1_000_000_000 + 5)
             self.assertEqual(observation.result, "error")
 
+    def test_future_source_timestamp_survives_rejection_and_persistence(self):
+        import tempfile
+        from pathlib import Path
+        from polymarket_bot.recorder.models import RunConfig
+        from polymarket_bot.recorder.store import RecorderStore
+        from polymarket_bot.recorder.free_reference import compute_approximate_sample_mean_60s
+        source = self.wall_us + 1_000_000
+        stamp = datetime.fromtimestamp(source / 1_000_000, timezone.utc).isoformat()
+        with self._make_client(lambda request: httpx.Response(200, json={
+                'price': '10', 'bid': '9', 'ask': '11', 'time': stamp})) as client:
+            provider = CoinbaseRestProvider(client, monotonic_ns=lambda: self.monotonic_ns,
+                wall_us=lambda: self.wall_us)
+            obs = provider.fetch_ticker(deadline=self.monotonic_ns / 1_000_000_000 + 5)
+        with tempfile.TemporaryDirectory() as directory:
+            store = RecorderStore.open_approximate(Path(directory) / 'new.sqlite3')
+            try:
+                run = store.start_run(RunConfig(mode='APPROXIMATE_REFERENCE'),
+                    wall_us=self.wall_us, app_revision='test')
+                identifier = store.save_approximate_observation(run, obs)
+                row = store._one('SELECT * FROM approximate_observations WHERE observation_id=?', (identifier,))
+                assert row is not None
+                self.assertEqual(row['source_timestamp_us'], source)
+                self.assertIsNone(row['price_text'])
+                self.assertEqual(row['error_code'], 'FUTURE_SOURCE_TIME')
+            finally:
+                store.close()
+        self.assertIsNone(obs.price)
+        self.assertIsNone(obs.bid_price)
+        self.assertIsNone(obs.ask_price)
+        report = compute_approximate_sample_mean_60s([obs], receipt_wall_us=self.wall_us,
+            receipt_server_us=None, receipt_mono_ns=self.monotonic_ns)
+        self.assertIsNone(report.value)
+        self.assertEqual(report.diagnostics, ('EXCLUDED_ERROR_OBSERVATIONS', 'MISSING_OBSERVATIONS'))
+
     def test_valid_ticker(self):
         """Valid ticker returns price from 'price' field, source_timestamp_us from 'time' field."""
         def handler(request):
@@ -311,8 +345,8 @@ class CoinbaseProviderTests(unittest.TestCase):
         self.assertEqual(obs.result, "error")
         self.assertIsNotNone(obs.error_code)
         self.assertIn("FUTURE_SOURCE_TIME", obs.error_code or "")
-        # source_timestamp_us should not be set to future value
-        self.assertIsNone(obs.source_timestamp_us)
+        self.assertEqual(obs.source_timestamp_us, 1584663777833000)
+        self.assertIsNone(obs.price)
 
     def test_stale_data_handling(self):
         """Old timestamp (e.g., hours ago) → accepted but with old source_timestamp_us."""

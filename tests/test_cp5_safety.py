@@ -36,6 +36,30 @@ class CP5SafetyTests(unittest.TestCase):
             'version': 1, 'diagnostic_only': True, 'type': 'APPROXIMATE_FETCH',
             'anchor_id': 7, 'observation_ids': [11, 12], 'reference_id': 13})
 
+    def test_replay_keeps_rejected_future_timestamp_without_contribution(self):
+        import json
+        observations = [dict(observation_id=i, run_id='run', provider=name,
+            pair='BTC/USD', quote_currency='USD', price_text=None if i == 1 else '100',
+            bid_price_text=None, ask_price_text=None, source_timestamp_us=101_000_000 if i == 1 else None,
+            receipt_wall_us=100_000_000, receipt_server_us=100_000_000,
+            receipt_mono_ns=100_000_000_000, raw_payload_hash='hash', raw_payload_size=1,
+            transport_type='rest', parser_revision='v1', http_status=200,
+            result='error' if i == 1 else 'success', error_code='FUTURE_SOURCE_TIME' if i == 1 else None)
+            for i, name in ((1, 'coinbase'), (2, 'kraken'))]
+        references = [dict(reference_id=1, run_id='run', reference_kind='APPROXIMATE_SAMPLE_MEAN_60S',
+            window_start_us=40_000_000, window_end_us=100_000_000, observation_count=1,
+            source_provider='kraken', was_fallback=1, receipt_wall_us=100_000_000,
+            value_text='100', mode='APPROXIMATE', verification_status='UNVERIFIED',
+            receipt_server_us=100_000_000, receipt_mono_ns=100_000_000_000,
+            window_time_domain='LOCAL_WALL', diagnostics_json=json.dumps([
+                'OBSERVATION_GAP', 'FALLBACK_COINBASE_FUTURE_SOURCE_TIME']))]
+        events = [dict(run_id='run', detail_json=json.dumps(dict(version=1,
+            diagnostic_only=True, type='APPROXIMATE_FETCH', anchor_id=7,
+            observation_ids=[1, 2], reference_id=1)))]
+        anchors = [dict(run_id='run', anchor_id=7, anchor_server_us=0, anchor_mono_ns=0)]
+        self.assertEqual(self.analyzer().replay_rows(observations, references, events, anchors),
+            dict(matched=1, observations=2, exact=True))
+
     def test_replay_requires_complete_membership(self):
         module = self.analyzer()
         with self.assertRaisesRegex(ValueError, 'incomplete'):
@@ -316,6 +340,147 @@ class CP5SafetyTests(unittest.TestCase):
         self.assertEqual(module.align(now=lambda: 901, sleep=waits.append), 899)
         self.assertEqual(waits, [899])
         self.assertEqual(module.align(now=lambda: 1800, sleep=waits.append), 0)
+
+    def test_wait_retries_early_wake_until_deadline(self):
+        from polymarket_bot.recorder.service import Recorder
+        recorder = object.__new__(Recorder)
+        now = [0]
+        recorder.monotonic_ns = lambda: now[0]
+        recorder.run_deadline_ns = 100
+        def sleep(seconds):
+            now[0] += max(1, round(seconds * 1_000_000_000) // 2)
+        recorder.sleep = sleep
+        recorder._wait(80)
+        self.assertEqual(now[0], 80)
+
+    def test_checkpoint_not_admitted_after_reference_consumes_budget(self):
+        from unittest.mock import Mock
+        from polymarket_bot.recorder.service import Recorder
+        recorder = object.__new__(Recorder)
+        now = [0]
+        recorder.monotonic_ns = lambda: now[0]
+        recorder.run_deadline_ns = 100_000_000
+        recorder._reference_housekeeping = lambda deadline_ns: now.__setitem__(0, deadline_ns)
+        recorder._checkpoint_due = Mock()
+        recorder._housekeeping(10_000_000)
+        recorder._checkpoint_due.assert_not_called()
+
+    def test_slot_diagnosis_keeps_all_grid_rows_and_unknown_causes(self):
+        market = dict(market_id='m', window_start_us=0, window_end_us=900_000_000)
+        slots = [dict(market_id='m', slot_id=1, slot_index=1, run_id='r',
+            status='MISSED', reason='PROCESSING_OVERRUN', scheduled_us=2_000_000)]
+        result = self.analyzer().slot_diagnosis(market, slots, [], [], [])
+        self.assertEqual(len(result['rows']), 450)
+        self.assertEqual(result['rows'][1]['cause'], 'UNKNOWN')
+        self.assertEqual(result['rows'][1]['category'], 'UNSENT')
+        self.assertEqual(sum(result['categories'].values()), 450)
+        self.assertEqual(result['contiguous_uncollected_slots'], [450])
+
+    def test_cp5_timing_event_records_observed_monotonic_time(self):
+        from unittest.mock import Mock
+        recorder = object.__new__(self.harness().CP5Recorder)
+        recorder.store = Mock()
+        recorder.run_id = 'run'
+        recorder.monotonic_ns = lambda: 123
+        recorder._timing('WAKE', target_ns=100, slot_index=2)
+        recorder.store.record_event.assert_not_called()
+        detail = recorder._timing_buffer[0][1]
+        self.assertEqual(detail['mono_ns'], 123)
+        self.assertEqual(detail['phase'], 'WAKE')
+        self.assertTrue(detail['diagnostic_only'])
+
+    def test_timing_identity_ends_after_capture_or_changed_target(self):
+        recorder = object.__new__(self.harness().CP5Recorder)
+        recorder.monotonic_ns = lambda: 123
+        for ended in (True, False):
+            with self.subTest(finalized=ended):
+                recorder._timing('SELECTION', market_id='m', slot_index=2, target_ns=100)
+                recorder._timing('HOUSEKEEPING_START', target_ns=100)
+                self.assertEqual(recorder._timing_buffer[-1][1]['market_id'], 'm')
+                recorder._timing('WAKE', target_ns=100)
+                self.assertEqual(recorder._timing_buffer[-1][1]['slot_index'], 2)
+                if ended:
+                    recorder._timing('FINALIZATION_END', slot_id=7, target_ns=100)
+                    self.assertEqual(recorder._timing_buffer[-1][1]['market_id'], 'm')
+                    self.assertEqual(recorder._timing_identity, {})
+                for phase in ('HOUSEKEEPING_START', 'HOUSEKEEPING_END', 'WAIT_START', 'WAKE'):
+                    recorder._timing(phase, target_ns=200)
+                    detail = recorder._timing_buffer[-1][1]
+                    self.assertNotIn('market_id', detail)
+                    self.assertNotIn('slot_index', detail)
+                    self.assertEqual(detail['target_ns'], 200)
+                self.assertEqual(recorder._timing_identity, {})
+
+    def test_diagnosis_partitions_runs_and_controls(self):
+        import json
+        market = dict(market_id='m', window_start_us=0, window_end_us=900_000_000)
+        slots = [dict(market_id='m', slot_id=1, slot_index=1, run_id='r', status='MISSED', reason='PROCESSING_OVERRUN')]
+        attempts = [dict(run_id='other', market_id='other', slot_id=2),
+                    dict(run_id='r', market_id=None, slot_id=None)]
+        result = self.analyzer().slot_diagnosis(market, slots, attempts, [], [])
+        self.assertEqual(result['request_timeline'], [])
+        self.assertEqual(len(result['unassigned_controls']), 1)
+        self.assertEqual(result['rows'][1]['category'], 'UNSENT')
+
+    def test_diagnosis_attempt_failure_categories(self):
+        market = dict(market_id='m', window_start_us=0, window_end_us=900_000_000)
+        for error, expected in [('request_timeout', 'ATTEMPTED_TIMEOUT'),
+                                ('http_error', 'ATTEMPTED_HTTP'),
+                                ('invalid_json', 'ATTEMPTED_MALFORMED')]:
+            slots = [dict(market_id='m', slot_id=1, slot_index=1, run_id='r', status='FAILED', reason=None)]
+            attempts = [dict(run_id='r', market_id='m', slot_id=1, error_code=error)]
+            result = self.analyzer().slot_diagnosis(market, slots, attempts, [], [])
+            self.assertEqual(result['rows'][1]['category'], expected)
+
+    def test_diagnosis_separates_run_grids_and_book_errors(self):
+        market = dict(market_id='m', window_start_us=0, window_end_us=900_000_000)
+        slots = [dict(market_id='m', slot_id=i, slot_index=1, run_id=run,
+            status='FAILED', reason=None) for i, run in [(1, 'a'), (2, 'b')]]
+        attempts = [dict(run_id=run, market_id='m', slot_id=i, error_code=None)
+            for i, run in [(1, 'a'), (2, 'b')]]
+        books = [dict(slot_id=1, status='INVALID', error_code='invalid_book'),
+                 dict(slot_id=2, status='LATE', error_code=None)]
+        result = self.analyzer().slot_diagnosis(market, slots, attempts, [], [], books)
+        self.assertEqual(set(result['runs']), {'a', 'b'})
+        self.assertEqual(result['runs']['a']['rows'][1]['category'], 'ATTEMPTED_MALFORMED')
+        self.assertEqual(result['runs']['b']['rows'][1]['category'], 'ATTEMPTED_LATE')
+        self.assertTrue(all(len(run['rows']) == 450 for run in result['runs'].values()))
+
+    def test_timing_flush_uses_one_transaction_and_no_tail(self):
+        import tempfile
+        from polymarket_bot.recorder.store import RecorderStore
+        from polymarket_bot.recorder.models import RunConfig
+        recorder = object.__new__(self.harness().CP5Recorder)
+        recorder.monotonic_ns = lambda: 123
+        with tempfile.TemporaryDirectory() as directory:
+            recorder.store = RecorderStore.open_approximate(Path(directory) / 'new.sqlite3')
+            recorder.run_id = recorder.store.start_run(RunConfig(mode='APPROXIMATE_REFERENCE'), wall_us=1, app_revision='test')
+            statements = []
+            recorder.store._connection.set_trace_callback(statements.append)
+            recorder._timing('WAKE')
+            recorder._timing('WAKE')
+            recorder._flush_timing()
+            recorder.store.close()
+            self.assertEqual(sum(sql == 'BEGIN IMMEDIATE' for sql in statements), 1)
+            self.assertEqual(recorder._timing_buffer, [])
+
+    def test_shutdown_stops_worker_when_timing_flush_fails(self):
+        from unittest.mock import Mock, patch
+        from polymarket_bot.recorder.service import Recorder
+        recorder = object.__new__(self.harness().CP5Recorder)
+        recorder.reference_worker = None
+        recorder.approximate_worker = Mock()
+        recorder._approximate_drain = Mock()
+        recorder.store = Mock()
+        recorder.run_id = 'run'
+        recorder.wall_us = lambda: 1
+        recorder._flush_timing = Mock(side_effect=OSError('timing flush failed'))
+        with patch('polymarket_bot.recorder.service.take_checkpoint'):
+            with self.assertRaisesRegex(OSError, 'timing flush failed'):
+                recorder._shutdown('STOPPED', 'STOP_REQUESTED')
+        recorder.approximate_worker.stop.assert_called_once_with()
+        recorder._approximate_drain.assert_called_once_with(stopping=True)
+        recorder._flush_timing.assert_called_once_with()
 
     def test_supervisor_kills_overdue_child(self):
         import sys

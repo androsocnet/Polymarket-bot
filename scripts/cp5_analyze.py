@@ -135,6 +135,70 @@ def window_coverage(market, slots, books, runs):
         window_end_us=market['window_end_us'], expected_slots=450, verdict='PASS' if best['complete_window'] else 'FAIL')
 
 
+def slot_diagnosis(market, slots, attempts, events, anchors, books=()):
+    from collections import Counter
+    participating = sorted({row['run_id'] for row in slots if row['market_id'] == market['market_id']})
+    if len(participating) > 1:
+        return dict(runs={run: slot_diagnosis(market,
+            [row for row in slots if row['run_id'] == run], attempts, events, anchors, books)
+            for run in participating}, cause_policy='Per-run grids; no cross-run slot overwrite')
+    selected = {row['slot_index']: row for row in slots if row['market_id'] == market['market_id']}
+    run_ids = {row['run_id'] for row in selected.values()}
+    controls = [row for row in attempts if row['run_id'] in run_ids and row.get('market_id') is None and row.get('slot_id') is None]
+    attempts = [row for row in attempts if row['run_id'] in run_ids and row.get('market_id') == market['market_id']]
+    anchors = [row for row in anchors if row['run_id'] in run_ids]
+    timeline = []
+    for event in events:
+        detail = json.loads(event['detail_json'])
+        if (detail.get('type') == 'SCHEDULER_TIMING' and event['run_id'] in run_ids
+                and detail.get('market_id') == market['market_id']):
+            timeline.append(dict(run_id=event['run_id'], event_id=event['event_id'], **detail))
+    result = []
+    gaps = []
+    gap = 0
+    for index in range(450):
+        slot = selected.get(index)
+        requests = [row for row in attempts if slot is not None and row.get('slot_id') == slot['slot_id']]
+        status = slot['status'] if slot else 'ABSENT'
+        outcomes = [row for row in books if slot is not None and row['slot_id'] == slot['slot_id']]
+        errors = {str(row.get('error_code') or '').lower() for row in requests + outcomes}
+        if status == 'COMPLETE':
+            category = 'COMPLETE'
+        elif status == 'PARTIAL':
+            category = 'PARTIAL'
+        elif not requests:
+            category = 'ABSENT' if slot is None else 'UNSENT'
+        elif any(row.get('status') == 'LATE' for row in outcomes) or any('late' in error or 'deadline' in error for error in errors):
+            category = 'ATTEMPTED_LATE'
+        elif any('timeout' in error for error in errors):
+            category = 'ATTEMPTED_TIMEOUT'
+        elif any('http' in error for error in errors) or any((row.get('http_status') or 0) >= 400 for row in requests):
+            category = 'ATTEMPTED_HTTP'
+        elif any('invalid' in error or 'malformed' in error for error in errors):
+            category = 'ATTEMPTED_MALFORMED'
+        else:
+            category = 'ATTEMPTED_UNKNOWN'
+        result.append(dict(slot_index=index, scheduled_us=market['window_start_us'] + index * 2_000_000,
+            category=category, cause='UNKNOWN', slot=slot, requests=requests,
+            anchor=next((row for row in anchors if slot and row['anchor_id'] == slot.get('anchor_id')), None)))
+        if status != 'COMPLETE':
+            gap += 1
+        elif gap:
+            gaps.append(gap)
+            gap = 0
+    if gap:
+        gaps.append(gap)
+    unassigned_timing = [dict(run_id=event['run_id'], event_id=event['event_id'], **json.loads(event['detail_json']))
+        for event in events if event['run_id'] in run_ids
+        and json.loads(event['detail_json']).get('type') == 'SCHEDULER_TIMING'
+        and json.loads(event['detail_json']).get('market_id') is None]
+    return dict(rows=result, categories=dict(Counter(row['category'] for row in result)),
+        unassigned_timing=unassigned_timing,
+        contiguous_uncollected_slots=gaps, timing_events=timeline,
+        request_timeline=attempts, clock_timeline=anchors, unassigned_controls=controls,
+        cause_policy='UNKNOWN unless directly established; reason labels are not root causes')
+
+
 def quality(conn):
     from collections import Counter
     from decimal import Decimal
@@ -243,6 +307,9 @@ def quality(conn):
     windows = []
     for market in rows('markets', 'window_start_us'):
         windows.append(window_coverage(market, slots, books, runs))
+    result['slot_diagnosis'] = {market['market_id']: slot_diagnosis(market, slots,
+        [{key: value for key, value in row.items() if key != 'response_raw_z'}
+                   for row in rows('request_attempts', 'request_id')], events, anchors, books) for market in rows('markets', 'window_start_us')}
     result['windows'] = windows
     result['full_window_verdict'] = 'PASS' if any(window['complete_window'] for window in windows) else 'FAIL'
     result['smoke_gate'] = bool(references and all(row['value_text'] is not None for row in references) and integrity == ['ok'] and not foreign_keys and version == 2

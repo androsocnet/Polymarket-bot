@@ -343,8 +343,10 @@ class Recorder:
         return self.clock.server_us_at(self.monotonic_ns())
 
     def _wait(self, deadline_ns):
-        remaining = min(deadline_ns, self.run_deadline_ns) - self.monotonic_ns()
-        if remaining > 0:
+        while True:
+            remaining = min(deadline_ns, self.run_deadline_ns) - self.monotonic_ns()
+            if remaining <= 0:
+                return
             self.sleep(remaining / 1_000_000_000)
 
     def _calibrate(self, deadline):
@@ -397,6 +399,8 @@ class Recorder:
         if self.monotonic_ns() >= deadline_ns:
             return
         self._reference_housekeeping(deadline_ns)
+        if self.monotonic_ns() >= deadline_ns:
+            return
         self._checkpoint_due(target_ns)
         if self.monotonic_ns() >= deadline_ns:
             return
@@ -765,13 +769,14 @@ class Recorder:
                 self._wait(self.clock.deadline_ns(end_us))
                 continue
             target_ns = self.clock.deadline_ns(target.scheduled_us)
+            timing = getattr(self, '_timing', None)
+            if timing is not None:
+                timing('SELECTION', target_ns=target_ns, slot_index=target.index, market_id=market.market_id)
             self._housekeeping(target_ns)
             if (self.revision is None or self.revision.market.market_id != market.market_id
                     or not self.clock.usable()):
                 continue
             target_ns = self.clock.deadline_ns(target.scheduled_us)
-            if self.monotonic_ns() >= target_ns:
-                continue
             self._wait(target_ns)
             if should_stop():
                 break
@@ -809,6 +814,8 @@ class Recorder:
             previous = self.public.on_attempt
             self.public.on_attempt = None
             try:
+                if timing is not None:
+                    timing('DISPATCH_READY', slot_id=slot_id, slot_index=target.index, target_ns=target_ns)
                 books = collect_books(self.public, market,
                     deadline=min(self.run_deadline_ns, self.clock.deadline_ns(min(target.scheduled_us+2_000_000, end_us)))/1_000_000_000,
                     receipt_server_us=lambda moment: project(round(moment*1_000_000_000)),
@@ -829,6 +836,9 @@ class Recorder:
                 self.anchor_id, self.revision_id, books, reference, started_ns, ended_ns),
                 committed_wall_us=self.wall_us())
             self.finalized += 1
+            if timing is not None:
+                timing('FINALIZATION_END', slot_id=slot_id, slot_index=target.index,
+                    target_ns=target_ns, capture_end_ns=ended_ns)
             if self.approximate_worker is not None:
                 self._approximate_drain()
             if self.reference_worker is not None and self.offline_reference.live is not None:

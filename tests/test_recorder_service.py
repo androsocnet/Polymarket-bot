@@ -13,6 +13,22 @@ from polymarket_bot.recorder.store import RecorderStore, RecorderStoreError
 
 
 class RecorderServiceTests(unittest.TestCase):
+    def test_armed_target_survives_housekeeping_at_target(self):
+        from polymarket_bot.recorder.service import Recorder
+        fixture = self.fixture()
+        original = Recorder._housekeeping
+        armed = []
+        def housekeeping(recorder, target_ns, **kwargs):
+            original(recorder, target_ns, **kwargs)
+            if not armed:
+                armed.append(target_ns)
+                fixture.advance((target_ns - fixture.monotonic_ns()) / 1_000_000_000)
+        with patch.object(Recorder, '_housekeeping', housekeeping):
+            result = self.run_recorder(fixture, pairs=1)
+        self.assertEqual(result.exit_code, 0)
+        slots = fixture.rows("SELECT slot_index FROM sample_slots WHERE status='COMPLETE'")
+        self.assertEqual([row['slot_index'] for row in slots], [151])
+
     def test_checkpoint_baseline_precedes_capture_and_shutdown_precedes_close(self):
         fixture = self.fixture()
         def before_capture(request,payload,f):
@@ -966,7 +982,7 @@ class RecorderServiceTests(unittest.TestCase):
         self.assertEqual(old["resolution_next_due_us"], observation["learned_server_us"]+30_000_000)
         self.assertEqual(len(fixture.rows("SELECT * FROM recording_runs")), 1)
 
-    def test_resolution_overrun_skips_target_and_does_not_redispatch_due_job(self):
+    def test_resolution_delay_retains_armed_target_and_does_not_redispatch_due_job(self):
         fixture = self.fixture(offset_us=597_000_000)
         def slow(request, payload, f):
             if request.url.path == "/v2/resolutions":
@@ -977,8 +993,8 @@ class RecorderServiceTests(unittest.TestCase):
         calls = [row for row in fixture.requests if row[1] == "/v2/resolutions"]
         self.assertEqual(len(calls), 1)
         self.assertTrue(all(0 < value < 2 for value in calls[0][3].values()))
-        self.assertEqual(fixture.rows("SELECT reason FROM sample_slots WHERE market_id='1002' AND slot_index=1")[0]["reason"], "PROCESSING_OVERRUN")
-        self.assertEqual([row["slot_index"] for row in fixture.rows("SELECT slot_index FROM sample_slots WHERE market_id='1002' AND status='COMPLETE' ORDER BY slot_index")], [2, 3])
+        self.assertEqual(fixture.rows("SELECT reason FROM sample_slots WHERE market_id='1002' AND slot_index=1")[0]["reason"], "BOOKS_CAPTURED")
+        self.assertEqual([row["slot_index"] for row in fixture.rows("SELECT slot_index FROM sample_slots WHERE market_id='1002' AND status='COMPLETE' ORDER BY slot_index")], [1, 2])
         self.assertEqual(fixture.rows("SELECT resolution_attempts FROM markets WHERE market_id='1001'")[0]["resolution_attempts"], 1)
 
     def test_resolution_backward_wall_step_does_not_stop_book_capture(self):

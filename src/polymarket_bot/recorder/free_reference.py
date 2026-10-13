@@ -175,7 +175,9 @@ class CoinbaseRestProvider:
             except (ValueError, KeyError, TypeError, ArithmeticError, MarketDataError):
                 error = "MALFORMED_JSON"
         if error is not None:
-            price = bid = ask = source = None
+            price = bid = ask = None
+            if error != "FUTURE_SOURCE_TIME":
+                source = None
         return ApproximateObservation(self.provider_name, self.pair, self.quote_currency,
             price, bid, ask, source, wall, server, hashlib.sha256(body).hexdigest(), len(body),
             "rest", self._PARSER_REVISION, status, "error" if error else "success", error, mono)

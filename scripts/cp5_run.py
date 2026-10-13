@@ -18,6 +18,73 @@ from polymarket_bot.recorder.service import Recorder
 
 
 class CP5Recorder(Recorder):
+    def _timing(self, phase, **detail):
+        if not hasattr(self, '_timing_buffer'):
+            self._timing_buffer = []
+        if phase == 'SELECTION':
+            self._timing_identity = {key: detail[key] for key in ('market_id', 'slot_index', 'target_ns')}
+        elif phase.startswith('CONTROL'):
+            detail = dict(detail, operation='CONTROL')
+        else:
+            if ('target_ns' in detail and detail['target_ns'] !=
+                    getattr(self, '_timing_identity', {}).get('target_ns')):
+                self._timing_identity = {}
+            detail = dict(getattr(self, '_timing_identity', {}), **detail)
+        self._timing_buffer.append((wall_us(), dict(type='SCHEDULER_TIMING', version=1,
+            diagnostic_only=True, time_domain='RUN_MONOTONIC', phase=phase,
+            mono_ns=self.monotonic_ns(), **detail)))
+        if phase == 'FINALIZATION_END':
+            self._timing_identity = {}
+
+    def _flush_timing(self):
+        started = self.monotonic_ns()
+        pending, self._timing_buffer = getattr(self, '_timing_buffer', []), []
+        if pending:
+            try:
+                with self.store._transaction():
+                    self.store._run(self.run_id)
+                    for observed_wall, detail in pending:
+                        self.store._insert('recorder_events', dict(run_id=self.run_id, market_id=None,
+                            kind='DISCOVERY_GAP', started_us=observed_wall, ended_us=None,
+                            detail_json=json.dumps(detail)))
+                    self.store._insert('recorder_events', dict(run_id=self.run_id, market_id=None,
+                        kind='DISCOVERY_GAP', started_us=wall_us(), ended_us=None,
+                        detail_json=json.dumps(dict(type='SCHEDULER_TIMING', version=1,
+                            diagnostic_only=True, time_domain='RUN_MONOTONIC', phase='DIAGNOSTIC_PERSISTENCE',
+                            mono_ns=self.monotonic_ns(), start_mono_ns=started,
+                            end_mono_ns=self.monotonic_ns(), event_count=len(pending),
+                            excludes_commit=True))))
+            except BaseException:
+                self._timing_buffer = pending + self._timing_buffer
+                raise
+
+    def _shutdown(self, state, reason):
+        try:
+            self._flush_timing()
+        finally:
+            super()._shutdown(state, reason)
+
+    def _housekeeping(self, target_ns, **kwargs):
+        if len(getattr(self, '_timing_buffer', [])) >= 64:
+            self._flush_timing()
+        self._timing('HOUSEKEEPING_START', target_ns=target_ns)
+        try:
+            return super()._housekeeping(target_ns, **kwargs)
+        finally:
+            self._timing('HOUSEKEEPING_END', target_ns=target_ns)
+
+    def _wait(self, deadline_ns):
+        self._timing('WAIT_START', target_ns=deadline_ns)
+        super()._wait(deadline_ns)
+        self._timing('WAKE', target_ns=deadline_ns)
+
+    def _control(self, operation):
+        self._timing('CONTROL_START')
+        try:
+            return super()._control(operation)
+        finally:
+            self._timing('CONTROL_END')
+
     def _reconcile(self, deadline_ns):
         return None
 
