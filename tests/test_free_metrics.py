@@ -125,6 +125,22 @@ class FreeMetricsTests(unittest.TestCase):
                  1, source_provider, int(was_fallback), "UNVERIFIED",
                  receipt_wall_us, receipt_wall_us // 1000, "{}"))
 
+    def test_versioned_replay_connection_is_read_only_and_not_causal_coverage(self):
+        from tests.test_free_persistence import ResearchPersistenceTests
+        from tests.test_cp5_safety import CP5SafetyTests
+        fixture = ResearchPersistenceTests('test_revision_two_recorder_flow')
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        fixture.test_revision_two_recorder_flow(cycles=40)
+        before = tuple(fixture.store._connection.iterdump())
+        module = CP5SafetyTests().analyzer()
+        result = module.replay_rows(fixture.store._connection)
+        self.assertTrue(result['exact'])
+        self.assertTrue(result['reports'][-1]['qualification'])
+        self.assertEqual(result['reports'][-1]['causal_availability'], 'NOT_EVALUATED')
+        self.assertEqual(tuple(fixture.store._connection.iterdump()), before)
+        self.assertEqual(fixture.store._connection.execute('PRAGMA user_version').fetchone()[0], 2)
+
     def test_approximate_coverage_separate_from_exact(self):
         """Insert approximate data, verify it doesn't affect Chainlink coverage count."""
         metrics = self.metrics()

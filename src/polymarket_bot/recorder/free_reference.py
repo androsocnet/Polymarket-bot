@@ -625,6 +625,21 @@ class ApproximateReferenceSession:
                 for i, obs in zip(ids, observations)))
         if validate_evidence is not None:
             accumulated = validate_evidence(accumulated, mono)
+        report, assessments, selected = reconstruct_research_report(window, evidence=accumulated,
+            context=context, report_wall_us=wall, report_ns=mono)
+        self._research_observations = window
+        return ResearchFetchResult(tuple(observations), report, assessments, selected,
+            context, self._monotonic_ns(), accumulated, window)
+
+    def fetch(self, *, run_id, anchor_id, project, deadline):
+        return _legacy_fetch(self, run_id=run_id, anchor_id=anchor_id, project=project, deadline=deadline)
+
+
+def reconstruct_research_report(window: Sequence[ApproximateObservation], *,
+        evidence: ResearchWindowEvidence, context: AcquisitionContext,
+        report_wall_us: int, report_ns: int
+        ) -> tuple[ApproximateReferenceReport, tuple[ResearchAssessment, ...], ResearchAssessment]:
+        accumulated, wall, mono = evidence, report_wall_us, report_ns
         primary, secondary = tuple(assess_provider(window, provider=name,
             report_wall_us=wall, report_ns=mono, evidence=accumulated)
             for name in ('coinbase', 'kraken'))
@@ -646,11 +661,10 @@ class ApproximateReferenceSession:
         report = replace(report, source_provider=selected.selected_provider, was_fallback=use_fallback,
             receipt_server_us=_captured_projection(context, mono),
             diagnostics=report.diagnostics + (('FALLBACK_COINBASE_INSUFFICIENT',) if use_fallback else ()))
-        self._research_observations = window
-        return ResearchFetchResult(tuple(observations), report, (primary, secondary), selected,
-            context, self._monotonic_ns(), accumulated, window)
+        return report, (primary, secondary), selected
 
-    def fetch(self, *, run_id, anchor_id, project, deadline):
+
+def _legacy_fetch(self, *, run_id, anchor_id, project, deadline):
         observations = []
         for name in ("coinbase", "kraken"):
             try:

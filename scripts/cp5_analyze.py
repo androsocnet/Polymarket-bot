@@ -8,7 +8,23 @@ from pathlib import Path
 from typing import Any
 
 
-def replay_rows(observations, references, events, anchors):
+def replay_rows(observations, references=None, events=None, anchors=None):
+    if isinstance(observations, sqlite3.Connection):
+        connection = observations
+        def rows(table, order):
+            cursor = connection.execute(f'SELECT * FROM {table} ORDER BY {order}')
+            names = [column[0] for column in cursor.description]
+            return [dict(zip(names, row)) for row in cursor]
+        observations, references, events, anchors = (rows(table, order) for table, order in (
+            ('approximate_observations', 'observation_id'), ('approximate_references', 'reference_id'),
+            ('recorder_events', 'event_id'), ('clock_anchors', 'anchor_id')))
+    try:
+        return _replay_rows(observations, references, events, anchors)
+    except (KeyError, TypeError, ArithmeticError, RecursionError) as exc:
+        raise ValueError('incomplete malformed persisted provenance: ' + str(exc)) from exc
+
+
+def _replay_rows(observations, references, events, anchors):
     from collections import deque
     from dataclasses import replace
     from decimal import Decimal
@@ -20,7 +36,13 @@ def replay_rows(observations, references, events, anchors):
     seen_observations, seen_references = set(), set()
     histories = {}
     matched = 0
+    research_reports = []
     chronology = {}
+    captured_membership = {}
+    completions_by_run = {}
+    event_ids = [row['event_id'] for row in events if 'event_id' in row]
+    if len(set(event_ids)) != len(event_ids):
+        raise ValueError('incomplete duplicate event identities')
     if len(observation_map) != len(observations) or len(reference_map) != len(references) or len(anchor_map) != len(anchors):
         raise ValueError('incomplete duplicate persisted identities')
     for event in events:
@@ -29,8 +51,21 @@ def replay_rows(observations, references, events, anchors):
             raise ValueError('incomplete malformed event object')
         if detail.get('type') != 'APPROXIMATE_FETCH':
             continue
-        if detail.get('version') != 1 or detail.get('diagnostic_only') is not True:
+        if type(detail.get('version')) is not int or detail['version'] not in (1, 2) or detail.get('diagnostic_only') is not True:
             raise ValueError('incomplete fetch version')
+        if detail['version'] == 2:
+            report_output = _replay_research(detail, event, observation_map, reference_map, anchor_map, events,
+                seen_observations, seen_references, captured_membership, completions_by_run.get(event['run_id'], 0))
+            completions_by_run[event['run_id']] = detail['completion_ns']
+            previous = chronology.get(event['run_id'])
+            current = (detail['reference_id'], detail['receipt_mono_ns'], *detail['observation_ids'])
+            if previous is not None and (current[0] <= previous[0] or current[1] < previous[1]
+                    or current[2] <= previous[3] or observation_map[current[2]]['receipt_mono_ns'] < previous[1]):
+                raise ValueError('incomplete fetch chronology')
+            chronology[event['run_id']] = current
+            research_reports.append(report_output)
+            matched += 1
+            continue
         run = event['run_id']
         if (type(detail.get('anchor_id')) is not int or type(detail.get('reference_id')) is not int
                 or not isinstance(detail.get('observation_ids'), list)
@@ -91,11 +126,249 @@ def replay_rows(observations, references, events, anchors):
             actual = list(report.diagnostics) if name == 'diagnostics' else decimal_text(report.value) if name == 'value' and report.value is not None else getattr(report, name)
             if actual != expected:
                 raise ValueError('replay mismatch: ' + name)
+        research_reports.append(dict(reference_id=ref['reference_id'], run_id=run, revision=1,
+            qualification='UNKNOWN', warmup_status='UNKNOWN', missing_requests='UNKNOWN'))
         seen_references.add(ref['reference_id'])
         matched += 1
     if not matched or seen_observations != set(observation_map) or seen_references != set(reference_map):
         raise ValueError('incomplete persisted fetch evidence')
-    return {'matched': matched, 'observations': len(seen_observations), 'exact': True}
+    result = {'matched': matched, 'observations': len(seen_observations), 'exact': True}
+    if research_reports:
+        result.update(reports=research_reports, qualification='RECONSTRUCTED')
+    return result
+
+
+def _replay_research(detail, event, observations, references, anchors, events, seen_observations, seen_references, captured_membership, previous_completion):
+    from dataclasses import asdict
+    from decimal import Decimal
+    from typing import NoReturn
+    from polymarket_bot.recorder.models import ClockAnchor
+    from polymarket_bot.recorder.free_reference import (AcquisitionContext, ApproximateObservation,
+        ResearchWindowEvidence, reconstruct_research_report, _captured_projection)
+    from polymarket_bot.market_data.numeric import decimal_text
+    def fail(reason) -> NoReturn:
+        raise ValueError('incomplete revision-2 ' + reason)
+    def integer(value):
+        if type(value) is not int or not 0 <= value <= 2**63 - 1:
+            fail('integer timing or identity')
+        return value
+    def bounded(value, depth=0):
+        if depth > 12:
+            fail('bounded JSON depth')
+        if isinstance(value, dict):
+            if len(value) > 64:
+                fail('bounded JSON object')
+            for item in value.values():
+                bounded(item, depth + 1)
+        elif isinstance(value, list):
+            if len(value) > 512:
+                fail('bounded JSON list')
+            for item in value:
+                bounded(item, depth + 1)
+        elif type(value) is int:
+            if not -(2**63) <= value <= 2**63 - 1:
+                fail('bounded JSON integer')
+        elif isinstance(value, float) or isinstance(value, str) and len(value) > 4096:
+            fail('bounded JSON scalar')
+    bounded(detail)
+    if len(json.dumps(detail)) > 1_048_576:
+        fail('bounded JSON')
+    run = event['run_id']
+    origin = integer(detail['sampling_origin_ns'])
+    receipt = integer(detail['receipt_mono_ns'])
+    completion = integer(detail['completion_ns'])
+    if type(run) is not str or not run.strip():
+        fail('run identity')
+    for key in ('version', 'policy_revision', 'anchor_id', 'uncertainty_us'):
+        integer(detail[key])
+    if detail['run_id'] != run or detail['policy_revision'] != 2 or detail['persistence_status'] != 'COMPLETE' or not origin <= receipt <= completion:
+        fail('origin or completion chronology')
+    ids = detail['observation_ids']
+    if not isinstance(ids, list) or len(ids) != 2 or len(set(ids)) != 2 or any(integer(i) == 0 or i in seen_observations for i in ids):
+        fail('membership')
+    ref = references.get(integer(detail['reference_id']))
+    if ref is None or ref['run_id'] != run or ref['reference_id'] in seen_references or ref['receipt_mono_ns'] != receipt:
+        fail('reference membership')
+    parsed = [(row, json.loads(row['detail_json'])) for row in events]
+    if any(not isinstance(data, dict) for _, data in parsed):
+        fail('malformed event object')
+    owned = [(row, data) for row, data in parsed if row['run_id'] == run]
+    for row, data in owned:
+        if data.get('type') in ('APPROXIMATE_SESSION', 'APPROXIMATE_OPPORTUNITY',
+                'APPROXIMATE_OPPORTUNITY_COMPLETION', 'APPROXIMATE_DISCONTINUITY', 'ACTUAL_SEND_ATTEMPT'):
+            bounded(data)
+            if type(data.get('version')) is not int or data['version'] != 2 or data.get('run_id') != run:
+                fail('event version or run identity')
+            integer(row['event_id'])
+            for key in ('sampling_origin_ns', 'target_ns', 'opportunity_id', 'reference_id',
+                    'completion_ns', 'calibration_end_ns', 'anchor_id', 'attempt', 'started_mono_ns', 'ended_mono_ns',
+                    'slot_id', 'slot_index'):
+                if key in data:
+                    integer(data[key])
+    sessions = [data for _, data in owned if data.get('type') == 'APPROXIMATE_SESSION']
+    if len(sessions) != 1 or sessions[0].get('sampling_origin_ns') != origin:
+        fail('session origin')
+    opportunity_id = integer(detail['opportunity_id'])
+    originals = [data for row, data in owned if row['event_id'] == opportunity_id and data.get('type') == 'APPROXIMATE_OPPORTUNITY']
+    if len(originals) != 1 or originals[0].get('disposition') != 'submitted':
+        fail('missing original submitted opportunity')
+    original = originals[0]
+    for field in ('market_id', 'slot_id', 'slot_index', 'target_ns'):
+        if field in original or field in detail:
+            if field != 'market_id':
+                integer(detail[field])
+            elif type(detail[field]) is not str or not detail[field].strip():
+                fail('opportunity market identity')
+            if original.get(field) != detail[field]:
+                fail('opportunity identity mismatch')
+    completions = [data for _, data in owned if data.get('type') == 'APPROXIMATE_OPPORTUNITY_COMPLETION' and data.get('opportunity_id') == opportunity_id]
+    if len(completions) != 1 or completions[0].get('disposition') != 'completed' or any(completions[0].get(k) != detail.get(k) for k in ('reference_id', 'completion_ns', 'market_id', 'slot_id', 'slot_index', 'target_ns')):
+        fail('completion barrier')
+    raw = detail['evidence']
+    if raw['run_id'] != run or raw['revision'] != 2 or raw['sampling_origin_ns'] != origin:
+        fail('evidence origin')
+    integer(raw['revision'])
+    integer(raw['sampling_origin_ns'])
+    for key in ('validated_window_start_ns', 'validated_window_end_ns'):
+        if raw[key] is not None:
+            integer(raw[key])
+    for outcome in raw['request_outcomes']:
+        if not isinstance(outcome, list) or len(outcome) != 5:
+            fail('request outcome shape')
+        for index in (0, 2, 3):
+            integer(outcome[index])
+    for request in raw['expected_requests']:
+        if not isinstance(request, list) or len(request) != 2:
+            fail('expected request shape')
+        integer(request[0])
+    window_ids = raw['observation_ids']
+    if not 0 < len(window_ids) <= 256 or len(set(window_ids)) != len(window_ids) or window_ids[-2:] != ids or len(raw['contexts']) != len(window_ids):
+        fail('window membership')
+    contexts, window = [], []
+    for identifier, captured in zip(window_ids, raw['contexts']):
+        row = observations.get(integer(identifier))
+        if row is None or row['run_id'] != run or (identifier not in ids and identifier not in seen_observations):
+            fail('observation ownership')
+        fields = {k: row[k] for k in ApproximateObservation.__dataclass_fields__ if k not in ('price', 'bid_price', 'ask_price')}
+        fields.update({k: Decimal(row[k + '_text']) if row[k + '_text'] is not None else None for k in ('price', 'bid_price', 'ask_price')})
+        obs = ApproximateObservation(**fields)
+        if obs.receipt_mono_ns is None or integer(obs.receipt_mono_ns) > receipt:
+            fail('post-completion observation')
+        anchor = anchors.get(integer(captured['anchor_id']))
+        if anchor is None or anchor['run_id'] != run or captured['run_id'] != run or captured['sampling_origin_ns'] != origin or captured['revision'] != 2:
+            fail('captured context ownership')
+        for key in ('revision', 'sampling_origin_ns'):
+            integer(captured[key])
+        if captured['discontinuity_end_ns'] is not None:
+            integer(captured['discontinuity_end_ns'])
+        for key, value in captured['anchor'].items():
+            if key not in ('status', 'diagnostic'):
+                integer(value)
+        prior = captured_membership.get(identifier)
+        outcome = [r for r in raw['request_outcomes'] if r[2] == identifier]
+        if len(outcome) != 1 or prior is not None and prior != (captured, outcome[0]):
+            fail('historical captured membership')
+        model = ClockAnchor(**captured['anchor'])
+        for column, field in (('server_seconds', 'server_seconds'), ('anchor_server_us', 'server_us'),
+                ('anchor_mono_ns', 'midpoint_ns'), ('request_start_mono_ns', 'request_start_mono_ns'),
+                ('request_end_mono_ns', 'request_end_mono_ns'), ('request_start_wall_us', 'request_start_wall_us'),
+                ('request_end_wall_us', 'request_end_wall_us'), ('status', 'status'), ('uncertainty_us', 'uncertainty_us')):
+            if anchor[column] != getattr(model, field):
+                fail('anchor uncertainty or captured fields')
+        contexts.append(AcquisitionContext(captured['revision'], run, model, captured['anchor_id'], origin, captured['discontinuity_end_ns']))
+        window.append(obs)
+    context = contexts[-1]
+    if contexts[-2] != context or context.anchor_id != detail['anchor_id'] or context.anchor.uncertainty_us != detail['uncertainty_us']:
+        fail('current anchor uncertainty')
+    if ids[0] >= ids[1] or [o.provider for o in window[-2:]] != ['coinbase', 'kraken'] or window[-2].receipt_mono_ns > window[-1].receipt_mono_ns:
+        fail('ordered membership')
+    expected_history = {i for i, (_, outcome) in captured_membership.items()
+        if observations[i]['run_id'] == run and (outcome[3] >= receipt - 60_000_000_000
+            or any(r[0] == outcome[0] and r[1] >= receipt - 60_000_000_000 for r in raw['scheduled_opportunities']))}
+    if not expected_history <= set(window_ids):
+        fail('missing historical window membership')
+    opportunities = raw['scheduled_opportunities']
+    if len(opportunities) > 128:
+        fail('bounded opportunities')
+    for identifier, target, disposition in opportunities:
+        integer(identifier)
+        integer(target)
+        matches = [data for row, data in owned if row.get('event_id') == identifier and data.get('type') == 'APPROXIMATE_OPPORTUNITY']
+        if len(matches) != 1 or matches[0].get('target_ns') != target or matches[0].get('sampling_origin_ns') != origin or matches[0].get('disposition') != ('submitted' if disposition == 'completed' else disposition):
+            fail('scheduler ownership')
+    start = max(origin, receipt - 60_000_000_000)
+    targets = sorted({target for _, target, _ in opportunities if start - 2_000_000_000 < target <= receipt})
+    complete = bool(targets) and targets[0] <= start and receipt < targets[-1] + 2_000_000_000 and all(b - a == 2_000_000_000 for a, b in zip(targets, targets[1:]))
+    if raw['validated_window_start_ns'] != (start if complete else None) or raw['validated_window_end_ns'] != (receipt if complete else None):
+        fail('scheduler interval')
+    ends = raw['discontinuity_ends_ns']
+    if any(integer(end) > receipt for end in ends):
+        fail('discontinuity chronology')
+    known_ends = {data['calibration_end_ns'] for _, data in owned if data.get('type') == 'APPROXIMATE_DISCONTINUITY'}
+    if any(end not in known_ends for end in ends):
+        fail('invented discontinuity')
+    for end in known_ends:
+        if start <= end <= receipt and end not in ends:
+            fail('missing discontinuity')
+    attempts = detail['request_attempts']
+    if not isinstance(attempts, list) or len(attempts) > 4:
+        fail('bounded attempt timing')
+    if any(a.get('provider') not in ('coinbase', 'kraken') for a in attempts):
+        fail('attempt provider identity')
+    target = integer(original['target_ns'])
+    previous_provider_receipt = max(origin, target, previous_completion)
+    for provider, obs in zip(('coinbase', 'kraken'), window[-2:]):
+        selected = [a for a in attempts if a.get('provider') == provider]
+        if not selected and obs.error_code not in ('MISSING_PROVIDER', 'PROVIDER_FAILURE', 'CLOCK_CONTEXT_UNAVAILABLE'):
+            fail('missing provider attempt timing')
+        previous = previous_provider_receipt
+        for index, attempt in enumerate(selected, 1):
+            begin, end = integer(attempt['started_mono_ns']), integer(attempt['ended_mono_ns'])
+            if attempt['run_id'] != run or attempt['opportunity_id'] != opportunity_id or attempt['attempt'] != index or not previous <= begin <= end <= obs.receipt_mono_ns:
+                fail('attempt chronology')
+            if _captured_projection(context, begin) is None:
+                fail('attempt captured anchor unavailable')
+            integer(attempt['attempt'])
+            previous = end
+        previous_provider_receipt = max(previous_provider_receipt, obs.receipt_mono_ns)
+    actual = [data for _, data in owned if data.get('type') == 'ACTUAL_SEND_ATTEMPT']
+    if actual:
+        identities = [integer(a['attempt']) for a in actual]
+        if len(set(identities)) != len(identities):
+            fail('transport duplicate attempt identity')
+        for provider in ('coinbase', 'kraken'):
+            wrappers = [a for a in attempts if a['provider'] == provider]
+            sends = sorted((a for a in actual if a.get('provider') == provider and a.get('opportunity_id') == opportunity_id), key=lambda a: a['attempt'])
+            if len(sends) != len(wrappers):
+                fail('transport missing attempt timing')
+            for wrapper, send in zip(wrappers, sends):
+                host, path = ('api.exchange.coinbase.com', '/products/BTC-USD/ticker') if provider == 'coinbase' else ('api.kraken.com', '/0/public/Ticker')
+                if (send.get('host') != host or send.get('path') != path or send.get('method') != 'GET'
+                        or not wrapper['started_mono_ns'] <= send['started_mono_ns'] <= send['ended_mono_ns'] <= wrapper['ended_mono_ns']
+                        or send.get('status') != wrapper['http_status']
+                        or any(send.get(k) != detail.get(k) for k in ('market_id', 'slot_id', 'slot_index', 'target_ns'))):
+                    fail('transport attempt provenance')
+    evidence = ResearchWindowEvidence(raw['revision'], run, origin, tuple(window_ids), tuple(contexts),
+        tuple(tuple(r) for r in opportunities), tuple(tuple(r) for r in raw['request_outcomes']),
+        tuple(ends), raw['validated_window_start_ns'], raw['validated_window_end_ns'], tuple(tuple(r) for r in raw['expected_requests']))
+    report, assessments, selected = reconstruct_research_report(window, evidence=evidence, context=context,
+        report_wall_us=ref['receipt_wall_us'], report_ns=receipt)
+    def encoded(value):
+        return json.loads(json.dumps(asdict(value), default=lambda v: str(v) if isinstance(v, Decimal) else v))
+    if [encoded(a) for a in assessments] != detail['assessments'] or encoded(selected) != detail['selected_assessment']:
+        fail('assessment or selection mismatch')
+    for name in report.__dataclass_fields__:
+        expected = json.loads(ref['diagnostics_json']) if name == 'diagnostics' else ref['value_text'] if name == 'value' else ref[name]
+        actual = list(report.diagnostics) if name == 'diagnostics' else decimal_text(report.value) if name == 'value' and report.value is not None else getattr(report, name)
+        if actual != expected:
+            raise ValueError('replay mismatch: ' + name)
+    for identifier, captured in zip(window_ids, raw['contexts']):
+        captured_membership[identifier] = (captured, next(r for r in raw['request_outcomes'] if r[2] == identifier))
+    seen_observations.update(ids)
+    seen_references.add(ref['reference_id'])
+    return dict(reference_id=ref['reference_id'], run_id=run, revision=2, opportunity_id=opportunity_id,
+        receipt_mono_ns=receipt, completion_ns=completion, selected_assessment=encoded(selected),
+        warmup_status=selected.warmup_status, causal_availability='NOT_EVALUATED', qualification=selected.value_status == 'VALID' and selected.coverage_quality != 'INSUFFICIENT' and selected.warmup_status == 'FULL')
 
 
 def analyze_db(db_path: Path):
@@ -314,6 +587,7 @@ def quality(conn):
     result['full_window_verdict'] = 'PASS' if any(window['complete_window'] for window in windows) else 'FAIL'
     result['smoke_gate'] = bool(references and all(row['value_text'] is not None for row in references) and integrity == ['ok'] and not foreign_keys and version == 2
         and not any(isolation.values()) and replay['exact'] and usable
+        and all(row.get('revision') == 2 and row.get('qualification') is True for row in replay.get('reports', []))
         and any(row['status'] == 'COMPLETE' for row in slots)
         and all(run['state'] == 'STOPPED' for run in runs))
     return result

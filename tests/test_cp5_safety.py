@@ -99,8 +99,321 @@ class CP5SafetyTests(unittest.TestCase):
             diagnostic_only=True, type='APPROXIMATE_FETCH', anchor_id=7,
             observation_ids=[1, 2], reference_id=1)))]
         anchors = [dict(run_id='run', anchor_id=7, anchor_server_us=0, anchor_mono_ns=0)]
-        self.assertEqual(self.analyzer().replay_rows(observations, references, events, anchors),
-            dict(matched=1, observations=2, exact=True))
+        result = self.analyzer().replay_rows(observations, references, events, anchors)
+        self.assertEqual((result['matched'], result['observations'], result['exact']), (1, 2, True))
+        self.assertEqual(result['reports'][0]['qualification'], 'UNKNOWN')
+        self.assertEqual(result['reports'][0]['warmup_status'], 'UNKNOWN')
+        self.assertEqual(result['reports'][0]['missing_requests'], 'UNKNOWN')
+
+    def research_replay_fixture(self, cycles=1):
+        from tests.test_free_persistence import ResearchPersistenceTests
+        fixture = ResearchPersistenceTests('test_revision_two_recorder_flow')
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        fixture.test_revision_two_recorder_flow(cycles=cycles)
+        return tuple([dict(row) for row in fixture.store._rows('SELECT * FROM ' + table)]
+            for table in ('approximate_observations', 'approximate_references', 'recorder_events', 'clock_anchors'))
+
+    def test_version_two_replay_reconstructs_durable_assessments(self):
+        import copy
+        rows = self.research_replay_fixture(cycles=40)
+        before = copy.deepcopy(rows)
+        result = self.analyzer().replay_rows(*rows)
+        self.assertTrue(result['exact'])
+        self.assertEqual(result['matched'], 40)
+        self.assertEqual(len(result['reports']), 40)
+        self.assertEqual(result['reports'][-1]['selected_assessment']['coverage_quality'], 'COMPLETE')
+        self.assertEqual(result['reports'][-1]['warmup_status'], 'FULL')
+        self.assertEqual(rows, before)
+
+    def test_version_two_replay_rejects_tampered_provenance(self):
+        import copy
+        import json
+        rows = self.research_replay_fixture()
+        mutations = {
+            'version': lambda d: d.update(version=3),
+            'membership': lambda d: d.update(observation_ids=[d['observation_ids'][0]] * 2),
+            'uncertainty': lambda d: d.update(uncertainty_us=d['uncertainty_us'] + 1),
+            'origin': lambda d: d.update(sampling_origin_ns=0),
+            'completion': lambda d: d.update(completion_ns=0),
+            'attempt': lambda d: d.update(request_attempts=[]),
+            'discontinuity': lambda d: d['evidence'].update(discontinuity_ends_ns=[d['completion_ns'] + 1]),
+            'assessment': lambda d: d['selected_assessment'].update(value='101'),
+            'context': lambda d: d['evidence']['contexts'][0]['anchor'].update(server_us=1),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                changed = copy.deepcopy(rows)
+                event = next(e for e in changed[2] if json.loads(e['detail_json']).get('type') == 'APPROXIMATE_FETCH')
+                detail = json.loads(event['detail_json'])
+                mutate(detail)
+                event['detail_json'] = json.dumps(detail)
+                with self.assertRaises(ValueError):
+                    self.analyzer().replay_rows(*changed)
+        changed = copy.deepcopy(rows)
+        changed[2][:] = [e for e in changed[2] if json.loads(e['detail_json']).get('type') != 'APPROXIMATE_OPPORTUNITY_COMPLETION']
+        with self.assertRaisesRegex(ValueError, 'completion'):
+            self.analyzer().replay_rows(*changed)
+
+    def test_replay_rejects_nested_identity_and_history_tampering(self):
+        import copy
+        import json
+        rows = self.research_replay_fixture(cycles=2)
+        mutations = {
+            'boolean revision': lambda d: d.update(policy_revision=True),
+            'boolean outcome ID': lambda d: d['evidence']['request_outcomes'][0].__setitem__(2, True),
+            'boolean context revision': lambda d: d['evidence']['contexts'][0].update(revision=True),
+            'boolean anchor field': lambda d: d['evidence']['contexts'][0]['anchor'].update(request_start_mono_ns=False),
+            'foreign historical opportunity': lambda d: d['evidence']['request_outcomes'][0].__setitem__(0, d['opportunity_id']),
+            'changed historical context': lambda d: d['evidence']['contexts'][0].update(discontinuity_end_ns=0),
+            'missing historical member': lambda d: (d['evidence']['observation_ids'].pop(0), d['evidence']['contexts'].pop(0)),
+            'invented discontinuity': lambda d: d['evidence'].update(discontinuity_ends_ns=[d['receipt_mono_ns']]),
+            'foreign attempt provider': lambda d: d['request_attempts'].append(dict(d['request_attempts'][0], provider='other')),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                changed = copy.deepcopy(rows)
+                event = [e for e in changed[2] if json.loads(e['detail_json']).get('type') == 'APPROXIMATE_FETCH'][-1]
+                detail = json.loads(event['detail_json'])
+                mutate(detail)
+                event['detail_json'] = json.dumps(detail)
+                with self.assertRaises(ValueError):
+                    self.analyzer().replay_rows(*changed)
+        for kind, key, value in (('APPROXIMATE_SESSION', 'version', 3),
+                ('APPROXIMATE_OPPORTUNITY', 'run_id', 'foreign'),
+                ('APPROXIMATE_OPPORTUNITY_COMPLETION', 'disposition', 'busy')):
+            with self.subTest(kind=kind):
+                changed = copy.deepcopy(rows)
+                event = next(e for e in changed[2] if json.loads(e['detail_json']).get('type') == kind)
+                detail = json.loads(event['detail_json'])
+                detail[key] = value
+                event['detail_json'] = json.dumps(detail)
+                with self.assertRaises(ValueError):
+                    self.analyzer().replay_rows(*changed)
+
+    def test_replay_transport_attempts_are_authority_when_present(self):
+        import copy
+        import json
+        rows = self.research_replay_fixture()
+        fetch = next(json.loads(e['detail_json']) for e in rows[2] if json.loads(e['detail_json']).get('type') == 'APPROXIMATE_FETCH')
+        for index, attempt in enumerate(fetch['request_attempts'], 1):
+            detail = dict(attempt, type='ACTUAL_SEND_ATTEMPT', version=2, attempt=index,
+                host='api.exchange.coinbase.com' if attempt['provider'] == 'coinbase' else 'api.kraken.com',
+                path='/products/BTC-USD/ticker' if attempt['provider'] == 'coinbase' else '/0/public/Ticker',
+                method='GET', status=attempt['http_status'], error=None, target_ns=fetch['target_ns'],
+                complete=True, stream_closed=True)
+            rows[2].append(dict(event_id=100 + index, run_id=fetch['run_id'], detail_json=json.dumps(detail)))
+        self.assertTrue(self.analyzer().replay_rows(*rows)['exact'])
+        mutations = {
+            'missing': lambda events: events.pop(),
+            'late': lambda events: events[-1].update(ended_mono_ns=fetch['completion_ns'] + 1),
+            'foreign': lambda events: events[-1].update(opportunity_id=999),
+            'duplicate': lambda events: events[-1].update(attempt=1),
+            'wrong status': lambda events: events[-1].update(status=500),
+            'wrong path': lambda events: events[-1].update(path='/wrong'),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                changed = copy.deepcopy(rows)
+                actual = [json.loads(e['detail_json']) for e in changed[2][-4:]]
+                mutate(actual)
+                changed[2][-4:] = [dict(event_id=100 + i, run_id=fetch['run_id'], detail_json=json.dumps(d)) for i, d in enumerate(actual, 1)]
+                with self.assertRaisesRegex(ValueError, 'transport'):
+                    self.analyzer().replay_rows(*changed)
+
+    def test_v2_live_replay_retains_rejection_fallback_decimal_and_wall_reversal(self):
+        from dataclasses import replace
+        from decimal import Decimal
+        from unittest.mock import patch
+        from polymarket_bot.recorder.free_reference import CoinbaseRestProvider, KrakenRestProvider
+        originals = {cls: cls.fetch_ticker for cls in (CoinbaseRestProvider, KrakenRestProvider)}
+        for scenario in ('rejection', 'decimal', 'wall reversal'):
+            with self.subTest(scenario=scenario):
+                calls = {'coinbase': 0, 'kraken': 0}
+                def fetch(provider, **kwargs):
+                    obs = originals[type(provider)](provider, **kwargs)
+                    calls[obs.provider] += 1
+                    if scenario == 'rejection' and obs.provider == 'coinbase':
+                        return replace(obs, price=None, bid_price=None, ask_price=None,
+                            source_timestamp_us=obs.receipt_server_us + kwargs['context'].anchor.uncertainty_us + 1,
+                            result='error', error_code='FUTURE_SOURCE_TIME')
+                    if scenario == 'decimal':
+                        return replace(obs, price=Decimal('100.0000000000000000000000000000000000001') + Decimal(calls[obs.provider]))
+                    if scenario == 'wall reversal' and calls[obs.provider] == 2:
+                        return replace(obs, receipt_wall_us=obs.receipt_wall_us - 5_000_000)
+                    return obs
+                with patch.object(CoinbaseRestProvider, 'fetch_ticker', fetch), patch.object(KrakenRestProvider, 'fetch_ticker', fetch):
+                    rows = self.research_replay_fixture(cycles=2)
+                result = self.analyzer().replay_rows(*rows)
+                self.assertTrue(result['exact'])
+                if scenario == 'rejection':
+                    self.assertEqual(result['reports'][-1]['selected_assessment']['selected_provider'], 'kraken')
+                    self.assertIsNone(rows[0][0]['price_text'])
+                    self.assertIsNotNone(rows[0][0]['source_timestamp_us'])
+                if scenario == 'wall reversal':
+                    self.assertLess(rows[0][2]['receipt_wall_us'], rows[0][0]['receipt_wall_us'])
+
+    def test_replay_fetch_and_completion_identity_bound_to_original_opportunity(self):
+        import copy
+        import json
+        rows = self.research_replay_fixture(cycles=2)
+        self.assertTrue(self.analyzer().replay_rows(*rows)['exact'])
+        for field, forged in [('market_id', 'forged-market'), ('slot_id', 999999), ('slot_index', 999999)]:
+            with self.subTest(field=field):
+                changed = copy.deepcopy(rows)
+                for event in changed[2]:
+                    detail = json.loads(event['detail_json'])
+                    if detail.get('type') in ('APPROXIMATE_FETCH', 'APPROXIMATE_OPPORTUNITY_COMPLETION'):
+                        detail[field] = forged
+                        event['detail_json'] = json.dumps(detail)
+                with self.assertRaises(ValueError):
+                    self.analyzer().replay_rows(*changed)
+        with self.subTest(field='target_ns'):
+            changed = copy.deepcopy(rows)
+            for event in changed[2]:
+                detail = json.loads(event['detail_json'])
+                if detail.get('type') == 'APPROXIMATE_FETCH':
+                    new_ops = []
+                    for oid, t, d in detail['evidence']['scheduled_opportunities']:
+                        new_ops.append([oid, 0 if t == detail['target_ns'] else t, d])
+                    detail['evidence']['scheduled_opportunities'] = new_ops
+                    event['detail_json'] = json.dumps(detail)
+            with self.assertRaises(ValueError):
+                self.analyzer().replay_rows(*changed)
+
+    def test_replay_slot_identity_rejects_bool_in_each_authority(self):
+        import copy
+        import json
+        rows = self.research_replay_fixture()
+        kinds = ('APPROXIMATE_OPPORTUNITY', 'APPROXIMATE_FETCH', 'APPROXIMATE_OPPORTUNITY_COMPLETION')
+        for event in rows[2]:
+            detail = json.loads(event['detail_json'])
+            if detail.get('type') in kinds:
+                detail.update(market_id='market', slot_id=1, slot_index=1)
+                event['detail_json'] = json.dumps(detail)
+        for transport in (False, True):
+            baseline = copy.deepcopy(rows)
+            if transport:
+                fetch = next(json.loads(e['detail_json']) for e in baseline[2] if json.loads(e['detail_json']).get('type') == 'APPROXIMATE_FETCH')
+                for index, attempt in enumerate(fetch['request_attempts'], 1):
+                    actual = dict(attempt, type='ACTUAL_SEND_ATTEMPT', version=2, attempt=index,
+                        market_id='market', slot_id=1, slot_index=1, target_ns=fetch['target_ns'],
+                        host='api.exchange.coinbase.com' if attempt['provider'] == 'coinbase' else 'api.kraken.com',
+                        path='/products/BTC-USD/ticker' if attempt['provider'] == 'coinbase' else '/0/public/Ticker',
+                        method='GET', status=attempt['http_status'])
+                    baseline[2].append(dict(event_id=100 + index, run_id=fetch['run_id'], detail_json=json.dumps(actual)))
+            self.assertTrue(self.analyzer().replay_rows(*baseline)['exact'])
+            for kind in kinds:
+                for field in ('slot_id', 'slot_index'):
+                    with self.subTest(transport=transport, kind=kind, field=field):
+                        changed = copy.deepcopy(baseline)
+                        event = next(e for e in changed[2] if json.loads(e['detail_json']).get('type') == kind)
+                        detail = json.loads(event['detail_json'])
+                        detail[field] = True
+                        event['detail_json'] = json.dumps(detail)
+                        with self.assertRaises(ValueError):
+                            self.analyzer().replay_rows(*changed)
+
+    def test_replay_rejects_impossible_request_chronology(self):
+        import copy
+        import json
+        rows = self.research_replay_fixture(cycles=2)
+        self.assertTrue(self.analyzer().replay_rows(*rows)['exact'])
+        fetches = [json.loads(e['detail_json']) for e in rows[2] if json.loads(e['detail_json']).get('type') == 'APPROXIMATE_FETCH']
+        fetch_detail = fetches[-1]
+        target = fetch_detail['target_ns']
+        origin = fetch_detail['sampling_origin_ns']
+        prev_completion = fetches[-2]['receipt_mono_ns']
+        for name, started in [('pre-target send', target - 1), ('pre-previous completion', prev_completion - 1)]:
+            with self.subTest(name=name):
+                changed = copy.deepcopy(rows)
+                for event in changed[2]:
+                    detail = json.loads(event['detail_json'])
+                    if detail.get('type') == 'APPROXIMATE_FETCH' and detail.get('reference_id') == fetch_detail['reference_id']:
+                        detail['request_attempts'][0]['started_mono_ns'] = started
+                        detail['request_attempts'][0]['ended_mono_ns'] = started + 100_000_000
+                        event['detail_json'] = json.dumps(detail)
+                with self.assertRaisesRegex(ValueError, 'attempt|chronology|target'):
+                    self.analyzer().replay_rows(*changed)
+
+    def test_replay_acquisition_boundaries_wrapper_and_transport(self):
+        import copy
+        import json
+        rows = self.research_replay_fixture(cycles=2)
+        def decoded(rows):
+            return [(e, json.loads(e['detail_json'])) for e in rows[2]]
+        for transport in (False, True):
+            for boundary in ('target', 'provider', 'anchor', 'previous completion'):
+                for offset in (-1, 0):
+                    with self.subTest(transport=transport, boundary=boundary, offset=offset):
+                        changed = copy.deepcopy(rows)
+                        fetches = [(e, d) for e, d in decoded(changed) if d.get('type') == 'APPROXIMATE_FETCH']
+                        last_event, last = fetches[-1]
+                        first_event, first = fetches[0]
+                        target = last['target_ns']
+                        if boundary == 'target':
+                            last['request_attempts'][0]['started_mono_ns'] = target + offset
+                        elif boundary == 'provider':
+                            receipt = changed[0][-2]['receipt_mono_ns']
+                            last['request_attempts'][-1]['started_mono_ns'] = receipt + offset
+                        elif boundary == 'anchor':
+                            end = target - offset
+                            changed[3].append(dict(changed[3][0], anchor_id=2, request_end_mono_ns=end))
+                            last['anchor_id'] = 2
+                            for context in last['evidence']['contexts'][-2:]:
+                                context['anchor_id'] = 2
+                                context['anchor']['request_end_mono_ns'] = end
+                        else:
+                            first['completion_ns'] = target - offset
+                            first_event['detail_json'] = json.dumps(first)
+                            for event, detail in decoded(changed):
+                                if detail.get('type') == 'APPROXIMATE_OPPORTUNITY_COMPLETION' and detail['reference_id'] == first['reference_id']:
+                                    detail['completion_ns'] = first['completion_ns']
+                                    event['detail_json'] = json.dumps(detail)
+                        last_event['detail_json'] = json.dumps(last)
+                        if transport:
+                            for event, detail in decoded(changed):
+                                if detail.get('type') != 'APPROXIMATE_FETCH':
+                                    continue
+                                for attempt in detail['request_attempts']:
+                                    index = len(changed[2]) + 100
+                                    actual = dict(attempt, type='ACTUAL_SEND_ATTEMPT', version=2, attempt=index,
+                                        host='api.exchange.coinbase.com' if attempt['provider'] == 'coinbase' else 'api.kraken.com',
+                                        path='/products/BTC-USD/ticker' if attempt['provider'] == 'coinbase' else '/0/public/Ticker',
+                                        method='GET', status=attempt['http_status'], target_ns=detail['target_ns'])
+                                    changed[2].append(dict(event_id=index, run_id=detail['run_id'], detail_json=json.dumps(actual)))
+                        if offset == -1:
+                            with self.assertRaises(ValueError):
+                                self.analyzer().replay_rows(*changed)
+                        else:
+                            self.assertTrue(self.analyzer().replay_rows(*changed)['exact'])
+
+    def test_replay_rejects_impossible_transport_chronology(self):
+        import copy
+        import json
+        rows = self.research_replay_fixture()
+        fetch_detail = next(json.loads(e['detail_json']) for e in rows[2] if json.loads(e['detail_json']).get('type') == 'APPROXIMATE_FETCH')
+        target = fetch_detail['target_ns']
+        origin = fetch_detail['sampling_origin_ns']
+        for index, attempt in enumerate(fetch_detail['request_attempts'], 1):
+            event = dict(type='ACTUAL_SEND_ATTEMPT', version=2, attempt=index,
+                host='api.exchange.coinbase.com' if attempt['provider'] == 'coinbase' else 'api.kraken.com',
+                path='/products/BTC-USD/ticker' if attempt['provider'] == 'coinbase' else '/0/public/Ticker',
+                method='GET', status=attempt['http_status'], error=None, target_ns=target,
+                run_id=fetch_detail['run_id'], opportunity_id=fetch_detail['opportunity_id'],
+                started_mono_ns=attempt['started_mono_ns'], ended_mono_ns=attempt['ended_mono_ns'],
+                provider=attempt['provider'], complete=True, stream_closed=True)
+            rows[2].append(dict(event_id=100 + index, run_id=fetch_detail['run_id'], detail_json=json.dumps(event)))
+        self.assertTrue(self.analyzer().replay_rows(*rows)['exact'])
+        for name, started in [('transport pre-target', target - 1), ('transport pre-origin', origin - 1)]:
+            with self.subTest(name=name):
+                changed = copy.deepcopy(rows)
+                for event in changed[2][-4:]:
+                    detail = json.loads(event['detail_json'])
+                    detail['started_mono_ns'] = started
+                    event['detail_json'] = json.dumps(detail)
+                with self.assertRaisesRegex(ValueError, 'transport'):
+                    self.analyzer().replay_rows(*changed)
 
     def test_replay_requires_complete_membership(self):
         module = self.analyzer()
