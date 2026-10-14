@@ -12,6 +12,43 @@ import httpx
 
 from polymarket_bot.market_data.models import MarketDataError
 from polymarket_bot.market_data.numeric import parse_decimal
+from polymarket_bot.recorder.models import ClockAnchor
+
+
+@dataclass(frozen=True)
+class AcquisitionContext:
+    revision: int
+    run_id: int
+    anchor: ClockAnchor
+    anchor_id: int
+    sampling_origin_ns: int
+    discontinuity_end_ns: int | None
+
+
+def _captured_projection(context: AcquisitionContext | None, moment: int | None) -> int | None:
+    if not isinstance(context, AcquisitionContext) or not isinstance(context.anchor, ClockAnchor):
+        return None
+    anchor = context.anchor
+    fields = (context.revision, context.run_id, context.anchor_id, context.sampling_origin_ns,
+        anchor.request_start_mono_ns, anchor.request_end_mono_ns, anchor.midpoint_ns,
+        anchor.server_us, anchor.uncertainty_us, moment)
+    if any(type(value) is not int or not 0 <= value <= 2**63 - 1 for value in fields):
+        return None
+    if (context.revision != 2 or context.run_id <= 0 or context.anchor_id <= 0
+            or anchor.status != 'VALID' or anchor.uncertainty_us < 1_000_000
+            or anchor.request_start_mono_ns > anchor.midpoint_ns
+            or anchor.midpoint_ns > anchor.request_end_mono_ns):
+        return None
+    if moment is None or moment < max(anchor.request_end_mono_ns, context.sampling_origin_ns):
+        return None
+    if moment - anchor.midpoint_ns > 120_000_000_000:
+        return None
+    if context.discontinuity_end_ns is not None:
+        end = context.discontinuity_end_ns
+        if type(end) is not int or not 0 <= end <= anchor.request_start_mono_ns:
+            return None
+    projected = anchor.server_us + (moment - anchor.midpoint_ns) // 1000
+    return projected if 0 <= projected <= 2**63 - 1 else None
 
 
 @runtime_checkable
@@ -22,7 +59,8 @@ class ApproximateReferenceProvider(Protocol):
     def pair(self) -> str: ...
     @property
     def quote_currency(self) -> str: ...
-    def fetch_ticker(self, *, deadline: float) -> "ApproximateObservation": ...
+    def fetch_ticker(self, *, deadline: float | None = None,
+                     context: AcquisitionContext | None = None) -> "ApproximateObservation": ...
 
 
 @dataclass(frozen=True)
@@ -44,6 +82,20 @@ class ApproximateObservation:
     result: str
     error_code: str | None
     receipt_mono_ns: int | None = None
+
+
+def source_time_status(observation: ApproximateObservation, context: AcquisitionContext | None) -> str:
+    projected = _captured_projection(context, observation.receipt_mono_ns)
+    if projected is None or observation.receipt_server_us != projected:
+        return 'CLOCK_CONTEXT_UNAVAILABLE'
+    if observation.source_timestamp_us is None:
+        return 'SOURCE_TIME_UNAVAILABLE'
+    if type(observation.source_timestamp_us) is not int or not 0 <= observation.source_timestamp_us <= 2**63 - 1:
+        return 'FUTURE_SOURCE_TIME'
+    assert context is not None
+    return ('SOURCE_TIME_WITHIN_CLOCK_UNCERTAINTY'
+        if observation.source_timestamp_us <= projected + context.anchor.uncertainty_us
+        else 'FUTURE_SOURCE_TIME')
 
 
 @dataclass(frozen=True)
@@ -81,16 +133,27 @@ class CoinbaseRestProvider:
         self._project = project
         self._sleep = sleep
 
-    def fetch_ticker(self, *, deadline: float) -> ApproximateObservation:
-        end_ns = int(deadline * 1000000000)
+    def fetch_ticker(self, *, deadline: float | None = None,
+                     context: AcquisitionContext | None = None) -> ApproximateObservation:
+        end_ns = (self._monotonic_ns() + 5_000_000_000 if deadline is None
+                  else int(deadline * 1000000000))
         body = bytearray()
         status = None
         error = "DEADLINE_EXPIRED"
+        last_attempt_ns = None
+        chronology_invalid = False
         for attempt in range(2):
-            remaining = (end_ns - self._monotonic_ns()) / 1000000000
+            send_ns = self._monotonic_ns()
+            if context is not None and (_captured_projection(context, send_ns) is None
+                    or (last_attempt_ns is not None and send_ns < last_attempt_ns)):
+                chronology_invalid = True
+                error = 'CLOCK_CONTEXT_UNAVAILABLE'
+                break
+            remaining = (end_ns - send_ns) / 1000000000
             if remaining <= 0:
                 error = "DEADLINE_EXPIRED"
                 break
+            last_attempt_ns = send_ns
             body = bytearray()
             status = None
             request = httpx.Request("GET", self._ENDPOINT,
@@ -120,14 +183,22 @@ class CoinbaseRestProvider:
             except httpx.HTTPError:
                 error = "TRANSPORT_ERROR"
             if attempt == 0 and (status == 429 or error in ("TRANSPORT_TIMEOUT", "TRANSPORT_ERROR")):
-                remaining = (end_ns - self._monotonic_ns()) / 1000000000
+                retry_ns = self._monotonic_ns()
+                if context is not None:
+                    if retry_ns < last_attempt_ns:
+                        chronology_invalid = True
+                        error = 'CLOCK_CONTEXT_UNAVAILABLE'
+                        break
+                    last_attempt_ns = retry_ns
+                remaining = (end_ns - retry_ns) / 1000000000
                 if remaining > 0.1:
                     self._sleep(0.1)
                     continue
             break
         wall = self._wall_us()
         mono = self._monotonic_ns()
-        server = self._project(mono) if self._project is not None else None
+        server = (_captured_projection(context, mono) if context is not None
+                  else self._project(mono) if self._project is not None else None)
         price = bid = ask = source = None
         if error is None:
             try:
@@ -170,13 +241,22 @@ class CoinbaseRestProvider:
                             raise ValueError()
                         delta = instant.astimezone(timezone.utc) - datetime(1970, 1, 1, tzinfo=timezone.utc)
                         source = (delta.days * 86400 + delta.seconds) * 1000000 + delta.microseconds
-                        if source > wall or (server is not None and source > server):
+                        if context is None and (source > wall or (server is not None and source > server)):
                             error = "FUTURE_SOURCE_TIME"
             except (ValueError, KeyError, TypeError, ArithmeticError, MarketDataError):
                 error = "MALFORMED_JSON"
+        if context is not None:
+            observation = ApproximateObservation(self.provider_name, self.pair, self.quote_currency,
+                price, bid, ask, source, wall, server, '', len(body), 'rest', self._PARSER_REVISION,
+                status, 'error' if error else 'success', error, mono)
+            policy_status = ('CLOCK_CONTEXT_UNAVAILABLE'
+                if chronology_invalid or (last_attempt_ns is not None and mono < last_attempt_ns)
+                else source_time_status(observation, context))
+            if policy_status == 'CLOCK_CONTEXT_UNAVAILABLE' or (error is None and policy_status == 'FUTURE_SOURCE_TIME'):
+                error = policy_status
         if error is not None:
             price = bid = ask = None
-            if error != "FUTURE_SOURCE_TIME":
+            if error not in ("FUTURE_SOURCE_TIME", 'CLOCK_CONTEXT_UNAVAILABLE'):
                 source = None
         return ApproximateObservation(self.provider_name, self.pair, self.quote_currency,
             price, bid, ask, source, wall, server, hashlib.sha256(body).hexdigest(), len(body),

@@ -12,6 +12,121 @@ from polymarket_bot.recorder.free_reference import (
 )
 
 
+class CapturedCoinbasePolicyTests(unittest.TestCase):
+    def setUp(self):
+        from polymarket_bot.recorder import free_reference
+        from polymarket_bot.recorder.models import ClockAnchor
+        self.policy = free_reference
+        self.assertTrue(hasattr(free_reference, 'AcquisitionContext'), 'captured acquisition policy missing')
+        self.mono = 10_000_000_000
+        self.wall = 1791873042839308
+        self.anchor = ClockAnchor(1791873042, self.mono, self.mono, 0, 0,
+            self.mono, 1791873042265500, 1093500, 'VALID')
+        self.context = free_reference.AcquisitionContext(2, 1, self.anchor, 1, self.mono, None)
+        self.sends = 0
+
+    def fetch(self, source=1791873042866047, *, context=None, advance=0, retry=False):
+        from datetime import timedelta
+        stamp = (datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=source)).isoformat()
+        def handler(request):
+            self.sends += 1
+            self.mono += advance
+            if retry:
+                return httpx.Response(429)
+            return httpx.Response(200, json={'price': '10', 'bid': '9', 'ask': '11', 'time': stamp})
+        with httpx.Client(transport=httpx.MockTransport(handler), trust_env=False) as client:
+            provider = CoinbaseRestProvider(client, monotonic_ns=lambda: self.mono,
+                wall_us=lambda: self.wall, project=lambda mono: self.fail('new projection used'),
+                sleep=lambda seconds: None)
+            return provider.fetch_ticker(deadline=self.mono / 1e9 + 5,
+                context=self.context if context is None else context)
+
+    def test_uncertainty_policy_retained_case(self):
+        obs = self.fetch()
+        self.assertEqual(obs.price, Decimal('10'))
+        self.assertEqual(obs.source_timestamp_us, 1791873042866047)
+        self.assertEqual(obs.receipt_server_us, 1791873042265500)
+        self.assertEqual(self.policy.source_time_status(obs, self.context),
+            'SOURCE_TIME_WITHIN_CLOCK_UNCERTAINTY')
+
+    def test_source_upper_bound(self):
+        for source, error in ((1791873043359000, None), (1791873043359001, 'FUTURE_SOURCE_TIME')):
+            with self.subTest(source=source):
+                obs = self.fetch(source)
+                self.assertEqual(obs.error_code, error)
+                self.assertEqual(obs.source_timestamp_us, source)
+                self.assertEqual((obs.price, obs.bid_price, obs.ask_price),
+                    (None, None, None) if error else (Decimal('10'), Decimal('9'), Decimal('11')))
+
+    def test_anchor_send_boundary_and_invalid_context(self):
+        from dataclasses import replace
+        for age, status, revision in ((120_000_000_000, 'VALID', 2),
+                (120_000_000_001, 'VALID', 2), (0, 'DISCONTINUITY', 2), (0, 'VALID', 3), (-1, 'VALID', 2)):
+            with self.subTest(age=age, status=status, revision=revision):
+                self.mono = self.anchor.midpoint_ns + age
+                context = replace(self.context, revision=revision, anchor=replace(self.anchor, status=status))
+                before = self.sends
+                obs = self.fetch(context=context)
+                valid = age == 120_000_000_000 and status == 'VALID' and revision == 2
+                self.assertEqual(self.sends - before, int(valid))
+                self.assertEqual(obs.result, 'success' if valid else 'error')
+                if not valid:
+                    self.assertIsNone(obs.price)
+                    self.assertIsNone(obs.receipt_server_us)
+
+    def test_receipt_and_retry_expiry(self):
+        for retry in (False, True):
+            with self.subTest(retry=retry):
+                self.mono = self.anchor.midpoint_ns + 119_999_999_999
+                before = self.sends
+                obs = self.fetch(advance=2, retry=retry)
+                self.assertEqual(self.sends - before, 1)
+                self.assertEqual(obs.error_code, 'CLOCK_CONTEXT_UNAVAILABLE')
+                self.assertIsNone(obs.price)
+                if not retry:
+                    self.assertEqual(obs.source_timestamp_us, 1791873042866047)
+
+    def test_acquisition_chronology_fails_closed(self):
+        for provider_class in (CoinbaseRestProvider, self.policy.KrakenRestProvider):
+            for phase in ('receipt', 'retry_send', 'retry_receipt', 'retry_after_response', 'equal', 'legacy'):
+                with self.subTest(provider=provider_class.provider_name, phase=phase):
+                    self.mono = self.anchor.midpoint_ns + 3000
+                    sends = []
+                    def handler(request):
+                        sends.append(self.mono)
+                        if phase.startswith('retry') and len(sends) == 1:
+                            if phase == 'retry_after_response':
+                                self.mono += 1000
+                            return httpx.Response(429)
+                        if phase in ('receipt', 'retry_receipt', 'legacy'):
+                            self.mono -= 1000
+                        payload = ({'price': '10', 'bid': '9', 'ask': '11',
+                            'time': '2020-03-20T00:22:57.833Z'}
+                            if provider_class is CoinbaseRestProvider else
+                            {'error': [], 'result': {'BTC/USD': {'c': ['10'], 'b': ['9'], 'a': ['11']}}})
+                        return httpx.Response(200, json=payload)
+                    def sleep(seconds):
+                        if phase in ('retry_send', 'retry_after_response'):
+                            self.mono -= 1000
+                    with httpx.Client(transport=httpx.MockTransport(handler), trust_env=False) as client:
+                        provider = provider_class(client, monotonic_ns=lambda: self.mono,
+                            wall_us=lambda: self.wall, sleep=sleep)
+                        obs = provider.fetch_ticker(deadline=self.mono / 1e9 + 5,
+                            context=None if phase == 'legacy' else self.context)
+                    if phase in ('equal', 'legacy'):
+                        self.assertEqual(obs.result, 'success')
+                    else:
+                        self.assertEqual(obs.error_code, 'CLOCK_CONTEXT_UNAVAILABLE')
+                        self.assertEqual((obs.price, obs.bid_price, obs.ask_price), (None, None, None))
+                        self.assertEqual(len(sends), 1 if phase in ('retry_send', 'retry_after_response', 'receipt') else 2)
+                        if provider_class is CoinbaseRestProvider and phase in ('receipt', 'retry_receipt'):
+                            self.assertIsNotNone(obs.source_timestamp_us)
+
+    def test_wall_jump_does_not_change_policy(self):
+        self.wall = 1
+        self.assertEqual(self.fetch().result, 'success')
+
+
 class CoinbaseProviderTests(unittest.TestCase):
     def setUp(self):
         self.monotonic_ns = 2_000_000_000_000_000

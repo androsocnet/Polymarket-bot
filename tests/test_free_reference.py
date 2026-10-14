@@ -11,6 +11,25 @@ from polymarket_bot.recorder.free_reference import (
 )
 
 
+class CapturedSourcePolicyTests(unittest.TestCase):
+    def test_missing_context_and_future_receipt_fail_closed(self):
+        from polymarket_bot.recorder import free_reference as policy
+        from polymarket_bot.recorder.models import ClockAnchor
+        from dataclasses import replace
+        self.assertTrue(hasattr(policy, 'AcquisitionContext'), 'captured acquisition policy missing')
+        anchor = ClockAnchor(1, 1000, 1000, 0, 0, 1000, 1000000, 1000000, 'VALID')
+        context = policy.AcquisitionContext(2, 1, anchor, 1, 1000, None)
+        obs = ApproximateObservation('coinbase', 'BTC/USD', 'USD', Decimal('1'), None, None,
+            1000000, 0, 1000000, '', 0, 'rest', 'coinbase-ticker-v1', 200, 'success', None, 1000)
+        self.assertEqual(policy.source_time_status(obs, context), 'SOURCE_TIME_WITHIN_CLOCK_UNCERTAINTY')
+        for changed in (replace(obs, receipt_mono_ns=None), replace(obs, receipt_mono_ns=999),
+                replace(obs, receipt_mono_ns=120_000_001_001), replace(obs, receipt_server_us=1000001)):
+            self.assertEqual(policy.source_time_status(changed, context), 'CLOCK_CONTEXT_UNAVAILABLE')
+        with self.assertRaises(FrozenInstanceError):
+            setattr(context, 'revision', 1)
+        self.assertEqual(policy.source_time_status(obs, None), 'CLOCK_CONTEXT_UNAVAILABLE')
+
+
 class FreeReferenceModelTests(unittest.TestCase):
     def test_observation_is_frozen_dataclass(self):
         obs = ApproximateObservation(

@@ -11,6 +11,24 @@ from polymarket_bot.recorder.free_reference import (
 )
 
 
+class CapturedKrakenPolicyTests(unittest.TestCase):
+    def test_captured_clock_without_fabricated_source(self):
+        from polymarket_bot.recorder import free_reference as policy
+        from polymarket_bot.recorder.models import ClockAnchor
+        self.assertTrue(hasattr(policy, 'AcquisitionContext'), 'captured acquisition policy missing')
+        anchor = ClockAnchor(1, 1000, 1000, 0, 0, 1000, 1000000, 1000000, 'VALID')
+        context = policy.AcquisitionContext(2, 1, anchor, 1, 1000, None)
+        with httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200,
+                json={'error': [], 'result': {'BTC/USD': {'c': ['10'], 'b': ['9'], 'a': ['11']}}})),
+                trust_env=False) as client:
+            provider = KrakenRestProvider(client, monotonic_ns=lambda: 1000, wall_us=lambda: 0)
+            obs = provider.fetch_ticker(context=context)
+        self.assertEqual(obs.result, 'success')
+        self.assertEqual(obs.receipt_server_us, 1000000)
+        self.assertIsNone(obs.source_timestamp_us)
+        self.assertEqual(policy.source_time_status(obs, context), 'SOURCE_TIME_UNAVAILABLE')
+
+
 class KrakenProviderTests(unittest.TestCase):
     def setUp(self):
         self.monotonic_ns = 1_000_000_000_000
