@@ -269,5 +269,177 @@ class FreePersistenceTests(unittest.TestCase):
         self.assertEqual(len(self.store._rows("SELECT * FROM approximate_observations")), 2)
 
 
+class ResearchPersistenceTests(FreePersistenceTests):
+    def test_all_book_attempts_are_durable(self):
+        from types import SimpleNamespace
+        from polymarket_bot.market_data.http import HttpAttempt
+        import json
+        self.test_revision_two_recorder_flow()
+        attempt = HttpAttempt('BOOK_SINGLE', 'GET', '/book', ('token_id=11',), 1,
+            11_000_000_000, 11_100_000_000, NOW_US, NOW_US, 200, 'success', None, b'{}', True)
+        self.assertTrue(hasattr(self.recorder, '_persist_book_attempts'), 'book attempts missing')
+        self.recorder._persist_book_attempts(SimpleNamespace(attempts=(attempt, attempt)),
+            market_id='market', slot_id=1, slot_index=0, target_ns=11_000_000_000,
+            up_token='11', down_token='12')
+        rows = [json.loads(row['detail_json']) for row in self.store._rows('SELECT detail_json FROM recorder_events')]
+        sends = [row for row in rows if row.get('type') == 'BOOK_SEND_ATTEMPT']
+        self.assertEqual(len(sends), 2)
+        self.assertEqual([row['leg'] for row in sends], ['UP', 'UP'])
+        self.assertEqual(sends[0]['started_mono_ns'], 11_000_000_000)
+
+    def test_scheduler_dispositions_and_session_origin_are_durable(self):
+        import json
+        self.test_revision_two_recorder_flow()
+        recorder = self.recorder
+        for disposition in ('skipped', 'busy', 'unsubmitted'):
+            recorder._research_opportunity(12_000_000_000, disposition, market_id='scheduled', slot_index=6)
+        events = [json.loads(row['detail_json']) for row in self.store._rows('SELECT detail_json FROM recorder_events')]
+        opportunities = [row for row in events if row.get('type') == 'APPROXIMATE_OPPORTUNITY']
+        self.assertEqual([row['disposition'] for row in opportunities[-3:]], ['skipped', 'busy', 'unsubmitted'])
+        self.assertTrue(any(row.get('type') == 'APPROXIMATE_SESSION' for row in events), 'session origin absent before fetch')
+
+    def test_v2_membership_rejects_duplicates_and_cross_run_ids(self):
+        from polymarket_bot.recorder.service import Recorder
+        from dataclasses import replace
+        self.test_revision_two_recorder_flow()
+        from typing import cast
+        from polymarket_bot.recorder.free_reference import ResearchFetchResult
+        recorder, result = self.recorder, cast(ResearchFetchResult, self.research_result)
+        for evidence in (replace(result.evidence, observation_ids=(1, 1)),
+                replace(result.evidence, run_id='foreign'),
+                replace(result.evidence, sampling_origin_ns=1),
+                replace(result.evidence, contexts=tuple(replace(c, run_id='foreign') for c in result.evidence.contexts)),
+                replace(result.evidence, contexts=tuple(replace(c, anchor=replace(c.anchor, uncertainty_us=2_000_000)) for c in result.evidence.contexts))):
+            with self.subTest(evidence=evidence), self.assertRaises(ValueError):
+                recorder._validate_research_result(replace(result, evidence=evidence))
+
+    def test_partial_fetch_persistence_fails_closed(self):
+        self.test_revision_two_recorder_flow()
+        import json
+        rows = self.store._rows('SELECT detail_json FROM recorder_events')
+        fetch = next(json.loads(row['detail_json']) for row in rows if json.loads(row['detail_json']).get('type') == 'APPROXIMATE_FETCH')
+        self.assertEqual(fetch.get('persistence_status'), 'COMPLETE', 'missing durable completion barrier')
+        from unittest.mock import patch
+        recorder = self.recorder
+        original_count = len(rows)
+        recorder._research_mapping = {}
+        with patch.object(self.store, 'save_approximate_reference', side_effect=OSError('interrupted')):
+            with self.assertRaises(OSError):
+                recorder._persist_research(self.research_result)
+        after = self.store._rows('SELECT detail_json FROM recorder_events')
+        self.assertEqual(len(after), original_count)
+        self.assertEqual(recorder._research_mapping, {})
+
+    def test_multi_fetch_history_is_bounded_and_ids_are_durable(self):
+        self.test_revision_two_recorder_flow(cycles=40)
+        evidence = self.recorder._research_evidence
+        self.assertLessEqual(len(evidence.observation_ids), 64)
+        session = self.recorder.approximate_reference
+        assert session is not None
+        self.assertEqual(len(evidence.observation_ids), len(session._research_observations))
+        self.assertEqual(len(self.store._rows('SELECT * FROM approximate_references')), 40)
+        self.assertEqual(set(evidence.observation_ids), set(self.recorder._research_mapping))
+
+    def test_delayed_discovery_cannot_attest_scheduler_completeness(self):
+        self.test_revision_two_recorder_flow(delay_ns=30_000_000_000)
+        result = self.research_result
+        assert result is not None
+        self.assertIsNone(result.evidence.validated_window_start_ns)
+        self.assertIsNone(result.evidence.validated_window_end_ns)
+        self.assertIn('INCOMPLETE_PROVENANCE', result.selected_assessment.reasons)
+
+    def test_captured_anchor_and_persisted_origin_are_bound(self):
+        from dataclasses import replace
+        self.test_revision_two_recorder_flow()
+        from typing import cast
+        from polymarket_bot.recorder.free_reference import ResearchFetchResult
+        result = cast(ResearchFetchResult, self.research_result)
+        for field, value in (('server_us', result.context.anchor.server_us + 1),
+                ('midpoint_ns', 1), ('request_end_mono_ns', 1), ('status', 'DISCONTINUITY')):
+            context = replace(result.context, anchor=replace(result.context.anchor, **{field: value}))
+            altered = replace(result, context=context, evidence=replace(result.evidence,
+                contexts=tuple(context for _ in result.evidence.contexts)))
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                self.recorder._validate_research_result(altered)
+        context = replace(result.context, sampling_origin_ns=1)
+        altered = replace(result, context=context, evidence=replace(result.evidence,
+            sampling_origin_ns=1, contexts=tuple(context for _ in result.evidence.contexts)))
+        with self.assertRaises(ValueError):
+            self.recorder._validate_research_result(altered)
+
+    def test_inflight_discontinuity_survives_receipt_and_drain(self):
+        self.test_revision_two_recorder_flow(inflight=True)
+        result = self.research_result
+        assert result is not None
+        self.assertIn(10_100_000_000, result.evidence.discontinuity_ends_ns)
+        self.assertIn('CLOCK_DISCONTINUITY', result.selected_assessment.reasons)
+        self.assertIn(10_100_000_000, self.recorder._research_evidence.discontinuity_ends_ns)
+        self.assertIn(result.report.receipt_mono_ns + 1, self.recorder._research_evidence.discontinuity_ends_ns)
+
+    def test_revision_two_recorder_flow(self, cycles=1, delay_ns=0, inflight=False):
+        import json
+        import httpx
+        from polymarket_bot.market_data.http import PublicGet
+        from polymarket_bot.recorder.service import Recorder, ApproximateReferenceWorker
+        from polymarket_bot.recorder.free_reference import ApproximateReferenceSession, CoinbaseRestProvider, KrakenRestProvider
+        from polymarket_bot.recorder.models import ClockAnchor
+        mono = [10_000_000_000]
+        calls = {}
+        wall = lambda: NOW_US + mono[0] // 1000
+        def respond(request):
+            mono[0] += 100_000_000
+            if inflight and mono[0] == 10_100_000_000:
+                from dataclasses import replace
+                recorder._research_evidence = replace(recorder._research_evidence, discontinuity_ends_ns=(mono[0],))
+            calls[request.url.host] = calls.get(request.url.host, 0) + 1
+            if calls[request.url.host] == 1:
+                return httpx.Response(429, json={})
+            if request.url.host == 'api.kraken.com':
+                return httpx.Response(200, json={'error': [], 'result': {'BTC/USD': {'c': ['100'], 'b': ['99'], 'a': ['101']}}})
+            return httpx.Response(200, json={'price': '100', 'bid': '99', 'ask': '101', 'time': '2026-01-01T00:00:00Z'})
+        with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+            providers = {name: cls(client, monotonic_ns=lambda: mono[0], wall_us=wall, sleep=lambda _: None)
+                for name, cls in (('coinbase', CoinbaseRestProvider), ('kraken', KrakenRestProvider))}
+            session = ApproximateReferenceSession(providers=providers, monotonic_ns=lambda: mono[0], wall_us=wall, sleep=lambda _: None)
+            session.start()
+            recorder = Recorder(self.store, PublicGet(client, monotonic=lambda: mono[0] / 1e9, sleep=lambda _: None, utcnow=lambda: __import__('datetime').datetime.now(__import__('datetime').timezone.utc)), monotonic_ns=lambda: mono[0], wall_us=wall, sleep=lambda _: None, approximate_reference=session)
+            recorder.run_id = self.run_id
+            recorder.run_deadline_ns = 100_000_000_000
+            recorder.approximate_worker = ApproximateReferenceWorker()
+            recorder.clock.anchor = ClockAnchor(NOW_US // 1_000_000, 0, 0, NOW_US, NOW_US, 0, NOW_US, 1_000_000, 'VALID')
+            recorder.anchor_id = self.store.save_anchor(self.run_id, recorder.clock.anchor)
+            mono[0] += delay_ns
+            self.assertTrue(recorder._approximate_submit(mono[0] + 2_000_000_000))
+            recorder.approximate_worker.stop()
+            self.recorder = recorder
+            self.research_result = recorder.approximate_worker.take()
+            if inflight:
+                from dataclasses import replace
+                assert self.research_result is not None
+                recorder._research_evidence = replace(recorder._research_evidence,
+                    discontinuity_ends_ns=recorder._research_evidence.discontinuity_ends_ns + (self.research_result.report.receipt_mono_ns + 1,))
+            mono[0] += 1_000_000_000
+            recorder._approximate_drain(result=self.research_result)
+            for index in range(1, cycles):
+                from polymarket_bot.recorder.service import ApproximateReferenceWorker
+                mono[0] = 10_000_000_000 + index * 2_000_000_000
+                recorder.approximate_worker = ApproximateReferenceWorker()
+                self.assertTrue(recorder._approximate_submit(mono[0] + 2_000_000_000))
+                recorder.approximate_worker.stop()
+                recorder._approximate_drain()
+        events = [json.loads(row['detail_json']) for row in self.store._rows('SELECT * FROM recorder_events')]
+        fetch = next(row for row in events if row.get('type') == 'APPROXIMATE_FETCH')
+        self.assertEqual(fetch['version'], 2)
+        self.assertEqual(fetch['run_id'], self.run_id)
+        self.assertEqual(fetch['sampling_origin_ns'], 10_000_000_000)
+        self.assertLess(fetch['completion_ns'], mono[0])
+        self.assertEqual(len(fetch['observation_ids']), 2)
+        self.assertEqual(len(fetch['request_attempts']), 4)
+        self.assertEqual([row['attempt'] for row in fetch['request_attempts']], [1, 2, 1, 2])
+        self.assertTrue(all(row['started_mono_ns'] <= row['ended_mono_ns'] for row in fetch['request_attempts']))
+        self.assertEqual(fetch['selected_assessment']['coverage_quality'], 'INSUFFICIENT')
+        self.assertTrue(any(row.get('type') == 'APPROXIMATE_OPPORTUNITY' for row in events))
+
+
 if __name__ == "__main__":
     unittest.main()
