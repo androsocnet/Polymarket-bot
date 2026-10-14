@@ -376,6 +376,59 @@ class ResearchPersistenceTests(FreePersistenceTests):
         self.assertIn(10_100_000_000, self.recorder._research_evidence.discontinuity_ends_ns)
         self.assertIn(result.report.receipt_mono_ns + 1, self.recorder._research_evidence.discontinuity_ends_ns)
 
+    def test_late_discontinuity_warmup_fallback_replays_exactly(self):
+        self.check_late_discontinuity_selection(cycles=1, provider='kraken', warming='WARMING_UP')
+
+    def test_late_discontinuity_disqualifies_postwarmup_fallback(self):
+        self.check_late_discontinuity_selection(cycles=40, provider='coinbase', warming='FULL')
+
+    def check_late_discontinuity_selection(self, *, cycles, provider, warming):
+        import json
+        from dataclasses import replace
+        from unittest.mock import patch
+        from tests.test_cp5_safety import CP5SafetyTests
+        from polymarket_bot.recorder.service import Recorder
+        from polymarket_bot.recorder.free_reference import CoinbaseRestProvider
+        original_fetch = CoinbaseRestProvider.fetch_ticker
+        original_persist = Recorder._persist_research
+        seen = []
+        def fetch(instance, **kwargs):
+            observation = original_fetch(instance, **kwargs)
+            return (replace(observation, price=None, bid_price=None,
+                ask_price=None, result='error', error_code='HTTP_ERROR', source_timestamp_us=None)
+                if instance.provider_name == 'coinbase' else observation)
+        def persist(recorder, result):
+            seen.append(result)
+            if len(seen) == cycles:
+                self.assertEqual(result.selected_assessment.selected_provider, 'kraken')
+                end = result.report.receipt_mono_ns - 1
+                recorder._research_evidence = replace(recorder._research_evidence,
+                    discontinuity_ends_ns=(end,))
+                recorder.store.record_event(recorder.run_id, 'CLOCK_PAUSE',
+                    started_us=result.report.receipt_wall_us, detail=dict(
+                        type='APPROXIMATE_DISCONTINUITY', version=2, run_id=recorder.run_id,
+                        anchor_id=recorder.anchor_id, calibration_end_ns=end))
+            return original_persist(recorder, result)
+        with patch.object(CoinbaseRestProvider, 'fetch_ticker', fetch), patch.object(Recorder, '_persist_research', persist):
+            self.test_revision_two_recorder_flow(cycles=cycles)
+        rows = tuple([dict(row) for row in self.store._rows('SELECT * FROM ' + table)]
+            for table in ('approximate_observations', 'approximate_references', 'recorder_events', 'clock_anchors'))
+        replay = CP5SafetyTests.analyzer().replay_rows(*rows)
+        self.assertTrue(replay['exact'])
+        final = replay['reports'][-1]
+        self.assertEqual(final['warmup_status'], warming)
+        self.assertEqual(final['selected_assessment']['selected_provider'], provider)
+        self.assertIn('CLOCK_DISCONTINUITY', final['selected_assessment']['reasons'])
+        detail = next(json.loads(e['detail_json']) for e in reversed(rows[2])
+            if json.loads(e['detail_json']).get('type') == 'APPROXIMATE_FETCH')
+        self.assertEqual(detail['receipt_mono_ns'], seen[-1].report.receipt_mono_ns)
+        self.assertGreaterEqual(detail['completion_ns'], seen[-1].completion_ns)
+        self.assertEqual(rows[1][-1]['source_provider'], provider)
+        if provider == 'kraken':
+            self.assertIn('PRIMARY_INSUFFICIENT', final['selected_assessment']['reasons'])
+        else:
+            self.assertEqual(final['selected_assessment']['coverage_quality'], 'INSUFFICIENT')
+
     def test_revision_two_recorder_flow(self, cycles=1, delay_ns=0, inflight=False):
         import json
         import httpx
@@ -432,7 +485,8 @@ class ResearchPersistenceTests(FreePersistenceTests):
         self.assertEqual(fetch['version'], 2)
         self.assertEqual(fetch['run_id'], self.run_id)
         self.assertEqual(fetch['sampling_origin_ns'], 10_000_000_000)
-        self.assertLess(fetch['completion_ns'], mono[0])
+        self.assertLessEqual(fetch['completion_ns'], mono[0])
+        self.assertGreaterEqual(fetch['completion_ns'], fetch['receipt_mono_ns'])
         self.assertEqual(len(fetch['observation_ids']), 2)
         self.assertEqual(len(fetch['request_attempts']), 4)
         self.assertEqual([row['attempt'] for row in fetch['request_attempts']], [1, 2, 1, 2])

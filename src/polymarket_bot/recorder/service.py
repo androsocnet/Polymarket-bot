@@ -380,13 +380,13 @@ class Recorder:
         ends = tuple(sorted(set(result.evidence.discontinuity_ends_ns + tuple(
             end for end in self._research_evidence.discontinuity_ends_ns if end <= receipt_ns))))
         if ends != result.evidence.discontinuity_ends_ns:
-            from .free_reference import assess_provider
+            from .free_reference import reconstruct_research_report
             evidence = replace(result.evidence, discontinuity_ends_ns=ends)
-            assessments = tuple(assess_provider(result.window_observations, provider=a.selected_provider,
-                report_wall_us=result.report.receipt_wall_us, report_ns=receipt_ns, evidence=evidence,
-                was_fallback=result.report.was_fallback and a.selected_provider == 'kraken') for a in result.assessments)
-            selected = next(a for a in assessments if a.selected_provider == result.selected_assessment.selected_provider)
-            result = replace(result, evidence=evidence, assessments=assessments, selected_assessment=selected)
+            report, assessments, selected = reconstruct_research_report(result.window_observations,
+                evidence=evidence, context=result.context,
+                report_wall_us=result.report.receipt_wall_us, report_ns=receipt_ns)
+            result = replace(result, evidence=evidence, report=report, assessments=assessments,
+                selected_assessment=selected, completion_ns=max(result.completion_ns, self.monotonic_ns()))
         self._validate_research_result(result)
         evidence = result.evidence
         if (result.context.run_id != self.run_id or evidence.run_id != self.run_id

@@ -297,7 +297,14 @@ def _replay_research(detail, event, observations, references, anchors, events, s
         if len(matches) != 1 or matches[0].get('target_ns') != target or matches[0].get('sampling_origin_ns') != origin or matches[0].get('disposition') != ('submitted' if disposition == 'completed' else disposition):
             fail('scheduler ownership')
     start = max(origin, receipt - 60_000_000_000)
-    targets = sorted({target for _, target, _ in opportunities if start - 2_000_000_000 < target <= receipt})
+    durable = {row['event_id'] for row, data in owned
+        if data.get('type') == 'APPROXIMATE_OPPORTUNITY'
+        and start - 2_000_000_000 < data['target_ns'] <= receipt}
+    embedded = [identifier for identifier, target, _ in opportunities
+        if start - 2_000_000_000 < target <= receipt]
+    if len(embedded) != len(set(embedded)) or set(embedded) != durable:
+        fail('scheduler membership')
+    targets = sorted(target for _, target, _ in opportunities if start - 2_000_000_000 < target <= receipt)
     complete = bool(targets) and targets[0] <= start and receipt < targets[-1] + 2_000_000_000 and all(b - a == 2_000_000_000 for a, b in zip(targets, targets[1:]))
     if raw['validated_window_start_ns'] != (start if complete else None) or raw['validated_window_end_ns'] != (receipt if complete else None):
         fail('scheduler interval')

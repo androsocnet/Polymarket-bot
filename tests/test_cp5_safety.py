@@ -280,6 +280,25 @@ class CP5SafetyTests(unittest.TestCase):
         self.assertEqual(result['reports'][-1]['warmup_status'], 'FULL')
         self.assertEqual(rows, before)
 
+    def test_replay_rejects_omitted_durable_scheduler_members(self):
+        import copy
+        import json
+        rows = self.research_replay_fixture(cycles=40)
+        last = next(json.loads(e['detail_json']) for e in reversed(rows[2])
+            if json.loads(e['detail_json']).get('type') == 'APPROXIMATE_FETCH')
+        for disposition in ('busy', 'skipped', 'unsubmitted', 'submitted'):
+            for target in (last['receipt_mono_ns'] - 1, last['target_ns']):
+                with self.subTest(disposition=disposition, target=target):
+                    changed = copy.deepcopy(rows)
+                    extra = dict(changed[2][-1])
+                    extra['event_id'] = max(e['event_id'] for e in changed[2]) + 1
+                    extra['detail_json'] = json.dumps(dict(type='APPROXIMATE_OPPORTUNITY',
+                        version=2, run_id=extra['run_id'], sampling_origin_ns=last['sampling_origin_ns'],
+                        target_ns=target, disposition=disposition))
+                    changed[2].append(extra)
+                    with self.assertRaisesRegex(ValueError, 'scheduler membership'):
+                        self.analyzer().replay_rows(*changed)
+
     def test_version_two_replay_rejects_tampered_provenance(self):
         import copy
         import json

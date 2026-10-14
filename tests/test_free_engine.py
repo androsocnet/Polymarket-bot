@@ -5,6 +5,7 @@ from decimal import Decimal
 from datetime import datetime, timezone
 
 from polymarket_bot.recorder.free_reference import (
+    AcquisitionContext,
     ApproximateObservation,
     ApproximateReferenceProvider,
     ApproximateReferenceReport,
@@ -586,7 +587,8 @@ class MockProvider(ApproximateReferenceProvider):
     def quote_currency(self) -> str:
         return self._quote
 
-    def fetch_ticker(self, *, deadline: float) -> ApproximateObservation:
+    def fetch_ticker(self, *, deadline: float | None = None,
+                     context: AcquisitionContext | None = None) -> ApproximateObservation:
         return self._response
 
 
