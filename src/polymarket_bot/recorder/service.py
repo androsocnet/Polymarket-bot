@@ -273,6 +273,9 @@ class Recorder:
             raise MarketDataError('approximate_reference_worker_failed', 'Approximate reference worker failed.') from None
         if result is None:
             return
+        from .free_reference import ResearchFetchResult
+        if isinstance(result, ResearchFetchResult):
+            raise ValueError('Research result requires revision-2 durable mapping before persistence.')
         report, observations, anchor_id = result
         observation_ids = [self.store.save_approximate_observation(self.run_id, observation)
                            for observation in observations]
@@ -548,6 +551,10 @@ class Recorder:
             finally:
                 worker = self.approximate_worker
                 if worker is None or worker._thread is None or not worker._thread.is_alive():
+                    if config.mode == 'APPROXIMATE_REFERENCE':
+                        stop = getattr(self.approximate_reference, 'stop', None)
+                        if stop is not None:
+                            stop()
                     self.store.close()
 
     def _execute_started_run(self, config, *, should_stop):
@@ -562,6 +569,9 @@ class Recorder:
             if self.store._connection.execute('PRAGMA user_version').fetchone()[0] != 2:
                 raise RecorderStoreError('schema_version_mismatch', 'Approximate mode requires a v2 database.')
             self.approximate_worker = ApproximateReferenceWorker()
+            start = getattr(self.approximate_reference, 'start', None)
+            if start is not None:
+                start()
         elif config.mode != "BOOK_ONLY" and (config.mode != 'REFERENCE_REQUIRED'
                 or not isinstance(self.offline_reference, OfflineReferenceSession)):
             self.store.close()

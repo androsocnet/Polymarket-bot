@@ -5,6 +5,25 @@ import unittest
 
 
 class CP5SafetyTests(unittest.TestCase):
+    def test_research_worker_handoff_never_writes_version_one_event(self):
+        from types import SimpleNamespace
+        from polymarket_bot.recorder.service import Recorder, ApproximateReferenceWorker
+        from polymarket_bot.recorder.free_reference import (
+            ResearchFetchResult, ApproximateReferenceReport, ResearchAssessment,
+            AcquisitionContext, ResearchWindowEvidence)
+        worker = ApproximateReferenceWorker()
+        result = ResearchFetchResult((), cast(ApproximateReferenceReport, None), (),
+            cast(ResearchAssessment, None), cast(AcquisitionContext, None), 123,
+            cast(ResearchWindowEvidence, None), ())
+        self.assertTrue(worker.submit(lambda: result))
+        worker.stop()
+        self.assertIs(worker.take(), result)
+        recorder = SimpleNamespace(approximate_worker=worker, run_id='run',
+            store=SimpleNamespace(save_approximate_reference=lambda *args: self.fail('v1 write')))
+        with self.assertRaisesRegex(ValueError, 'durable'):
+            Recorder._approximate_drain(cast(Recorder, recorder), result=result)
+
+
     def test_submission_keeps_anchor_when_clock_changes(self):
         from types import SimpleNamespace
         from polymarket_bot.recorder.service import Recorder

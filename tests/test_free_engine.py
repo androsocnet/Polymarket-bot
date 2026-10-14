@@ -226,6 +226,148 @@ class ResearchAssessmentTests(unittest.TestCase):
         self.assertEqual(len(result.value.as_tuple().digits), 512)
 
 
+class ResearchSessionTests(unittest.TestCase):
+    def test_session_start_origin_is_stable(self):
+        now = [10]
+        session = ApproximateReferenceSession(providers={}, monotonic_ns=lambda: now[0],
+            wall_us=lambda: 0, sleep=lambda _: None)
+        session.start()
+        now[0] = 99
+        session.start()
+        session.stop()
+        session.start()
+        self.assertEqual(getattr(session, 'sampling_origin_ns', None), 10)
+
+    def test_research_selection_and_delayed_first_fetch(self):
+        from dataclasses import replace
+        from polymarket_bot.recorder import free_reference as policy
+        fixture = ResearchAssessmentTests()
+        fixture.setUp()
+        for primary_full, fallback_full, failed, provider, fallback, quality in (
+                (True, False, True, 'coinbase', False, 'DEGRADED'),
+                (False, True, False, 'kraken', True, 'DEGRADED'),
+                (False, False, False, 'coinbase', False, 'INSUFFICIENT'),
+                (False, False, True, 'coinbase', False, 'INSUFFICIENT')):
+            with self.subTest(primary_full=primary_full, fallback_full=fallback_full, failed=failed):
+                now = [fixture.origin]
+                class Provider:
+                    def __init__(self, name):
+                        self.name = name
+                    def fetch_ticker(self, *, deadline=None, context=None):
+                        obs = fixture.observation(now[0], self.name)
+                        if failed and self.name == 'coinbase' or self.name == 'kraken' and not fallback_full:
+                            return replace(obs, price=None, result='error', error_code='HTTP_ERROR')
+                        return obs
+                session = ApproximateReferenceSession(providers={name: Provider(name)
+                    for name in ('coinbase', 'kraken')}, monotonic_ns=lambda: now[0],
+                    wall_us=lambda: 1_000_000_000 + now[0] // 1000, sleep=lambda _: None)
+                session.start()
+                self.assertTrue(hasattr(session, 'fetch_research'), 'research fetch missing')
+                past = []
+                if primary_full:
+                    past += fixture.full()
+                if fallback_full:
+                    past += fixture.full('kraken')
+                session._research_observations = tuple(past)
+                ids = tuple(range(1, len(past) + 1))
+                opportunities = tuple((i, obs.receipt_mono_ns, 'completed')
+                    for i, obs in zip(ids, past)) + ((100, fixture.end, 'submitted'),)
+                outcomes = tuple((i, obs.provider, i, obs.receipt_mono_ns, 'success')
+                    for i, obs in zip(ids, past))
+                evidence = policy.ResearchWindowEvidence(2, fixture.context.run_id, fixture.origin,
+                    ids, (fixture.context,) * len(ids), opportunities, outcomes, (),
+                    fixture.origin, fixture.end, tuple((r[0], r[1]) for r in outcomes)
+                    + ((100, 'coinbase'), (100, 'kraken')))
+                now[0] = fixture.end
+                result = session.fetch_research(context=fixture.context, evidence=evidence)
+                self.assertEqual((result.report.source_provider, result.report.was_fallback,
+                    result.selected_assessment.coverage_quality), (provider, fallback, quality))
+                self.assertEqual(result.completion_ns, fixture.end)
+                self.assertEqual(result.selected_assessment.warmup_status, 'FULL')
+                self.assertEqual(len(result.observations), 2)
+                self.assertEqual(len(result.assessments), 2)
+                self.assertEqual(len(set(result.evidence.observation_ids)), len(past) + 2)
+                if not primary_full and not failed:
+                    self.assertEqual(result.report.value, Decimal('10'))
+                if not past:
+                    self.assertEqual(result.selected_assessment.occupied_cells, () if failed else (29,))
+                    self.assertEqual(len(result.selected_assessment.empty_pairs), 14 if not failed else 15)
+
+    def test_elapsed_fetch_validates_receipt_horizon_before_actual_completion(self):
+        from dataclasses import replace
+        from unittest.mock import patch
+        from polymarket_bot.recorder import free_reference as policy
+        fixture = ResearchAssessmentTests()
+        fixture.setUp()
+        for provider, complete in (('coinbase', True), ('kraken', True), ('coinbase', False)):
+            with self.subTest(provider=provider, complete=complete):
+                now = [fixture.origin]
+                class Provider:
+                    def __init__(self, name):
+                        self.name = name
+                    def fetch_ticker(self, **kwargs):
+                        now[0] += 100_000_000
+                        return fixture.observation(now[0], self.name)
+                session = ApproximateReferenceSession(providers={n: Provider(n)
+                    for n in ('coinbase', 'kraken')}, monotonic_ns=lambda: now[0],
+                    wall_us=lambda: 1_000_000_000 + now[0] // 1000, sleep=lambda _: None)
+                session.start()
+                past = tuple(fixture.full(provider))
+                session._research_observations = past
+                ids = tuple(range(1, 31))
+                outcomes = tuple((i, provider, i, fixture.origin + (i - 1) * 2_000_000_000, 'success')
+                    for i in ids)
+                evidence = policy.ResearchWindowEvidence(2, fixture.context.run_id, fixture.origin,
+                    ids, (fixture.context,) * 30,
+                    tuple((i, fixture.origin + (i - 1) * 2_000_000_000, 'completed') for i in ids)
+                    + ((100, fixture.end, 'submitted'),), outcomes, (), fixture.origin,
+                    fixture.end, tuple((i, provider) for i in ids) + ((100, 'coinbase'), (100, 'kraken')))
+                now[0] = fixture.end
+                def validate(accumulated, receipt_ns):
+                    self.assertEqual(receipt_ns, 70_200_000_000)
+                    self.assertEqual(accumulated.validated_window_end_ns, 70_000_000_000)
+                    if not complete:
+                        return accumulated
+                    return replace(accumulated, validated_window_start_ns=10_200_000_000,
+                        validated_window_end_ns=70_200_000_000)
+                original = policy.assess_provider
+                def assess(*args, **kwargs):
+                    now[0] += 10_000_000
+                    return original(*args, **kwargs)
+                import inspect
+                self.assertIn('validate_evidence', inspect.signature(session.fetch_research).parameters,
+                    'completion-time evidence validator missing')
+                with patch.object(policy, 'assess_provider', side_effect=assess):
+                    result = session.fetch_research(context=fixture.context, evidence=evidence,
+                        validate_evidence=validate)
+                self.assertEqual(result.report.receipt_mono_ns, 70_200_000_000)
+                assert result.report.receipt_mono_ns is not None
+                self.assertGreater(result.completion_ns, result.report.receipt_mono_ns)
+                self.assertEqual(result.selected_assessment.coverage_quality,
+                    ('COMPLETE' if provider == 'coinbase' else 'DEGRADED') if complete else 'INSUFFICIENT')
+                self.assertEqual(result.report.source_provider, provider if complete else 'coinbase')
+                self.assertEqual('INCOMPLETE_PROVENANCE' in result.selected_assessment.reasons, not complete)
+
+    def test_warmup_uses_availability_and_context_origin_must_match(self):
+        from dataclasses import replace
+        from polymarket_bot.recorder import free_reference as policy
+        fixture = ResearchAssessmentTests()
+        fixture.setUp()
+        now = [fixture.origin]
+        session = ApproximateReferenceSession(providers={}, monotonic_ns=lambda: now[0],
+            wall_us=lambda: fixture.wall, sleep=lambda _: None)
+        session.start()
+        self.assertTrue(hasattr(session, 'fetch_research'), 'research fetch missing')
+        evidence = policy.ResearchWindowEvidence(2, fixture.context.run_id, fixture.origin,
+            (), (), ((1, fixture.origin, 'submitted'),), (), (), fixture.origin, fixture.origin,
+            ((1, 'coinbase'), (1, 'kraken')))
+        with self.assertRaises(ValueError):
+            session.fetch_research(context=replace(fixture.context, sampling_origin_ns=0), evidence=evidence)
+        result = session.fetch_research(context=fixture.context, evidence=evidence)
+        self.assertFalse(result.report.was_fallback)
+        self.assertEqual(result.selected_assessment.warmup_status, 'WARMING_UP')
+
+
 class SampleMeanEngineTests(unittest.TestCase):
     def setUp(self):
         self.receipt_wall_us = 2_000_000_000_000_000

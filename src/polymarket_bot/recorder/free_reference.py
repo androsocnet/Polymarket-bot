@@ -544,6 +544,18 @@ def assess_provider(observations: Sequence[ApproximateObservation], *, provider:
             for name in ('coinbase', 'kraken')), tuple(jitter), tuple(disagreements))
 
 
+@dataclass(frozen=True)
+class ResearchFetchResult:
+    observations: tuple[ApproximateObservation, ...]
+    report: ApproximateReferenceReport
+    assessments: tuple[ResearchAssessment, ...]
+    selected_assessment: ResearchAssessment
+    context: AcquisitionContext
+    completion_ns: int
+    evidence: ResearchWindowEvidence
+    window_observations: tuple[ApproximateObservation, ...]
+
+
 class ApproximateReferenceSession:
     def __init__(self, *, providers, monotonic_ns, wall_us, sleep, project=None):
         self._providers = dict(providers)
@@ -552,8 +564,13 @@ class ApproximateReferenceSession:
         self._project = project
         self._history = {name: deque(maxlen=64) for name in ("coinbase", "kraken")}
         self._started = False
+        self.sampling_origin_ns: int | None = None
+        self._research_observations: tuple[ApproximateObservation, ...] = ()
+        self._next_observation_id = 1
 
-    def start(self):
+    def start(self) -> None:
+        if self.sampling_origin_ns is None:
+            self.sampling_origin_ns = self._monotonic_ns()
         self._started = True
 
     def stop(self):
@@ -561,6 +578,72 @@ class ApproximateReferenceSession:
 
     def check_health(self):
         pass
+
+    def fetch_research(self, *, context: AcquisitionContext, evidence: ResearchWindowEvidence,
+            deadline: float | None = None,
+            validate_evidence: Callable[[ResearchWindowEvidence, int], ResearchWindowEvidence] | None = None
+            ) -> ResearchFetchResult:
+        if (not self._started or self.sampling_origin_ns != context.sampling_origin_ns
+                or evidence.sampling_origin_ns != self.sampling_origin_ns
+                or evidence.run_id != context.run_id or context.revision != 2 or evidence.revision != 2):
+            raise ValueError('Research session context mismatch or inactive session.')
+        pending = [row for row in evidence.scheduled_opportunities if row[2] == 'submitted']
+        if len(pending) != 1 or len(self._research_observations) != len(evidence.observation_ids):
+            raise ValueError('Research fetch requires one submitted opportunity and aligned history.')
+        opportunity_id = pending[0][0]
+        if not all((opportunity_id, name) in evidence.expected_requests for name in ('coinbase', 'kraken')):
+            raise ValueError('Research fetch requires explicit provider request membership.')
+        observations = []
+        for name in ('coinbase', 'kraken'):
+            try:
+                obs = self._providers[name].fetch_ticker(deadline=deadline, context=context)
+            except Exception as exc:
+                mono = self._monotonic_ns()
+                obs = ApproximateObservation(name, 'BTC/USD', 'USD', None, None, None, None,
+                    self._wall_us(), _captured_projection(context, mono), hashlib.sha256(b'').hexdigest(),
+                    0, 'rest', name + '-ticker-v1', None, 'error',
+                    'MISSING_PROVIDER' if isinstance(exc, KeyError) else 'PROVIDER_FAILURE', mono)
+            observations.append(obs)
+        mono, wall = self._monotonic_ns(), self._wall_us()
+        first_id = max(self._next_observation_id, max(evidence.observation_ids, default=0) + 1)
+        ids = (first_id, first_id + 1)
+        self._next_observation_id = first_id + 2
+        window = self._research_observations + tuple(observations)
+        accumulated = replace(evidence,
+            observation_ids=evidence.observation_ids + ids,
+            contexts=evidence.contexts + (context, context),
+            scheduled_opportunities=tuple((i, target, 'completed' if i == opportunity_id else disposition)
+                for i, target, disposition in evidence.scheduled_opportunities),
+            request_outcomes=evidence.request_outcomes + tuple(
+                (opportunity_id, obs.provider, i, obs.receipt_mono_ns,
+                    'success' if obs.result == 'success' and obs.error_code is None else 'error')
+                for i, obs in zip(ids, observations)))
+        if validate_evidence is not None:
+            accumulated = validate_evidence(accumulated, mono)
+        primary, secondary = tuple(assess_provider(window, provider=name,
+            report_wall_us=wall, report_ns=mono, evidence=accumulated)
+            for name in ('coinbase', 'kraken'))
+        warming = primary.warmup_status == 'WARMING_UP'
+        use_fallback = (primary.value_status != 'VALID' if warming
+            else primary.value_status != 'VALID' or primary.coverage_quality == 'INSUFFICIENT')
+        use_fallback = use_fallback and secondary.value_status == 'VALID' and (
+            warming or secondary.coverage_quality != 'INSUFFICIENT')
+        if use_fallback:
+            secondary = assess_provider(window, provider='kraken', report_wall_us=wall,
+                report_ns=mono, evidence=accumulated, was_fallback=True)
+            secondary = replace(secondary, reasons=secondary.reasons + ('PRIMARY_INSUFFICIENT',))
+        selected = secondary if use_fallback else primary
+        contributions = set(selected.contributing_ids)
+        report = compute_approximate_sample_mean_60s([
+            replace(obs, source_timestamp_us=None, receipt_server_us=None)
+            for i, obs in zip(accumulated.observation_ids, window) if i in contributions],
+            receipt_server_us=None, receipt_wall_us=wall, receipt_mono_ns=mono)
+        report = replace(report, source_provider=selected.selected_provider, was_fallback=use_fallback,
+            receipt_server_us=_captured_projection(context, mono),
+            diagnostics=report.diagnostics + (('FALLBACK_COINBASE_INSUFFICIENT',) if use_fallback else ()))
+        self._research_observations = window
+        return ResearchFetchResult(tuple(observations), report, (primary, secondary), selected,
+            context, self._monotonic_ns(), accumulated, window)
 
     def fetch(self, *, run_id, anchor_id, project, deadline):
         observations = []

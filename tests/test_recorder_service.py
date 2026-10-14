@@ -13,6 +13,41 @@ from polymarket_bot.recorder.store import RecorderStore, RecorderStoreError
 
 
 class RecorderServiceTests(unittest.TestCase):
+    def test_approximate_session_lifecycle_owned_by_recorder(self):
+        import tempfile
+        from pathlib import Path
+        from polymarket_bot.recorder.service import Recorder
+        from polymarket_bot.recorder.free_reference import ApproximateReferenceSession
+        for fail in (False, True):
+            with self.subTest(fail=fail), tempfile.TemporaryDirectory() as directory:
+                store = RecorderStore.open_approximate(Path(directory) / 'new.db')
+                session = ApproximateReferenceSession(providers={}, monotonic_ns=lambda: 123,
+                    wall_us=lambda: 0, sleep=lambda _: None)
+                public = httpx.Client(transport=httpx.MockTransport(lambda _: httpx.Response(200)))
+                from polymarket_bot.market_data.http import PublicGet
+                adapter = PublicGet(public, monotonic=lambda: 0, sleep=lambda _: None,
+                    utcnow=lambda: __import__('datetime').datetime.now(__import__('datetime').timezone.utc))
+                recorder = Recorder(store, adapter, monotonic_ns=lambda: 123,
+                    wall_us=lambda: 0, sleep=lambda _: None, approximate_reference=session)
+                def record(owner, config, **kwargs):
+                    self.assertTrue(session._started)
+                    self.assertEqual(session.sampling_origin_ns, 123)
+                    owner.run_id, owner.finalized = '', 0
+                    if fail:
+                        raise OSError('fixture failure')
+                    from polymarket_bot.recorder.models import RunResult
+                    return RunResult('', 'STOPPED', 0, 0, 'fixture')
+                try:
+                    with patch.object(Recorder, '_record', record):
+                        result = recorder._execute_run(RunConfig(mode='APPROXIMATE_REFERENCE'), should_stop=lambda: True)
+                        self.assertEqual(result.exit_code, 1 if fail else 0)
+                    self.assertFalse(session._started)
+                    assert recorder.approximate_worker is not None
+                    self.assertIsNone(recorder.approximate_worker._thread)
+                finally:
+                    public.close()
+                    store.close()
+
     def test_armed_target_survives_housekeeping_at_target(self):
         from polymarket_bot.recorder.service import Recorder
         fixture = self.fixture()
