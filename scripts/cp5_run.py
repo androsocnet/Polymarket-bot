@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+from typing import Any, Callable
 
 import httpx
 
@@ -18,6 +19,8 @@ from polymarket_bot.recorder.service import Recorder
 
 
 class CP5Recorder(Recorder):
+    _audit_events: Any = ()
+
     def _timing(self, phase, **detail):
         if not hasattr(self, '_timing_buffer'):
             self._timing_buffer = []
@@ -58,8 +61,25 @@ class CP5Recorder(Recorder):
                 self._timing_buffer = pending + self._timing_buffer
                 raise
 
+    def _flush_audit(self):
+        persisted = getattr(self, '_audit_persisted_attempts', set())
+        self._audit_persisted_attempts = persisted
+        for event in tuple(getattr(self, '_audit_events', ())):
+            if event['attempt'] not in persisted:
+                self.store.record_event(self.run_id, 'DISCOVERY_GAP', started_us=event['started_wall_us'],
+                    detail=dict(event, type='ACTUAL_SEND_ATTEMPT', version=2))
+                persisted.add(event['attempt'])
+        retained = {event['attempt'] for event in tuple(getattr(self, '_audit_events', ()))}
+        persisted.intersection_update(retained)
+
+    def _approximate_drain(self, **kwargs):
+        result = super()._approximate_drain(**kwargs)
+        self._flush_audit()
+        return result
+
     def _shutdown(self, state, reason):
         try:
+            self._flush_audit()
             self._flush_timing()
         finally:
             super()._shutdown(state, reason)
@@ -131,6 +151,7 @@ class AuditTransport(httpx.BaseTransport):
         self.print_events = False
         self.lock = threading.Lock()
         self.closed = False
+        self.capture_identity: Callable[[httpx.Request], dict] | None = None
 
     def handle_request(self, request):
         url = request.url
@@ -184,6 +205,9 @@ class AuditTransport(httpx.BaseTransport):
             started_wall_us=wall_us(), started_mono_ns=time.monotonic_ns(), status=None,
             request_bytes=len(request.content), response_bytes=0, redirect=False,
             request_header_presence=sorted(request.headers.keys()), response_header_presence=[], error=None)
+        capture = getattr(self, 'capture_identity', None)
+        if capture is not None:
+            event.update(capture(request))
         event.update(complete=False, stream_closed=False, set_cookie_present=False)
         try:
             response = self.inner.handle_request(request)
@@ -250,7 +274,8 @@ def child(path, seconds):
     from polymarket_bot.recorder.store import RecorderStore
     if path.exists() or path.name == 'cp5_smoke.sqlite3' or seconds not in (120, 1200):
         raise ValueError('CP5 requires new bounded database')
-    events = []
+    from collections import deque
+    events = deque(maxlen=4096)
     transport = AuditTransport(httpx.HTTPTransport(retries=0, trust_env=False), events.append)
     transport.print_events = True
     client = httpx.Client(transport=transport, trust_env=False, auth=None, follow_redirects=False)
@@ -265,6 +290,19 @@ def child(path, seconds):
             wall_us=wall_us, sleep=time.sleep)
         recorder = CP5Recorder(store, public, monotonic_ns=time.monotonic_ns,
             wall_us=wall_us, sleep=time.sleep, approximate_reference=session)
+        recorder._audit_events = events
+        def capture_identity(request):
+            identity = dict(getattr(recorder, '_book_identity', {})) if request.url.path in ('/book', '/books') else {}
+            if request.url.path == '/book' and recorder.revision is not None:
+                token = request.url.params.get('token_id')
+                identity['leg'] = 'UP' if token == recorder.revision.market.up.token_id else 'DOWN'
+            if request.url.host in ('api.exchange.coinbase.com', 'api.kraken.com'):
+                pending = getattr(recorder, '_research_pending', None)
+                if pending is not None:
+                    identity.update(pending[1], opportunity_id=pending[0])
+                identity['provider'] = 'coinbase' if request.url.host == 'api.exchange.coinbase.com' else 'kraken'
+            return dict(identity, run_id=recorder.run_id, version=2)
+        transport.capture_identity = capture_identity
         result = recorder.run(RunConfig(mode='APPROXIMATE_REFERENCE'), should_stop=lambda: False,
             deadline_ns=time.monotonic_ns() + seconds * 1_000_000_000)
     finally:
@@ -292,7 +330,7 @@ def child(path, seconds):
         version = connection.execute('PRAGMA user_version').fetchone()[0]
     reopened = RecorderStore.open_approximate(path)
     reopened.close()
-    evidence = dict(result=asdict(result), sends=events, integrity=integrity,
+    evidence = dict(result=asdict(result), sends=list(events), integrity=integrity,
         foreign_keys=foreign_keys, user_version=version, client_closed=client.is_closed,
         transport_closed=transport.closed, worker_active=active,
         remaining_threads=[thread.name for thread in threading.enumerate() if thread is not threading.main_thread()],

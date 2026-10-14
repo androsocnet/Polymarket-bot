@@ -275,7 +275,9 @@ class Recorder:
             return
         from .free_reference import ResearchFetchResult
         if isinstance(result, ResearchFetchResult):
-            raise ValueError('Research result requires revision-2 durable mapping before persistence.')
+            if not hasattr(self, '_research_pending') or result.context is None:
+                raise ValueError('Research result requires durable submission identity.')
+            return self._persist_research(result)
         report, observations, anchor_id = result
         observation_ids = [self.store.save_approximate_observation(self.run_id, observation)
                            for observation in observations]
@@ -285,8 +287,188 @@ class Recorder:
                 type='APPROXIMATE_FETCH', anchor_id=anchor_id,
                 observation_ids=observation_ids, reference_id=reference_id))
 
-    def _approximate_submit(self, deadline_ns):
+    def _persist_book_attempts(self, books, *, up_token, down_token, **identity):
+        for index, attempt in enumerate(books.attempts):
+            leg = ('PAIRED' if attempt.path == '/books' else 'UP'
+                if attempt.selectors == ('token_id=' + up_token,) else 'DOWN'
+                if attempt.selectors == ('token_id=' + down_token,) else 'UNKNOWN')
+            if not 0 <= attempt.started_mono_ns <= attempt.ended_mono_ns <= 2**63 - 1 or leg == 'UNKNOWN':
+                raise ValueError('Invalid book send provenance.')
+            self.store.record_event(self.run_id, 'DISCOVERY_GAP', started_us=attempt.started_wall_us,
+                detail=dict(type='BOOK_SEND_ATTEMPT', version=2, run_id=self.run_id,
+                    leg=leg, attempt=attempt.attempt_number, sequence=index,
+                    started_mono_ns=attempt.started_mono_ns, ended_mono_ns=attempt.ended_mono_ns,
+                    operation=attempt.operation, path=attempt.path, result=attempt.result,
+                    error_code=attempt.error_code, **identity))
+
+    def _research_start(self):
+        from .free_reference import ResearchWindowEvidence
+        if not hasattr(self, '_research_evidence'):
+            session = self.approximate_reference
+            if session is None or session.sampling_origin_ns is None:
+                raise ValueError('Research sampling session has no origin.')
+            origin = session.sampling_origin_ns
+            self._research_evidence = ResearchWindowEvidence(2, self.run_id, origin, (), (), (), (), ())
+            self._research_mapping = {}
+            self._research_session_event_id = self.store.record_event(self.run_id, 'DISCOVERY_GAP', started_us=self.wall_us(),
+                detail=dict(type='APPROXIMATE_SESSION', version=2, run_id=self.run_id,
+                    sampling_origin_ns=origin))
+    def _research_opportunity(self, target_ns, disposition, **identity):
+        self._research_start()
+        if disposition not in ('submitted', 'skipped', 'busy', 'unsubmitted') or type(target_ns) is not int or not 0 <= target_ns <= 2**63 - 1:
+            raise ValueError('Invalid scheduled opportunity.')
+        detail = dict(type='APPROXIMATE_OPPORTUNITY', version=2, run_id=self.run_id,
+            sampling_origin_ns=self._research_evidence.sampling_origin_ns,
+            target_ns=target_ns, disposition=disposition, **identity)
+        event_id = self.store.record_event(self.run_id, 'DISCOVERY_GAP',
+            started_us=self.wall_us(), detail=detail)
+        from dataclasses import replace
+        cutoff = self.monotonic_ns() - 60_000_000_000
+        retained = tuple(row for row in self._research_evidence.scheduled_opportunities
+            if row[1] >= cutoff or row[2] in ('submitted', 'completed'))
+        self._research_evidence = replace(self._research_evidence,
+            scheduled_opportunities=retained + ((event_id, target_ns, disposition),))
+        return event_id
+
+    def _validate_research_result(self, result):
+        evidence = result.evidence
+        if (result.context.run_id != self.run_id or evidence.run_id != self.run_id
+                or evidence.sampling_origin_ns != result.context.sampling_origin_ns
+                or type(result.completion_ns) is not int
+                or type(result.report.receipt_mono_ns) is not int
+                or not 0 <= result.report.receipt_mono_ns <= result.completion_ns <= 2**63 - 1
+                or not 0 < len(evidence.observation_ids) <= 256
+                or len(set(evidence.observation_ids)) != len(evidence.observation_ids)
+                or len(evidence.contexts) != len(evidence.observation_ids)
+                or len(result.window_observations) != len(evidence.observation_ids)
+                or len(evidence.scheduled_opportunities) > 128):
+            raise ValueError('Invalid durable research membership.')
+        import json
+        session = self.store._one('SELECT * FROM recorder_events WHERE event_id=?', (self._research_session_event_id,))
+        if (session is None or session['run_id'] != self.run_id
+                or json.loads(session['detail_json']).get('sampling_origin_ns') != evidence.sampling_origin_ns
+                or self._research_evidence.sampling_origin_ns != evidence.sampling_origin_ns
+                or result.context != self._research_submitted_context):
+            raise ValueError('Invalid persisted research origin or submitted context.')
+        for opportunity_id, target_ns, disposition in evidence.scheduled_opportunities:
+            row = self.store._one('SELECT * FROM recorder_events WHERE event_id=?', (opportunity_id,))
+            detail = json.loads(row['detail_json']) if row is not None else {}
+            if (row is None or row['run_id'] != self.run_id
+                    or detail.get('type') != 'APPROXIMATE_OPPORTUNITY'
+                    or detail.get('target_ns') != target_ns
+                    or detail.get('sampling_origin_ns') != evidence.sampling_origin_ns
+                    or detail.get('disposition') != ('submitted' if disposition == 'completed' else disposition)):
+                raise ValueError('Foreign or inconsistent durable opportunity.')
+        for context in evidence.contexts:
+            anchor = self.store._one('SELECT * FROM clock_anchors WHERE anchor_id=?', (context.anchor_id,))
+            if (context.run_id != self.run_id or context.sampling_origin_ns != evidence.sampling_origin_ns
+                    or anchor is None or anchor['run_id'] != self.run_id
+                    or any(anchor[column] != getattr(context.anchor, field) for column, field in (
+                        ('server_seconds', 'server_seconds'), ('anchor_server_us', 'server_us'),
+                        ('anchor_mono_ns', 'midpoint_ns'), ('request_start_mono_ns', 'request_start_mono_ns'),
+                        ('request_end_mono_ns', 'request_end_mono_ns'), ('request_start_wall_us', 'request_start_wall_us'),
+                        ('request_end_wall_us', 'request_end_wall_us'), ('status', 'status'),
+                        ('uncertainty_us', 'uncertainty_us')))):
+                raise ValueError('Invalid durable research anchor or origin.')
+
+    def _persist_research(self, result):
+        from dataclasses import asdict, replace
+        from decimal import Decimal
+        import json
+        opportunity_id, identity, attempts = self._research_pending
+        receipt_ns = result.report.receipt_mono_ns
+        ends = tuple(sorted(set(result.evidence.discontinuity_ends_ns + tuple(
+            end for end in self._research_evidence.discontinuity_ends_ns if end <= receipt_ns))))
+        if ends != result.evidence.discontinuity_ends_ns:
+            from .free_reference import assess_provider
+            evidence = replace(result.evidence, discontinuity_ends_ns=ends)
+            assessments = tuple(assess_provider(result.window_observations, provider=a.selected_provider,
+                report_wall_us=result.report.receipt_wall_us, report_ns=receipt_ns, evidence=evidence,
+                was_fallback=result.report.was_fallback and a.selected_provider == 'kraken') for a in result.assessments)
+            selected = next(a for a in assessments if a.selected_provider == result.selected_assessment.selected_provider)
+            result = replace(result, evidence=evidence, assessments=assessments, selected_assessment=selected)
+        self._validate_research_result(result)
+        evidence = result.evidence
+        if (result.context.run_id != self.run_id or evidence.run_id != self.run_id
+                or result.completion_ns < result.report.receipt_mono_ns
+                or len(set(evidence.observation_ids)) != len(evidence.observation_ids)
+                or len(evidence.contexts) != len(evidence.observation_ids)):
+            raise ValueError('Invalid durable research membership.')
+        for row in attempts:
+            if (type(row.get('started_mono_ns')) is not int or type(row.get('ended_mono_ns')) is not int
+                    or not 0 <= row['started_mono_ns'] <= row['ended_mono_ns'] <= result.completion_ns):
+                raise ValueError('Invalid reference attempt timing.')
+        mapping = dict(self._research_mapping)
+        new_ids = evidence.observation_ids[-len(result.observations):]
+        for local_id, observation in zip(new_ids, result.observations):
+            if local_id in mapping:
+                raise ValueError('Duplicate durable research membership.')
+            mapping[local_id] = self.store.save_approximate_observation(self.run_id, observation)
+        for local_id in evidence.observation_ids:
+            durable_id = mapping.get(local_id)
+            row = self.store._one('SELECT run_id FROM approximate_observations WHERE observation_id=?', (durable_id,))
+            if row is None or row['run_id'] != self.run_id:
+                raise ValueError('Foreign or missing durable research membership.')
+        reference_id = self.store.save_approximate_reference(self.run_id, result.report)
+        def assessment(value):
+            data = asdict(value)
+            data['contributing_ids'] = [mapping[i] for i in value.contributing_ids]
+            data['source_statuses'] = [(mapping[i], status) for i, status in value.source_statuses]
+            data['scheduled_receipt_jitter_ns'] = [(mapping[i], jitter) for i, jitter in value.scheduled_receipt_jitter_ns]
+            data['same_fetch_disagreements'] = [(op, mapping.get(cb), mapping.get(kr), *rest)
+                for op, cb, kr, *rest in value.same_fetch_disagreements]
+            return data
+        durable_evidence = asdict(evidence)
+        durable_evidence['observation_ids'] = [mapping[i] for i in evidence.observation_ids]
+        durable_evidence['request_outcomes'] = [(op, name, mapping[i], ns, status)
+            for op, name, i, ns, status in evidence.request_outcomes]
+        detail = dict(type='APPROXIMATE_FETCH', version=2, diagnostic_only=True,
+            run_id=self.run_id, sampling_origin_ns=evidence.sampling_origin_ns,
+            opportunity_id=opportunity_id, **identity,
+            anchor_id=result.context.anchor_id, uncertainty_us=result.context.anchor.uncertainty_us,
+            policy_revision=2, persistence_status='COMPLETE', completion_ns=result.completion_ns,
+            receipt_mono_ns=result.report.receipt_mono_ns,
+            observation_ids=[mapping[i] for i in new_ids], reference_id=reference_id,
+            evidence=durable_evidence, assessments=[assessment(a) for a in result.assessments],
+            selected_assessment=assessment(result.selected_assessment), request_attempts=attempts)
+        encoded = json.dumps(detail, default=lambda value: str(value) if isinstance(value, Decimal) else value)
+        if len(encoded) > 1_048_576:
+            raise ValueError('Durable research event exceeds bounded JSON size.')
+        self.store.record_event(self.run_id, 'DISCOVERY_GAP', started_us=result.report.receipt_wall_us,
+            detail=json.loads(encoded))
+        self.store.record_event(self.run_id, 'DISCOVERY_GAP', started_us=self.wall_us(),
+            detail=dict(type='APPROXIMATE_OPPORTUNITY_COMPLETION', version=2, run_id=self.run_id,
+                opportunity_id=opportunity_id, reference_id=reference_id,
+                completion_ns=result.completion_ns, disposition='completed', **identity))
+        self._research_mapping = mapping
+        known = {row[0] for row in evidence.scheduled_opportunities}
+        evidence = replace(evidence,
+            discontinuity_ends_ns=tuple(sorted(set(evidence.discontinuity_ends_ns + self._research_evidence.discontinuity_ends_ns))),
+            scheduled_opportunities=evidence.scheduled_opportunities + tuple(
+            row for row in self._research_evidence.scheduled_opportunities if row[0] not in known))
+        self._research_evidence = evidence
+        cutoff = result.report.receipt_mono_ns - 60_000_000_000
+        keep_ops = {op for op, target, _ in evidence.scheduled_opportunities if target >= cutoff}
+        keep_ops.update(op for op, _, _, ns, _ in evidence.request_outcomes if ns >= cutoff)
+        keep_ids = {i for op, _, i, _, _ in evidence.request_outcomes if op in keep_ops}
+        indices = [index for index, i in enumerate(evidence.observation_ids) if i in keep_ids]
+        self._research_evidence = replace(evidence,
+            observation_ids=tuple(evidence.observation_ids[i] for i in indices),
+            contexts=tuple(evidence.contexts[i] for i in indices),
+            scheduled_opportunities=tuple(row for row in evidence.scheduled_opportunities if row[0] in keep_ops),
+            request_outcomes=tuple(row for row in evidence.request_outcomes if row[0] in keep_ops),
+            expected_requests=tuple(row for row in evidence.expected_requests if row[0] in keep_ops),
+            discontinuity_ends_ns=tuple(ns for ns in evidence.discontinuity_ends_ns if ns >= cutoff))
+        if self.approximate_reference is None:
+            raise ValueError('Research sampling session unavailable.')
+        self.approximate_reference._research_observations = tuple(result.window_observations[i] for i in indices)
+        self._research_mapping = {i: mapping[i] for i in keep_ids}
+
+    def _approximate_submit(self, deadline_ns, **identity):
         if self.approximate_worker is None or not self.clock.usable() or self.monotonic_ns() >= deadline_ns:
+            if hasattr(self, '_research_evidence'):
+                self._research_opportunity(identity.get('target_ns', self.monotonic_ns()), 'unsubmitted',
+                    **{k: v for k, v in identity.items() if k != 'target_ns'})
             return False
         anchor, run_id = self.clock.anchor, self.run_id
         session = self.approximate_reference
@@ -295,6 +477,44 @@ class Recorder:
         anchor_id = self.anchor_id
         deadline = min(deadline_ns, self.run_deadline_ns) / 1_000_000_000
         project = lambda ns: anchor.server_us + (ns-anchor.midpoint_ns)//1000
+        from .free_reference import ApproximateReferenceSession, AcquisitionContext
+        if isinstance(session, ApproximateReferenceSession):
+            from dataclasses import replace
+            target_ns = identity.get('target_ns', self.monotonic_ns())
+            busy = self.approximate_worker._thread is not None
+            opportunity_id = self._research_opportunity(target_ns, 'busy' if busy else 'submitted', **{k: v for k, v in identity.items() if k != 'target_ns'})
+            if busy:
+                return False
+            if session.sampling_origin_ns is None:
+                raise ValueError('Research sampling session has no origin.')
+            context = AcquisitionContext(2, run_id, anchor, anchor_id, session.sampling_origin_ns,
+                getattr(self, '_discontinuity_end_ns', None))
+            self._research_submitted_context = context
+            evidence = replace(self._research_evidence, expected_requests=self._research_evidence.expected_requests +
+                ((opportunity_id, 'coinbase'), (opportunity_id, 'kraken')))
+            attempts = []
+            self._research_pending = (opportunity_id, dict(identity, target_ns=target_ns), attempts)
+            def research_fetch():
+                def validate(accumulated, receipt_ns):
+                    known = {row[0] for row in accumulated.scheduled_opportunities}
+                    extra = tuple(row for row in self._research_evidence.scheduled_opportunities if row[0] not in known)
+                    start_ns = max(context.sampling_origin_ns, receipt_ns - 60_000_000_000)
+                    targets = sorted({target for _, target, _ in accumulated.scheduled_opportunities + extra})
+                    covering = [target for target in targets if start_ns - 2_000_000_000 < target <= receipt_ns]
+                    complete = (bool(covering) and covering[0] <= start_ns
+                        and receipt_ns < covering[-1] + 2_000_000_000
+                        and all(b - a == 2_000_000_000 for a, b in zip(covering, covering[1:])))
+                    ends = tuple(sorted(set(accumulated.discontinuity_ends_ns + self._research_evidence.discontinuity_ends_ns)))
+                    return replace(accumulated, discontinuity_ends_ns=tuple(end for end in ends if end <= receipt_ns),
+                        scheduled_opportunities=accumulated.scheduled_opportunities + extra,
+                        validated_window_start_ns=max(context.sampling_origin_ns, receipt_ns - 60_000_000_000) if complete else None,
+                        validated_window_end_ns=receipt_ns if complete else None)
+                result = session.fetch_research(context=context, evidence=evidence, deadline=deadline, validate_evidence=validate)
+                for name, provider in session._providers.items():
+                    attempts.extend(dict(row, run_id=run_id, opportunity_id=opportunity_id, **identity)
+                        for row in getattr(provider, 'request_attempts', ()))
+                return result
+            return self.approximate_worker.submit(research_fetch)
         def fetch():
             result = session.fetch(run_id=run_id, anchor_id=anchor_id, project=project, deadline=deadline)
             return None if result is None else (*result, anchor_id)
@@ -376,6 +596,14 @@ class Recorder:
                 self.offline_reference.discovery_verified_us = verified
         self.next_clock_ns = anchor.midpoint_ns + 60_000_000_000
         if anchor.status == "DISCONTINUITY":
+            self._discontinuity_end_ns = anchor.request_end_mono_ns
+            if hasattr(self, '_research_evidence'):
+                from dataclasses import replace
+                self._research_evidence = replace(self._research_evidence,
+                    discontinuity_ends_ns=self._research_evidence.discontinuity_ends_ns + (anchor.request_end_mono_ns,))
+            self.store.record_event(self.run_id, 'CLOCK_PAUSE', started_us=self.wall_us(),
+                detail=dict(type='APPROXIMATE_DISCONTINUITY', version=2, run_id=self.run_id,
+                    anchor_id=self.anchor_id, calibration_end_ns=anchor.request_end_mono_ns))
             self.next_clock_ns = self.monotonic_ns()
             self.store.record_event(self.run_id, "CLOCK_PAUSE", started_us=self.wall_us(),
                                     detail=anchor.diagnostic)
@@ -693,6 +921,9 @@ class Recorder:
         take_checkpoint(self.store,run_id=self.run_id,wall_us=self.wall_us())
         self.next_checkpoint_ns = self.monotonic_ns()+3_600_000_000_000
         self.store.record_event(self.run_id, "STARTUP", started_us=self.wall_us())
+        from .free_reference import ApproximateReferenceSession
+        if isinstance(self.approximate_reference, ApproximateReferenceSession):
+            self._research_start()
         if previous_wall_us is not None:
             self.store.record_event(self.run_id, "RESTART", started_us=previous_wall_us,
                 ended_us=self.wall_us(), detail={"monotonic_epoch": "NEW"})
@@ -762,6 +993,10 @@ class Recorder:
                 terminal_indices=self.store.covered_indices(market.market_id))
             grid = slot_grid(start_us)
             for index in selection.missed:
+                if hasattr(self, '_research_evidence'):
+                    self._research_opportunity(self.clock.deadline_ns(grid[index].scheduled_us), 'skipped',
+                        market_id=market.market_id, slot_index=index, scheduled_us=grid[index].scheduled_us,
+                        reason=self.miss_reason)
                 self.store.mark_missed(market.market_id, grid[index], run_id=self.run_id,
                                       reason=self.miss_reason, wall_us=self.wall_us())
             self.miss_reason = "PROCESSING_OVERRUN" if self.revision.capture_ready else "METADATA_NOT_READY"
@@ -798,6 +1033,9 @@ class Recorder:
             if classify_wake(target, now_us=self._now(), window_end_us=end_us) != "CAPTURE":
                 continue
             if not self.revision.capture_ready:
+                if hasattr(self, '_research_evidence'):
+                    self._research_opportunity(target_ns, 'unsubmitted', market_id=market.market_id,
+                        slot_index=target.index, scheduled_us=target.scheduled_us, reason='METADATA_NOT_READY')
                 self.store.mark_missed(market.market_id, target, run_id=self.run_id,
                                       reason="METADATA_NOT_READY", wall_us=self.wall_us())
                 self.miss_reason = "METADATA_NOT_READY"
@@ -811,7 +1049,9 @@ class Recorder:
             if self.approximate_worker is not None:
                 reference_deadline_ns = self.clock.deadline_ns(min(target.scheduled_us+2_000_000, end_us))
                 self._approximate_drain()
-                self._approximate_submit(reference_deadline_ns)
+                self._approximate_submit(reference_deadline_ns, market_id=market.market_id,
+                    slot_id=slot_id, slot_index=target.index, target_ns=target_ns,
+                    scheduled_us=target.scheduled_us)
             if self.reference_worker is not None:
                 from .models import ReferenceAssociationDraft
                 row = ReferenceAssociationDraft(market.market_id, 'SLOT_CURRENT', target.scheduled_us,
@@ -823,6 +1063,8 @@ class Recorder:
                     current_reference_result = 'BUSY'
             previous = self.public.on_attempt
             self.public.on_attempt = None
+            self._book_identity = dict(market_id=market.market_id, slot_id=slot_id,
+                slot_index=target.index, target_ns=target_ns, leg='PAIRED')
             try:
                 if timing is not None:
                     timing('DISPATCH_READY', slot_id=slot_id, slot_index=target.index, target_ns=target_ns)
@@ -833,6 +1075,10 @@ class Recorder:
             finally:
                 self.public.on_attempt = previous
             ended_ns = self.monotonic_ns()
+            if hasattr(self, '_research_evidence'):
+                self._persist_book_attempts(books, market_id=market.market_id, slot_id=slot_id,
+                    slot_index=target.index, target_ns=target_ns,
+                    up_token=market.up.token_id, down_token=market.down.token_id)
             reference = disabled_reference(market.market_id, target.scheduled_us,
                 learned_wall_us=self.wall_us(), learned_server_us=project(ended_ns))
             if self.approximate_worker is not None:

@@ -133,11 +133,13 @@ class CoinbaseRestProvider:
         self._wall_us = wall_us
         self._project = project
         self._sleep = sleep
+        self.request_attempts = []
 
     def fetch_ticker(self, *, deadline: float | None = None,
                      context: AcquisitionContext | None = None) -> ApproximateObservation:
         end_ns = (self._monotonic_ns() + 5_000_000_000 if deadline is None
                   else int(deadline * 1000000000))
+        self.request_attempts = []
         body = bytearray()
         status = None
         error = "DEADLINE_EXPIRED"
@@ -183,6 +185,9 @@ class CoinbaseRestProvider:
                 error = "TRANSPORT_TIMEOUT"
             except httpx.HTTPError:
                 error = "TRANSPORT_ERROR"
+            self.request_attempts.append(dict(provider=self.provider_name, attempt=attempt + 1,
+                started_mono_ns=send_ns, ended_mono_ns=self._monotonic_ns(),
+                http_status=status, error_code=error))
             if attempt == 0 and (status == 429 or error in ("TRANSPORT_TIMEOUT", "TRANSPORT_ERROR")):
                 retry_ns = self._monotonic_ns()
                 if context is not None:

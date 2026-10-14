@@ -24,6 +24,29 @@ class CP5SafetyTests(unittest.TestCase):
             Recorder._approximate_drain(cast(Recorder, recorder), result=result)
 
 
+    def test_runner_audit_captures_durable_identity_before_send(self):
+        import httpx
+        module = self.harness()
+        events = []
+        transport = module.AuditTransport(httpx.MockTransport(lambda request: httpx.Response(200, content=b'1')), events.append)
+        transport.capture_identity = lambda request: dict(run_id='run', market_id='market', slot_id=7, leg='PAIRED')
+        with httpx.Client(transport=transport) as client:
+            client.post('https://clob.polymarket.com/books', json=[{'token_id': '1'}, {'token_id': '2'}])
+        self.assertEqual(events[0].get('run_id'), 'run')
+        self.assertEqual(events[0].get('slot_id'), 7)
+
+    def test_runner_bounds_audit_history(self):
+        import httpx
+        from collections import deque
+        module = self.harness()
+        events = deque(maxlen=4)
+        transport = module.AuditTransport(httpx.MockTransport(lambda request: httpx.Response(200, content=b'1')), events.append)
+        with httpx.Client(transport=transport) as client:
+            for _ in range(8):
+                client.get('https://clob.polymarket.com/time')
+        self.assertEqual(len(events), 4)
+        self.assertEqual([row['attempt'] for row in events], [5, 6, 7, 8])
+
     def test_submission_keeps_anchor_when_clock_changes(self):
         from types import SimpleNamespace
         from polymarket_bot.recorder.service import Recorder
