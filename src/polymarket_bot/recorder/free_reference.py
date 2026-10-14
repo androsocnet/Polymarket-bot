@@ -3,7 +3,7 @@ from collections import deque
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal, Context, localcontext, ROUND_HALF_EVEN
-from typing import Callable, Protocol, runtime_checkable
+from typing import Callable, Protocol, Sequence, runtime_checkable
 import hashlib
 import json
 import time
@@ -18,7 +18,7 @@ from polymarket_bot.recorder.models import ClockAnchor
 @dataclass(frozen=True)
 class AcquisitionContext:
     revision: int
-    run_id: int
+    run_id: str
     anchor: ClockAnchor
     anchor_id: int
     sampling_origin_ns: int
@@ -29,12 +29,13 @@ def _captured_projection(context: AcquisitionContext | None, moment: int | None)
     if not isinstance(context, AcquisitionContext) or not isinstance(context.anchor, ClockAnchor):
         return None
     anchor = context.anchor
-    fields = (context.revision, context.run_id, context.anchor_id, context.sampling_origin_ns,
+    fields = (context.revision, context.anchor_id, context.sampling_origin_ns,
         anchor.request_start_mono_ns, anchor.request_end_mono_ns, anchor.midpoint_ns,
         anchor.server_us, anchor.uncertainty_us, moment)
     if any(type(value) is not int or not 0 <= value <= 2**63 - 1 for value in fields):
         return None
-    if (context.revision != 2 or context.run_id <= 0 or context.anchor_id <= 0
+    if (context.revision != 2 or type(context.run_id) is not str or not context.run_id.strip()
+            or context.anchor_id <= 0
             or anchor.status != 'VALID' or anchor.uncertainty_us < 1_000_000
             or anchor.request_start_mono_ns > anchor.midpoint_ns
             or anchor.midpoint_ns > anchor.request_end_mono_ns):
@@ -314,6 +315,233 @@ def compute_approximate_sample_mean_60s(observations: list[ApproximateObservatio
         ",".join(sorted({obs.provider for obs in valid})), False, receipt_wall_us,
         mean,
         receipt_server_us=receipt_server_us, diagnostics=tuple(diagnostics), receipt_mono_ns=receipt_mono_ns)
+
+
+@dataclass(frozen=True)
+class ResearchWindowEvidence:
+    revision: int
+    run_id: str
+    sampling_origin_ns: int
+    observation_ids: tuple[int, ...]
+    contexts: tuple[AcquisitionContext, ...]
+    scheduled_opportunities: tuple[tuple[int, int, str], ...]
+    request_outcomes: tuple[tuple[int, str, int, int, str], ...]
+    discontinuity_ends_ns: tuple[int, ...]
+    validated_window_start_ns: int | None = None
+    validated_window_end_ns: int | None = None
+    expected_requests: tuple[tuple[int, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class ResearchAssessment:
+    revision: int
+    selected_provider: str
+    contributing_ids: tuple[int, ...]
+    value_status: str
+    coverage_quality: str
+    warmup_status: str
+    strict_gap: bool
+    reasons: tuple[str, ...]
+    value: Decimal | None
+    occupied_cells: tuple[int, ...]
+    empty_cells: tuple[int, ...]
+    empty_pairs: tuple[int, ...]
+    exposed_pairs: tuple[int, ...]
+    partial_pair: int | None
+    provisional: bool
+    max_wall_gap_us: int
+    max_mono_gap_ns: int
+    head_wall_us: int | None
+    tail_wall_us: int | None
+    head_mono_ns: int | None
+    tail_mono_ns: int | None
+    failed_requests: int
+    excluded_observations: int
+    missing_requests: int
+    source_statuses: tuple[tuple[int, str], ...]
+    cell_phase_offsets_ns: tuple[int, ...]
+    provider_availability: tuple[tuple[str, int], ...]
+    scheduled_receipt_jitter_ns: tuple[tuple[int, int], ...]
+    same_fetch_disagreements: tuple[tuple[int, int | None, int | None,
+        Decimal | None, Decimal | None, Decimal | None, int | None], ...]
+
+
+def assess_provider(observations: Sequence[ApproximateObservation], *, provider: str,
+        report_wall_us: int, report_ns: int, evidence: ResearchWindowEvidence,
+        was_fallback: bool = False) -> ResearchAssessment:
+    reasons = []
+    start = report_ns - 60_000_000_000
+    wall_start = report_wall_us - _WINDOW_US
+    origin = evidence.sampling_origin_ns
+    provenance = (evidence.revision == 2 and provider in ('coinbase', 'kraken')
+        and type(evidence.run_id) is str and bool(evidence.run_id.strip())
+        and type(origin) is int and 0 <= origin <= report_ns
+        and len(observations) == len(evidence.observation_ids) == len(evidence.contexts)
+        and all(type(i) is int and i > 0 for i in evidence.observation_ids)
+        and len(set(evidence.observation_ids)) == len(evidence.observation_ids))
+    valid = []
+    statuses = []
+    occupied = set()
+    failed = excluded = 0
+    available = {}
+    for index, obs in enumerate(observations):
+        context = evidence.contexts[index] if index < len(evidence.contexts) else None
+        identity = (obs.provider in ('coinbase', 'kraken') and obs.pair == 'BTC/USD'
+            and obs.quote_currency == 'USD' and obs.transport_type == 'rest'
+            and obs.parser_revision == obs.provider + '-ticker-v1')
+        numeric = (identity and obs.result == 'success' and obs.error_code is None
+            and obs.http_status == 200 and isinstance(obs.price, Decimal)
+            and obs.price.is_finite() and obs.price > 0)
+        wall_member = wall_start <= obs.receipt_wall_us <= report_wall_us
+        mono = obs.receipt_mono_ns
+        mono_member = type(mono) is int and start <= mono <= report_ns
+        status = source_time_status(obs, context)
+        if (context is None or context.run_id != evidence.run_id
+                or context.sampling_origin_ns != origin or status == 'CLOCK_CONTEXT_UNAVAILABLE'):
+            provenance = False
+        policy_ok = (status == 'SOURCE_TIME_WITHIN_CLOCK_UNCERTAINTY'
+            if obs.provider == 'coinbase' else status == 'SOURCE_TIME_UNAVAILABLE'
+                and obs.source_timestamp_us is None)
+        if numeric and wall_member and mono_member and policy_ok and index < len(evidence.observation_ids):
+            available[evidence.observation_ids[index]] = obs
+        if obs.provider != provider:
+            continue
+        if numeric and wall_member != mono_member:
+            reasons.append('WINDOW_MEMBERSHIP_DISAGREEMENT')
+        policy_ok = (status == 'SOURCE_TIME_WITHIN_CLOCK_UNCERTAINTY'
+            if provider == 'coinbase' else status == 'SOURCE_TIME_UNAVAILABLE'
+                and obs.source_timestamp_us is None)
+        if not numeric or not wall_member or not mono_member or not policy_ok:
+            if wall_member or mono_member:
+                excluded += 1
+            continue
+        assert mono is not None
+        if mono < origin:
+            provenance = False
+            continue
+        observation_id = evidence.observation_ids[index] if index < len(evidence.observation_ids) else 0
+        statuses.append((observation_id, status))
+        valid.append((observation_id, obs))
+        occupied.add(min(29, (mono - start) // 2_000_000_000))
+    ends = evidence.discontinuity_ends_ns + tuple(
+        c.discontinuity_end_ns for c in evidence.contexts if c.discontinuity_end_ns is not None)
+    if any(type(end) is not int or not 0 <= end <= report_ns for end in ends):
+        provenance = False
+    elif any(report_ns - end < 60_000_000_000 for end in ends):
+        reasons.append('CLOCK_DISCONTINUITY')
+    opportunity_ids = [row[0] for row in evidence.scheduled_opportunities]
+    if (len(set(opportunity_ids)) != len(opportunity_ids)
+            or any(type(i) is not int or i <= 0 for i in opportunity_ids)):
+        provenance = False
+    if report_ns > origin and not evidence.scheduled_opportunities:
+        provenance = False
+    missing = 0
+    for _, target, disposition in evidence.scheduled_opportunities:
+        if type(target) is not int or disposition not in ('completed', 'submitted', 'skipped', 'busy', 'unsubmitted'):
+            provenance = False
+        elif max(start, origin) <= target <= report_ns and disposition != 'completed':
+            missing += 1
+    if (evidence.validated_window_start_ns != max(start, origin)
+            or evidence.validated_window_end_ns != report_ns):
+        provenance = False
+    opportunities = {i: (target, disposition) for i, target, disposition in evidence.scheduled_opportunities}
+    members = dict(zip(evidence.observation_ids, observations))
+    requests = {}
+    seen_observations = set()
+    jitter = []
+    for row in evidence.request_outcomes:
+        if len(row) != 5:
+            provenance = False
+            continue
+        opportunity_id, name, observation_id, receipt_ns, outcome = row
+        key = (opportunity_id, name)
+        obs = members.get(observation_id)
+        opportunity = opportunities.get(opportunity_id)
+        if (type(opportunity_id) is not int or opportunity_id <= 0
+                or name not in ('coinbase', 'kraken') or outcome not in ('success', 'error')
+                or type(receipt_ns) is not int or receipt_ns < 0
+                or key in requests or observation_id in seen_observations
+                or obs is None or opportunity is None or opportunity[1] != 'completed'
+                or obs.provider != name or obs.receipt_mono_ns != receipt_ns
+                or outcome != ('success' if obs.result == 'success' and obs.error_code is None else 'error')):
+            provenance = False
+            continue
+        requests[key] = observation_id
+        seen_observations.add(observation_id)
+        if start <= receipt_ns <= report_ns:
+            if name == provider and outcome == 'error':
+                failed += 1
+            if observation_id in available:
+                jitter.append((observation_id, receipt_ns - opportunity[0]))
+    expected = evidence.expected_requests
+    if (len(set(expected)) != len(expected) or set(expected) != set(requests)
+            or seen_observations != set(evidence.observation_ids)):
+        provenance = False
+    for opportunity_id, (_, disposition) in opportunities.items():
+        if disposition == 'completed' and not any(key[0] == opportunity_id for key in requests):
+            provenance = False
+    disagreements = []
+    for opportunity_id in sorted({key[0] for key in requests}):
+        coinbase_id = requests.get((opportunity_id, 'coinbase'))
+        kraken_id = requests.get((opportunity_id, 'kraken'))
+        coinbase = available.get(coinbase_id)
+        kraken = available.get(kraken_id)
+        if coinbase is None and kraken is None:
+            continue
+        difference = separation = None
+        if coinbase is not None and kraken is not None:
+            assert coinbase.price is not None and kraken.price is not None
+            assert coinbase.receipt_mono_ns is not None and kraken.receipt_mono_ns is not None
+            with localcontext(Context(prec=512, rounding=ROUND_HALF_EVEN)):
+                difference = kraken.price - coinbase.price
+            separation = kraken.receipt_mono_ns - coinbase.receipt_mono_ns
+        disagreements.append((opportunity_id, coinbase_id, kraken_id,
+            coinbase.price if coinbase else None, kraken.price if kraken else None,
+            difference, separation))
+    if not provenance:
+        reasons.append('INCOMPLETE_PROVENANCE')
+    warming = origin > start
+    exposed = tuple(i for i in range(15) if start + i * 4_000_000_000 >= origin)
+    partial = next((i for i in range(15)
+        if start + i * 4_000_000_000 < origin < start + (i + 1) * 4_000_000_000), None)
+    empty_pairs = tuple(i for i in exposed if not ({2 * i, 2 * i + 1} & occupied))
+    ordered = sorted(valid, key=lambda item: (item[1].receipt_wall_us,
+        item[1].receipt_mono_ns or 0, item[1].raw_payload_hash))
+    arithmetic = compute_approximate_sample_mean_60s([
+        replace(obs, source_timestamp_us=None, receipt_server_us=None) for _, obs in ordered],
+        receipt_server_us=None, receipt_wall_us=report_wall_us, receipt_mono_ns=report_ns)
+    walls = sorted(obs.receipt_wall_us for _, obs in valid)
+    monos = sorted(obs.receipt_mono_ns for _, obs in valid if obs.receipt_mono_ns is not None)
+    wall_gap = max((b - a for a, b in zip(walls, walls[1:])), default=0)
+    mono_gap = max((b - a for a, b in zip(monos, monos[1:])), default=0)
+    value_status = 'VALID' if arithmetic.value is not None else 'INVALID'
+    if value_status == 'INVALID':
+        reasons.append('INVALID_VALUE')
+    if empty_pairs or not exposed:
+        reasons.append('EMPTY_EXPOSED_PAIRS')
+    quality = ('INSUFFICIENT' if reasons else 'COMPLETE'
+        if len(occupied) == 30 and not (failed or excluded or missing or was_fallback)
+        else 'DEGRADED')
+    if failed:
+        reasons.append('FAILED_PROVIDER_REQUESTS')
+    if excluded:
+        reasons.append('EXCLUDED_PROVIDER_OBSERVATIONS')
+    if missing:
+        reasons.append('MISSING_SCHEDULED_REQUESTS')
+    if was_fallback:
+        reasons.append('FALLBACK_SELECTED')
+    return ResearchAssessment(2, provider, tuple(i for i, _ in ordered), value_status,
+        quality, 'WARMING_UP' if warming else 'FULL', 'OBSERVATION_GAP' in arithmetic.diagnostics,
+        tuple(dict.fromkeys(reasons)), arithmetic.value, tuple(sorted(occupied)),
+        tuple(i for i in range(30) if i not in occupied), empty_pairs, exposed, partial, warming,
+        wall_gap, mono_gap, walls[0] - wall_start if walls else None,
+        report_wall_us - walls[-1] if walls else None, monos[0] - start if monos else None,
+        report_ns - monos[-1] if monos else None, failed, excluded, missing, tuple(statuses),
+        tuple(obs.receipt_mono_ns - (start + cell * 2_000_000_000)
+            for _, obs in ordered if obs.receipt_mono_ns is not None
+            for cell in (min(29, (obs.receipt_mono_ns - start) // 2_000_000_000),)),
+        tuple((name, sum(obs.provider == name for obs in available.values()))
+            for name in ('coinbase', 'kraken')), tuple(jitter), tuple(disagreements))
 
 
 class ApproximateReferenceSession:

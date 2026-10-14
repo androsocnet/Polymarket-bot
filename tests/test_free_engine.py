@@ -16,6 +16,216 @@ from polymarket_bot.recorder.free_reference import (
 )
 
 
+class ResearchAssessmentTests(unittest.TestCase):
+    def setUp(self):
+        from polymarket_bot.recorder import free_reference as policy
+        from polymarket_bot.recorder.models import ClockAnchor
+        self.policy = policy
+        self.assertTrue(hasattr(policy, 'assess_provider'), 'pure research assessment missing')
+        self.origin = 10_000_000_000
+        self.end = 70_000_000_000
+        self.wall = 1_070_000_000
+        anchor = ClockAnchor(1, self.origin, self.origin, 0, 0, self.origin,
+            1_010_000_000, 1_000_000, 'VALID')
+        self.context = policy.AcquisitionContext(2, '22f60ec8-3c93-4d67-9a5f-0cb2b0841625', anchor, 1, self.origin, None)
+
+    def observation(self, ns, provider='coinbase', **changes):
+        from dataclasses import replace
+        wall = 1_000_000_000 + ns // 1000
+        obs = ApproximateObservation(provider, 'BTC/USD', 'USD', Decimal('10'),
+            Decimal('9'), Decimal('11'), wall if provider == 'coinbase' else None,
+            wall, wall, 'abc', 100, 'rest', provider + '-ticker-v1', 200,
+            'success', None, ns)
+        return replace(obs, **changes)
+
+    def assess(self, observations, provider='coinbase', end=None, evidence_changes=None, **kwargs):
+        from dataclasses import replace
+        end = self.end if end is None else end
+        ids = tuple(range(1, len(observations) + 1))
+        opportunities = []
+        requests = []
+        assigned = {}
+        for observation_id, obs in zip(ids, observations):
+            ns = obs.receipt_mono_ns
+            opportunity_id = assigned.get(ns)
+            if opportunity_id is None or any(row[0] == opportunity_id and row[1] == obs.provider for row in requests):
+                opportunity_id = len(opportunities) + 1
+                opportunities.append((opportunity_id, ns, 'completed'))
+                assigned[ns] = opportunity_id
+            requests.append((opportunity_id, obs.provider, observation_id, ns,
+                'success' if obs.result == 'success' and obs.error_code is None else 'error'))
+        evidence = self.policy.ResearchWindowEvidence(2, self.context.run_id, self.origin, ids,
+            tuple(self.context for _ in ids), tuple(opportunities), tuple(requests), (),
+            max(end - 60_000_000_000, self.origin), end,
+            tuple((row[0], row[1]) for row in requests))
+        if evidence_changes:
+            evidence = replace(evidence, **evidence_changes)
+        return self.policy.assess_provider(observations, provider=provider,
+            report_wall_us=1_000_000_000 + end // 1000, report_ns=end,
+            evidence=evidence, **kwargs)
+
+    def full(self, provider='coinbase'):
+        return [self.observation(self.origin + i * 2_000_000_000, provider) for i in range(30)]
+
+    def test_one_sample_numeric_valid_not_sufficient(self):
+        result = self.assess([self.observation(self.end)])
+        self.assertEqual((result.value, result.value_status, result.coverage_quality),
+            (Decimal('10'), 'VALID', 'INSUFFICIENT'))
+        self.assertTrue(result.strict_gap)
+        self.assertEqual(result.contributing_ids, (1,))
+        self.assertEqual(result.warmup_status, 'FULL')
+
+    def test_receipt_cells_and_pairs(self):
+        for indices, quality, count in ((range(30), 'COMPLETE', 30),
+                (range(0, 30, 2), 'DEGRADED', 15), (range(2, 30, 2), 'INSUFFICIENT', 14)):
+            with self.subTest(quality=quality):
+                obs = [self.observation(self.origin + i * 2_000_000_000) for i in indices]
+                result = self.assess(obs)
+                self.assertEqual(result.coverage_quality, quality)
+                self.assertEqual(len(result.occupied_cells), count)
+        burst = self.assess([self.observation(self.end)] * 40)
+        self.assertEqual(burst.occupied_cells, (29,))
+        self.assertEqual(burst.coverage_quality, 'INSUFFICIENT')
+        for i in range(1, 30):
+            for jitter, cell in ((-1, i - 1), (0, i), (1, i)):
+                with self.subTest(boundary=i, jitter=jitter):
+                    result = self.assess([self.observation(self.origin + i * 2_000_000_000 + jitter)])
+                    self.assertEqual(result.occupied_cells, (cell,))
+        for ns, cells in ((self.origin, (0,)), (self.end, (29,)),
+                (self.origin - 1, ()), (self.end + 1, ())):
+            with self.subTest(endpoint=ns):
+                self.assertEqual(self.assess([self.observation(ns)]).occupied_cells, cells)
+
+    def test_warmup_clips_only_oldest_partial_pair(self):
+        for age, status, partial, full in ((59_999_999_999, 'WARMING_UP', 0, 14),
+                (60_000_000_000, 'FULL', None, 15), (3_999_999_999, 'WARMING_UP', 14, 0),
+                (4_000_000_000, 'WARMING_UP', None, 1)):
+            with self.subTest(age=age):
+                end = self.origin + age
+                result = self.assess([self.observation(end)], end=end)
+                self.assertEqual(result.warmup_status, status)
+                self.assertEqual(result.partial_pair, partial)
+                self.assertEqual(len(result.exposed_pairs), full)
+                self.assertEqual(result.failed_requests, 0)
+                self.assertEqual(result.provisional, status == 'WARMING_UP')
+        self.assertEqual(self.assess([self.observation(self.origin + 1)],
+            end=self.origin + 1).coverage_quality, 'INSUFFICIENT')
+
+    def test_invalid_identity_and_numeric_inputs(self):
+        for changes in ({'pair': 'ETH/USD'}, {'quote_currency': 'EUR'},
+                {'parser_revision': 'unknown'}, {'transport_type': 'websocket'},
+                {'price': Decimal('NaN')}, {'price': Decimal('0')}, {'price': None},
+                {'result': 'error', 'error_code': 'HTTP_ERROR'}, {'http_status': 500}):
+            with self.subTest(changes=changes):
+                from dataclasses import replace
+                result = self.assess([replace(self.observation(self.end), **changes)])
+                self.assertEqual(result.value_status, 'INVALID')
+                self.assertEqual(result.coverage_quality, 'INSUFFICIENT')
+        self.assertEqual(self.assess([]).value_status, 'INVALID')
+        mixed = self.full() + [self.observation(self.end, 'kraken', price=Decimal('999'))]
+        self.assertEqual(self.assess(mixed).value, Decimal('10'))
+        self.assertEqual(self.assess(mixed).coverage_quality, 'COMPLETE')
+
+    def test_provider_scoping_fallback_and_request_diagnostics(self):
+        error = self.observation(self.end, 'kraken', result='error', error_code='HTTP_ERROR', price=None)
+        self.assertEqual(self.assess(self.full() + [error]).coverage_quality, 'COMPLETE')
+        primary_error = self.observation(self.end, result='error', error_code='HTTP_ERROR', price=None)
+        result = self.assess(self.full('kraken') + [primary_error], provider='kraken', was_fallback=True)
+        self.assertEqual(result.coverage_quality, 'DEGRADED')
+        result = self.assess(self.full() + [primary_error])
+        self.assertEqual((result.coverage_quality, result.failed_requests), ('DEGRADED', 1))
+        opportunities = tuple((i + 1, self.origin + i * 2_000_000_000, 'completed') for i in range(30))
+        result = self.assess(self.full(), evidence_changes={
+            'scheduled_opportunities': opportunities + ((31, self.end, 'busy'),)})
+        self.assertEqual((result.coverage_quality, result.missing_requests), ('DEGRADED', 1))
+
+    def test_provenance_and_membership_fail_closed(self):
+        from dataclasses import replace
+        for changes in ({'scheduled_opportunities': ()}, {'observation_ids': ()}, {'contexts': ()},
+                {'observation_ids': (1,) * 30}, {'run_id': 'foreign-run'},
+                {'run_id': ''}, {'run_id': ' '}, {'run_id': 2},
+                {'contexts': (replace(self.context, anchor_id=0),) * 30},
+                {'contexts': (replace(self.context, sampling_origin_ns=0),) * 30}):
+            with self.subTest(changes=changes):
+                self.assertEqual(self.assess(self.full(), evidence_changes=changes).coverage_quality,
+                    'INSUFFICIENT')
+        obs = self.full() + [self.observation(self.origin - 1, receipt_wall_us=self.wall)]
+        self.assertIn('WINDOW_MEMBERSHIP_DISAGREEMENT', self.assess(obs).reasons)
+        obs[-1] = replace(obs[-1], result='error', error_code='HTTP_ERROR', price=None)
+        self.assertNotIn('WINDOW_MEMBERSHIP_DISAGREEMENT', self.assess(obs).reasons)
+        for age, quality in ((59_999_999_999, 'INSUFFICIENT'), (60_000_000_000, 'COMPLETE')):
+            self.assertEqual(self.assess(self.full(), evidence_changes={
+                'discontinuity_ends_ns': (self.end - age,)}).coverage_quality, quality)
+
+    def test_request_membership_rejects_incomplete_or_orphan_evidence(self):
+        for changes in ({'scheduled_opportunities': ((1, self.end, 'completed'),)},
+                {'request_outcomes': ((999, 'coinbase', 'error'),)},
+                {'request_outcomes': ((1, 'coinbase', 'error'), (1, 'coinbase', 'success'))},
+                {'request_outcomes': ((1, 'coinbase', 1, self.origin, 'success'),) * 2},
+                {'request_outcomes': ((1, 'coinbase', 1, self.origin, 'error'),)},
+                {'request_outcomes': ()}, {'expected_requests': ((999, 'coinbase'),)},
+                {'validated_window_start_ns': None},
+                {'validated_window_end_ns': self.end - 1},
+                {'scheduled_opportunities': ((1, self.origin, 'busy'),)}):
+            with self.subTest(changes=changes):
+                self.assertIn('INCOMPLETE_PROVENANCE', self.assess(self.full(),
+                    evidence_changes=changes).reasons)
+
+    def test_final_request_counts_once_and_uses_actual_receipt_window(self):
+        error = self.observation(self.end, result='error', error_code='HTTP_ERROR', price=None)
+        result = self.assess(self.full() + [error])
+        self.assertEqual(result.failed_requests, 1)
+        for ns, count in ((self.origin - 1, 0), (self.origin, 1),
+                (self.end, 1), (self.end + 1, 0)):
+            with self.subTest(ns=ns):
+                error = self.observation(ns, result='error', error_code='HTTP_ERROR', price=None)
+                result = self.assess(self.full() + [error])
+                self.assertEqual(result.failed_requests, count)
+        result = self.assess(self.full() + [self.observation(self.end,
+            result='error', error_code='HTTP_ERROR', price=None)] * 2)
+        self.assertEqual(result.failed_requests, 2)
+        self.assertEqual(self.assess(self.full()).failed_requests, 0)
+
+    def test_same_fetch_disagreement_is_explicit_not_consensus(self):
+        self.assertTrue(hasattr(self.policy.ResearchAssessment, '__dataclass_fields__'))
+        self.assertIn('same_fetch_disagreements', self.policy.ResearchAssessment.__dataclass_fields__)
+        observations = self.full() + [self.observation(self.origin, 'kraken', price=Decimal('1000'))]
+        result = self.assess(observations)
+        pair = result.same_fetch_disagreements[0]
+        self.assertEqual(pair, (1, 1, 31, Decimal('10'), Decimal('1000'), Decimal('990'), 0))
+        self.assertEqual(result.coverage_quality, 'COMPLETE')
+        self.assertEqual(result.value, Decimal('10'))
+        self.assertEqual(result.provider_availability, (('coinbase', 30), ('kraken', 1)))
+        self.assertEqual(result.scheduled_receipt_jitter_ns[0], (1, 0))
+        self.assertEqual(result.cell_phase_offsets_ns[0], 0)
+        interleaved = [self.observation(self.origin), self.observation(self.origin + 2_000_000_000),
+            self.observation(self.origin + 2_000_000_000, 'kraken', price=Decimal('20')),
+            self.observation(self.origin, 'kraken', price=Decimal('30'))]
+        pairs = self.assess(interleaved).same_fetch_disagreements
+        self.assertEqual([(row[0], row[1], row[2], row[5]) for row in pairs],
+            [(1, 1, 4, Decimal('20')), (2, 2, 3, Decimal('10'))])
+        error = self.observation(self.origin, 'kraken', result='error', error_code='HTTP_ERROR', price=None)
+        self.assertEqual(self.assess(self.full() + [error]).same_fetch_disagreements[0][5], None)
+        for ns in (self.origin - 1, self.end + 1):
+            result = self.assess(self.full() + [self.observation(ns, 'kraken')])
+            self.assertFalse(any(row[5] is not None for row in result.same_fetch_disagreements))
+            self.assertEqual(dict(result.provider_availability)['kraken'], 0)
+
+    def test_uncertainty_policy_and_decimal_precision_preserved(self):
+        from decimal import localcontext, Inexact
+        obs = self.observation(self.end, source_timestamp_us=self.wall + 1_000_000)
+        self.assertEqual(self.assess([obs]).value_status, 'VALID')
+        obs = self.observation(self.end, source_timestamp_us=self.wall + 1_000_001)
+        self.assertEqual(self.assess([obs]).value_status, 'INVALID')
+        observations = [self.observation(self.end, price=Decimal(x)) for x in ('1', '1', '2')]
+        with localcontext() as context:
+            context.prec = 3
+            context.traps[Inexact] = True
+            result = self.assess(observations)
+        assert result.value is not None
+        self.assertEqual(len(result.value.as_tuple().digits), 512)
+
+
 class SampleMeanEngineTests(unittest.TestCase):
     def setUp(self):
         self.receipt_wall_us = 2_000_000_000_000_000

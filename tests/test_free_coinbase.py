@@ -22,7 +22,7 @@ class CapturedCoinbasePolicyTests(unittest.TestCase):
         self.wall = 1791873042839308
         self.anchor = ClockAnchor(1791873042, self.mono, self.mono, 0, 0,
             self.mono, 1791873042265500, 1093500, 'VALID')
-        self.context = free_reference.AcquisitionContext(2, 1, self.anchor, 1, self.mono, None)
+        self.context = free_reference.AcquisitionContext(2, '22f60ec8-3c93-4d67-9a5f-0cb2b0841625', self.anchor, 1, self.mono, None)
         self.sends = 0
 
     def fetch(self, source=1791873042866047, *, context=None, advance=0, retry=False):

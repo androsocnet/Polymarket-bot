@@ -17,7 +17,7 @@ class CapturedKrakenPolicyTests(unittest.TestCase):
         from polymarket_bot.recorder.models import ClockAnchor
         self.assertTrue(hasattr(policy, 'AcquisitionContext'), 'captured acquisition policy missing')
         anchor = ClockAnchor(1, 1000, 1000, 0, 0, 1000, 1000000, 1000000, 'VALID')
-        context = policy.AcquisitionContext(2, 1, anchor, 1, 1000, None)
+        context = policy.AcquisitionContext(2, '22f60ec8-3c93-4d67-9a5f-0cb2b0841625', anchor, 1, 1000, None)
         with httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200,
                 json={'error': [], 'result': {'BTC/USD': {'c': ['10'], 'b': ['9'], 'a': ['11']}}})),
                 trust_env=False) as client:

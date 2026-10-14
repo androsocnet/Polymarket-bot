@@ -18,7 +18,7 @@ class CapturedSourcePolicyTests(unittest.TestCase):
         from dataclasses import replace
         self.assertTrue(hasattr(policy, 'AcquisitionContext'), 'captured acquisition policy missing')
         anchor = ClockAnchor(1, 1000, 1000, 0, 0, 1000, 1000000, 1000000, 'VALID')
-        context = policy.AcquisitionContext(2, 1, anchor, 1, 1000, None)
+        context = policy.AcquisitionContext(2, '22f60ec8-3c93-4d67-9a5f-0cb2b0841625', anchor, 1, 1000, None)
         obs = ApproximateObservation('coinbase', 'BTC/USD', 'USD', Decimal('1'), None, None,
             1000000, 0, 1000000, '', 0, 'rest', 'coinbase-ticker-v1', 200, 'success', None, 1000)
         self.assertEqual(policy.source_time_status(obs, context), 'SOURCE_TIME_WITHIN_CLOCK_UNCERTAINTY')
@@ -28,6 +28,22 @@ class CapturedSourcePolicyTests(unittest.TestCase):
         with self.assertRaises(FrozenInstanceError):
             setattr(context, 'revision', 1)
         self.assertEqual(policy.source_time_status(obs, None), 'CLOCK_CONTEXT_UNAVAILABLE')
+        for run_id in ('', ' ', 1, True, None):
+            with self.subTest(run_id=run_id):
+                self.assertEqual(policy.source_time_status(obs, replace(context, run_id=run_id)),
+                    'CLOCK_CONTEXT_UNAVAILABLE')
+
+
+class ResearchEvidenceModelTests(unittest.TestCase):
+    def test_evidence_and_assessment_are_immutable(self):
+        from polymarket_bot.recorder import free_reference as policy
+        evidence = policy.ResearchWindowEvidence(2, '22f60ec8-3c93-4d67-9a5f-0cb2b0841625', 0, (), (), (), (), ())
+        assessment = policy.assess_provider([], provider='coinbase', report_wall_us=60_000_000,
+            report_ns=60_000_000_000, evidence=evidence)
+        for model, field, value in ((evidence, 'run_id', 2), (assessment, 'value_status', 'VALID')):
+            with self.assertRaises(FrozenInstanceError):
+                setattr(model, field, value)
+        self.assertEqual(assessment.coverage_quality, 'INSUFFICIENT')
 
 
 class FreeReferenceModelTests(unittest.TestCase):
