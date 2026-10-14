@@ -1,10 +1,164 @@
 import importlib.util
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 import unittest
 
 
 class CP5SafetyTests(unittest.TestCase):
+    def gate_fixture(self, count=15) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        reports = [dict(reference_id=i + 1, run_id='r', revision=2, opportunity_id=i + 1,
+            receipt_mono_ns=60_000_000_000 + i * 2_000_000_000,
+            completion_ns=60_000_000_000 + i * 2_000_000_000,
+            warmup_status='FULL', qualification=True,
+            selected_assessment=dict(value_status='VALID', coverage_quality='COMPLETE', warmup_status='FULL'))
+            for i in range(count)]
+        opportunities = [dict(event_id=i + 1, run_id='r', market_id='m', slot_index=i,
+            target_ns=60_000_000_000 + i * 2_000_000_000, disposition='submitted', version=2)
+            for i in range(count)]
+        return reports, opportunities
+
+    def test_smoke_scheduled_continuity_and_all_postwarmup(self):
+        import copy
+        module = self.analyzer()
+        self.assertTrue(callable(getattr(module, 'smoke_continuity', None)), 'smoke gate missing')
+        reports, opportunities = self.gate_fixture()
+        self.assertEqual(module.smoke_continuity(reports, opportunities)['verdict'], 'PASS')
+        for mutation in ('fourteen', 'duplicate', 'busy', 'warmup', 'legacy', 'short', 'bad_extra', 'target'):
+            with self.subTest(mutation=mutation):
+                r, o = copy.deepcopy((reports, opportunities))
+                if mutation == 'fourteen': r.pop(); o.pop()
+                if mutation == 'duplicate': r.append(copy.deepcopy(r[0]))
+                if mutation == 'busy': o[7]['disposition'] = 'busy'
+                if mutation == 'warmup': r[7]['warmup_status'] = 'WARMING_UP'
+                if mutation == 'legacy': r[7]['revision'] = 1
+                if mutation == 'short': r[-1]['completion_ns'] -= 1
+                if mutation == 'target': o[7]['target_ns'] += 1
+                if mutation == 'bad_extra':
+                    r.append(dict(r[-1], reference_id=99, opportunity_id=99,
+                        selected_assessment=dict(value_status='VALID', coverage_quality='INSUFFICIENT', warmup_status='FULL')))
+                self.assertEqual(module.smoke_continuity(r, o)['verdict'], 'FAIL')
+
+    def test_smoke_requires_exact_fifteen_window_span(self):
+        module = self.analyzer()
+        for count in (16, 40):
+            with self.subTest(count=count):
+                reports, opportunities = self.gate_fixture(count)
+                for i, report in enumerate(reports):
+                    report['receipt_mono_ns'] = report['completion_ns'] = 60_000_000_000 + i * 1_866_666_667
+                self.assertEqual(module.smoke_continuity(reports, opportunities)['verdict'], 'FAIL')
+        reports, opportunities = self.gate_fixture(16)
+        reports[0]['receipt_mono_ns'] = reports[0]['completion_ns'] = 60_000_000_001
+        result = module.smoke_continuity(reports, opportunities)
+        self.assertEqual(result['verdict'], 'PASS')
+        self.assertEqual(len(result['qualifying_chain']), 15)
+        self.assertEqual(result['qualifying_chain'][0]['reference_id'], 2)
+        self.assertEqual(result['completion_span_ns'], 28_000_000_000)
+
+    def pilot_fixture(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+        reports, _ = self.gate_fixture(450)
+        slots = [dict(slot_id=i + 1, run_id='r', market_id='m', slot_index=i,
+            scheduled_us=i * 2_000_000, status='COMPLETE', window_start_us=0,
+            window_end_us=900_000_000, books=[dict(outcome=outcome, status='VALID',
+                expected_token_id=token, expected_condition_id='c') for outcome, token in [('UP', '1'), ('DOWN', '2')]])
+            for i in range(450)]
+        attempts = [dict(run_id='r', market_id='m', slot_id=i + 1, slot_index=i, leg=leg,
+            attempt=i * 2 + j + 1, started_mono_ns=60_000_000_001 + i * 2_000_000_000,
+            ended_mono_ns=60_000_000_002 + i * 2_000_000_000)
+            for i in range(450) for j, leg in enumerate(('UP', 'DOWN'))]
+        return reports, slots, attempts
+
+    def test_causal_cutoff_uses_earliest_send_across_all_attempts(self):
+        module = self.analyzer()
+        self.assertTrue(callable(getattr(module, 'pilot_causal_availability', None)), 'pilot gate missing')
+        reports, slots, attempts = self.pilot_fixture()
+        report = reports[0]
+        for offset, available in ((0, False), (-1, True), (-2_000_000_000, True), (-2_000_000_001, False), (1, False)):
+            with self.subTest(offset=offset):
+                report['completion_ns'] = attempts[0]['started_mono_ns'] + offset
+                report['receipt_mono_ns'] = report['completion_ns']
+                result = module.pilot_causal_availability(reports, slots, attempts)
+                self.assertEqual(result['slots'][0]['available'], available)
+        report['completion_ns'] = report['receipt_mono_ns'] = 60_000_000_000
+        attempts.append(dict(attempts[1], attempt=1000, started_mono_ns=59_999_999_999, ended_mono_ns=60_000_000_000))
+        self.assertFalse(module.pilot_causal_availability(reports, slots, attempts)['slots'][0]['available'])
+        attempts.pop()
+        attempts[0].pop('started_mono_ns')
+        self.assertFalse(module.pilot_causal_availability(reports, slots, attempts)['slots'][0]['available'])
+
+    def test_pilot_ledger_identity_segment_and_explicit_exclusions(self):
+        import copy
+        module = self.analyzer()
+        self.assertTrue(callable(getattr(module, 'pilot_causal_availability', None)), 'pilot gate missing')
+        reports, slots, attempts = self.pilot_fixture()
+        result = module.pilot_causal_availability(reports, slots, attempts)
+        self.assertEqual(result['verdict'], 'PASS')
+        self.assertEqual(len(result['slots']), 450)
+        self.assertGreaterEqual(len(result['qualifying_segment']), 31)
+        for mutation in ('thirty', 'hole', 'identity', 'missing', 'opening', 'closing', 'no_references'):
+            with self.subTest(mutation=mutation):
+                r, s, a = copy.deepcopy((reports, slots, attempts))
+                if mutation in ('thirty', 'hole'):
+                    for i, row in enumerate(r):
+                        if (mutation == 'thirty' and i >= 30) or (mutation == 'hole' and i % 31 == 15):
+                            row['qualification'] = False
+                if mutation == 'identity': s[100]['books'][0]['expected_token_id'] = '3'
+                if mutation == 'missing': s.pop(100)
+                if mutation == 'opening': s[0]['books'][0]['status'] = 'INVALID'
+                if mutation == 'closing': s[-1]['books'][0]['status'] = 'INVALID'
+                if mutation == 'no_references': r = []
+                self.assertEqual(module.pilot_causal_availability(r, s, a)['verdict'], 'FAIL')
+        slots[100]['status'] = 'PARTIAL'
+        slots[100]['books'][0]['status'] = 'INVALID'
+        result = module.pilot_causal_availability(reports, slots, attempts)
+        self.assertEqual(result['verdict'], 'PASS')
+        self.assertIn(100, result['excluded_slot_indices'])
+
+    def test_pilot_rejects_unsupported_or_inconsistent_classifications(self):
+        module = self.analyzer()
+        for status, valid_count, accepted in (('MADE_UP', None, False), ('IN_PROGRESS', None, False),
+                ('COMPLETE', None, False), ('PARTIAL', 2, False), ('FAILED', 1, False),
+                ('MISSED', 2, False), ('INTERRUPTED', 2, False), ('PARTIAL', 1, True),
+                ('FAILED', 0, True), ('MISSED', None, True), ('INTERRUPTED', 0, True)):
+            with self.subTest(status=status, valid_count=valid_count):
+                reports, slots, attempts = self.pilot_fixture()
+                slots[100]['status'] = status
+                if valid_count is None:
+                    slots[100]['books'] = []
+                else:
+                    for i, book in enumerate(slots[100]['books']):
+                        book['status'] = 'VALID' if i < valid_count else ('INTERRUPTED' if status == 'INTERRUPTED' else 'INVALID')
+                result = module.pilot_causal_availability(reports, slots, attempts)
+                self.assertEqual(result['verdict'], 'PASS' if accepted else 'FAIL')
+                self.assertIn(100, result['excluded_slot_indices'])
+                self.assertEqual(result['slots'][100]['classification'], status)
+
+    def test_gate_identity_and_replay_integration(self):
+        import copy
+        import json
+        module = self.analyzer()
+        reports, slots, attempts = self.pilot_fixture()
+        for mutation in ('foreign_attempt', 'bool_timing', 'grid', 'metadata', 'duplicate_reference'):
+            with self.subTest(mutation=mutation):
+                r, s, a = copy.deepcopy((reports, slots, attempts))
+                if mutation == 'foreign_attempt': a[0]['run_id'] = 'foreign'
+                if mutation == 'bool_timing': a[0]['started_mono_ns'] = True
+                if mutation == 'grid': s[0]['scheduled_us'] = 1
+                if mutation == 'metadata':
+                    for row in s:
+                        row['expected_identity'] = {'UP': ('9', 'c'), 'DOWN': ('2', 'c')}
+                if mutation == 'duplicate_reference': r.append(copy.deepcopy(r[0]))
+                result = module.pilot_causal_availability(r, s, a)
+                if mutation in ('foreign_attempt', 'bool_timing'):
+                    self.assertFalse(result['slots'][0]['available'])
+                else:
+                    self.assertEqual(result['verdict'], 'FAIL')
+        rows = self.research_replay_fixture(cycles=40)
+        replay = module.replay_rows(*rows)
+        opportunities = [dict(json.loads(e['detail_json']), event_id=e['event_id']) for e in rows[2]
+            if json.loads(e['detail_json']).get('type') == 'APPROXIMATE_OPPORTUNITY']
+        self.assertEqual(module.smoke_continuity(replay['reports'], opportunities)['verdict'], 'FAIL')
+        self.assertEqual(sum(r['qualification'] is True for r in replay['reports']), 10)
+
     def test_research_worker_handoff_never_writes_version_one_event(self):
         from types import SimpleNamespace
         from polymarket_bot.recorder.service import Recorder, ApproximateReferenceWorker

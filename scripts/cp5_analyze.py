@@ -371,6 +371,153 @@ def _replay_research(detail, event, observations, references, anchors, events, s
         warmup_status=selected.warmup_status, causal_availability='NOT_EVALUATED', qualification=selected.value_status == 'VALID' and selected.coverage_quality != 'INSUFFICIENT' and selected.warmup_status == 'FULL')
 
 
+def _timing(value):
+    return type(value) is int and 0 <= value <= 2**63 - 1
+
+
+def _qualified(report):
+    assessment = report.get('selected_assessment', {})
+    return (type(report.get('revision')) is int and report['revision'] == 2
+        and report.get('qualification') is True and report.get('warmup_status') == 'FULL'
+        and assessment.get('warmup_status') == 'FULL' and assessment.get('value_status') == 'VALID'
+        and assessment.get('coverage_quality') in ('COMPLETE', 'DEGRADED')
+        and _timing(report.get('receipt_mono_ns')) and _timing(report.get('completion_ns'))
+        and report['receipt_mono_ns'] <= report['completion_ns'])
+
+
+def smoke_continuity(reports, opportunities):
+    reasons = []
+    bad = [r.get('reference_id') for r in reports if r.get('warmup_status') == 'FULL' and not _qualified(r)]
+    if bad:
+        reasons.append('POST_WARMUP_INVALID_OR_INSUFFICIENT')
+    reference_ids = [(r.get('run_id'), r.get('reference_id')) for r in reports]
+    completion_ids = [(r.get('run_id'), r.get('opportunity_id')) for r in reports if r.get('revision') == 2]
+    if len(set(reference_ids)) != len(reference_ids) or len(set(completion_ids)) != len(completion_ids):
+        reasons.append('DUPLICATE_REFERENCE_IDENTITY')
+    chains, chain = [], []
+    identities = [(o.get('run_id'), o.get('event_id')) for o in opportunities]
+    if len(set(identities)) != len(identities):
+        reasons.append('DUPLICATE_OPPORTUNITY')
+    ordered = sorted(opportunities, key=lambda o: (str(o.get('run_id')), str(o.get('market_id')), o.get('target_ns', -1)))
+    for opportunity in ordered:
+        matches = [r for r in reports if r.get('run_id') == opportunity.get('run_id')
+            and r.get('opportunity_id') == opportunity.get('event_id')]
+        valid = (opportunity.get('version') == 2 and _timing(opportunity.get('target_ns'))
+            and opportunity.get('disposition') == 'submitted' and len(matches) == 1 and _qualified(matches[0]))
+        if chain and (not valid or opportunity.get('run_id') != chain[-1]['run_id']
+                or opportunity.get('market_id') != chain[-1].get('market_id')
+                or opportunity['target_ns'] - chain[-1]['target_ns'] != 2_000_000_000
+                or matches[0]['completion_ns'] <= chain[-1]['completion_ns']):
+            chains.append(chain)
+            chain = []
+        if valid:
+            chain.append(dict(opportunity, reference_id=matches[0]['reference_id'], completion_ns=matches[0]['completion_ns']))
+    chains.append(chain)
+    qualifying = next((c[start:start + 15] for c in chains for start in range(len(c) - 14)
+        if c[start + 14]['completion_ns'] - c[start]['completion_ns'] >= 28_000_000_000), [])
+    if not qualifying:
+        reasons.append('NO_15_SCHEDULED_REPORTS_SPANNING_28_SECONDS')
+    return dict(verdict='FAIL' if reasons else 'PASS', reasons=reasons, qualifying_chain=qualifying,
+        completion_span_ns=qualifying[-1]['completion_ns'] - qualifying[0]['completion_ns'] if qualifying else None,
+        post_warmup_exclusions=bad)
+
+
+def pilot_causal_availability(reports, slots, attempts):
+    reasons, rows, segment, best = [], [], [], []
+    identities = {(s.get('run_id'), s.get('market_id')) for s in slots}
+    indices = [s.get('slot_index') for s in slots]
+    if (len(identities) != 1 or len(slots) != 450 or any(not _timing(i) for i in indices)
+            or set(indices) != set(range(450)) or len({s.get('slot_id') for s in slots}) != 450):
+        reasons.append('INCOMPLETE_OR_MIXED_450_SLOT_LEDGER')
+    reference_ids = [(r.get('run_id'), r.get('reference_id')) for r in reports]
+    if len(set(reference_ids)) != len(reference_ids):
+        reasons.append('DUPLICATE_REFERENCE_IDENTITY')
+    tokens = None
+    boundaries = {(s.get('window_start_us'), s.get('window_end_us')) for s in slots}
+    if len(boundaries) != 1:
+        reasons.append('MIXED_MARKET_BOUNDARIES')
+    for slot in sorted(slots, key=lambda s: s.get('slot_index', -1)):
+        exclusion = []
+        books = slot.get('books', [])
+        status = slot.get('status')
+        valid_count = sum(book.get('status') == 'VALID' for book in books)
+        classification_valid = (
+            status in ('COMPLETE', 'PARTIAL', 'FAILED') and len(books) == 2
+            and valid_count == {'COMPLETE': 2, 'PARTIAL': 1, 'FAILED': 0}[status]
+            or status == 'MISSED' and not books
+            or status == 'INTERRUPTED' and len(books) == 2
+            and all(book.get('status') == 'INTERRUPTED' for book in books))
+        if not classification_valid:
+            exclusion.append('UNSUPPORTED_OR_INCONSISTENT_SLOT_CLASSIFICATION')
+            if 'UNSUPPORTED_OR_INCONSISTENT_SLOT_CLASSIFICATION' not in reasons:
+                reasons.append('UNSUPPORTED_OR_INCONSISTENT_SLOT_CLASSIFICATION')
+        mapping = {b.get('outcome'): (b.get('expected_token_id'), b.get('expected_condition_id')) for b in books}
+        identity_valid = (len(books) == 2 and set(mapping) == {'UP', 'DOWN'}
+            and all(isinstance(t, str) and t.strip() and isinstance(c, str) and c.strip() for t, c in mapping.values())
+            and len({t for t, _ in mapping.values()}) == 2 and len({c for _, c in mapping.values()}) == 1)
+        if books and (not identity_valid or tokens is not None and mapping != tokens
+                or slot.get('expected_identity') is not None and mapping != slot['expected_identity']):
+            exclusion.append('BOOK_IDENTITY_MISMATCH')
+            if 'BOOK_IDENTITY_MISMATCH' not in reasons:
+                reasons.append('BOOK_IDENTITY_MISMATCH')
+        elif identity_valid and tokens is None:
+            tokens = mapping
+        paired = identity_valid and mapping == tokens and slot.get('status') == 'COMPLETE' and all(b.get('status') == 'VALID' for b in books)
+        if not paired:
+            exclusion.append('NOT_PAIRED_VALID')
+        if (not _timing(slot.get('window_start_us')) or not _timing(slot.get('window_end_us'))
+                or slot['window_end_us'] - slot['window_start_us'] != 900_000_000
+                or not _timing(slot.get('slot_index')) or slot.get('scheduled_us') != slot['window_start_us'] + slot['slot_index'] * 2_000_000):
+            exclusion.append('INVALID_SLOT_GRID')
+            if 'INVALID_SLOT_GRID' not in reasons:
+                reasons.append('INVALID_SLOT_GRID')
+        sends = [a for a in attempts if a.get('slot_id') == slot.get('slot_id')]
+        legs = {a.get('leg') for a in sends}
+        timing_valid = bool(sends) and (legs == {'PAIRED'} or legs <= {'UP', 'DOWN', 'PAIRED'} and ('PAIRED' in legs or {'UP', 'DOWN'} <= legs))
+        timing_valid = timing_valid and len({a.get('attempt') for a in sends}) == len(sends) and all(
+            a.get('run_id') == slot.get('run_id') and a.get('market_id') == slot.get('market_id')
+            and type(a.get('slot_index')) is int and a['slot_index'] == slot['slot_index']
+            and _timing(a.get('attempt')) and _timing(a.get('started_mono_ns')) and _timing(a.get('ended_mono_ns'))
+            and a['started_mono_ns'] <= a['ended_mono_ns'] for a in sends)
+        cutoff = min(a['started_mono_ns'] for a in sends) if timing_valid else None
+        if not timing_valid:
+            exclusion.append('MISSING_OR_INVALID_ACTUAL_SEND_TIMING')
+        candidates = [r for r in reports if r.get('run_id') == slot.get('run_id') and _qualified(r)
+            and cutoff is not None and r['completion_ns'] < cutoff and r['receipt_mono_ns'] < cutoff]
+        reference = max(candidates, key=lambda r: r['completion_ns'], default=None)
+        age = cutoff - reference['completion_ns'] if reference is not None else None
+        if reference is None:
+            exclusion.append('NO_STRICTLY_PRIOR_QUALIFYING_REFERENCE')
+        elif age is not None and age > 2_000_000_000:
+            exclusion.append('REFERENCE_OLDER_THAN_2_SECONDS')
+        row = dict(slot_index=slot.get('slot_index'), slot_id=slot.get('slot_id'), run_id=slot.get('run_id'),
+            market_id=slot.get('market_id'), classification=slot.get('status'), paired_valid=paired,
+            cutoff_ns=cutoff, reference_id=reference['reference_id'] if reference else None, age_ns=age,
+            available=not exclusion, exclusions=exclusion, attempts=sends)
+        rows.append(row)
+        if segment and (not row['available'] or row['slot_index'] != segment[-1]['slot_index'] + 1
+                or row['run_id'] != segment[-1]['run_id'] or row['market_id'] != segment[-1]['market_id']):
+            if len(segment) > len(best):
+                best = segment
+            segment = []
+        if row['available']:
+            segment.append(row)
+    if len(segment) > len(best):
+        best = segment
+    opening = any(r['slot_index'] == 0 and r['paired_valid'] for r in rows)
+    closing = any(r['slot_index'] == 449 and r['paired_valid'] for r in rows)
+    if not opening or not closing:
+        reasons.append('MISSING_PAIRED_OPENING_OR_CLOSING')
+    qualifying = best if len(best) >= 31 else []
+    if not qualifying:
+        reasons.append('NO_31_CONSECUTIVE_CAUSAL_SLOTS_SPANNING_60_SECONDS')
+    return dict(verdict='FAIL' if reasons else 'PASS', reasons=reasons, slots=rows,
+        qualifying_segment=qualifying, segment_span_ns=(len(qualifying) - 1) * 2_000_000_000 if qualifying else None,
+        opening_present=opening, closing_present=closing, expected_slots=450,
+        excluded_slot_indices=[r['slot_index'] for r in rows if not r['available']],
+        source_time_semantics='SOURCE_TIME_WITHIN_CLOCK_UNCERTAINTY is not exact UTC ordering')
+
+
 def analyze_db(db_path: Path):
     with closing(sqlite3.connect(db_path.resolve().as_uri() + '?mode=ro', uri=True)) as conn:
         return quality(conn)
@@ -585,11 +732,36 @@ def quality(conn):
                    for row in rows('request_attempts', 'request_id')], events, anchors, books) for market in rows('markets', 'window_start_us')}
     result['windows'] = windows
     result['full_window_verdict'] = 'PASS' if any(window['complete_window'] for window in windows) else 'FAIL'
-    result['smoke_gate'] = bool(references and all(row['value_text'] is not None for row in references) and integrity == ['ok'] and not foreign_keys and version == 2
-        and not any(isolation.values()) and replay['exact'] and usable
-        and all(row.get('revision') == 2 and row.get('qualification') is True for row in replay.get('reports', []))
-        and any(row['status'] == 'COMPLETE' for row in slots)
+    reports = replay.get('reports', []) if replay['exact'] else []
+    decoded = [dict(json.loads(event['detail_json']), event_id=event['event_id']) for event in events]
+    opportunities = [event for event in decoded if event.get('type') == 'APPROXIMATE_OPPORTUNITY']
+    actual_sends = [event for event in decoded if event.get('type') == 'ACTUAL_SEND_ATTEMPT'
+        and event.get('host') == 'clob.polymarket.com' and event.get('path') in ('/book', '/books')]
+    result['report_quality'] = dict(reports=reports, classifications=dict(Counter(
+        report.get('selected_assessment', {}).get('coverage_quality', 'UNKNOWN') for report in reports)),
+        warmup=dict(Counter(report.get('warmup_status', 'UNKNOWN') for report in reports)))
+    result['smoke_continuity'] = smoke_continuity(reports, opportunities)
+    pilots = []
+    for market in rows('markets', 'window_start_us'):
+        for run in runs:
+            ledger = [dict(slot, window_start_us=market['window_start_us'], window_end_us=market['window_end_us'],
+                expected_identity={'UP': (market['up_token_id'], market['condition_id']),
+                    'DOWN': (market['down_token_id'], market['condition_id'])},
+                books=[book for book in books if book['slot_id'] == slot['slot_id']])
+                for slot in slots if slot['market_id'] == market['market_id'] and slot['run_id'] == run['run_id']]
+            if ledger:
+                pilots.append(dict(pilot_causal_availability(reports, ledger, actual_sends),
+                    run_id=run['run_id'], market_id=market['market_id']))
+    system_valid = bool(integrity == ['ok'] and not foreign_keys and version == 2
+        and not any(isolation.values()) and replay['exact'] and runs
         and all(run['state'] == 'STOPPED' for run in runs))
+    result['pilot_causal_availability'] = dict(windows=pilots,
+        verdict='PASS' if system_valid and any(pilot['verdict'] == 'PASS' for pilot in pilots) else 'FAIL',
+        system_evidence_valid=system_valid)
+    paired_book = any(slot['status'] == 'COMPLETE' and len(pair := [book for book in books
+        if book['slot_id'] == slot['slot_id']]) == 2 and {book['outcome'] for book in pair} == {'UP', 'DOWN'}
+        and all(book['status'] == 'VALID' for book in pair) for slot in slots)
+    result['smoke_gate'] = system_valid and paired_book and result['smoke_continuity']['verdict'] == 'PASS'
     return result
 
 
