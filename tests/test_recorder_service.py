@@ -64,6 +64,225 @@ class RecorderServiceTests(unittest.TestCase):
         slots = fixture.rows("SELECT slot_index FROM sample_slots WHERE status='COMPLETE'")
         self.assertEqual([row['slot_index'] for row in slots], [151])
 
+    def test_nominal_cadence_survives_anchor_shift_with_active_utc_guards(self):
+        from dataclasses import replace
+        from polymarket_bot.recorder.service import Recorder
+        for shift in (-632_500, 632_500):
+            with self.subTest(shift=shift):
+                fixture = self.fixture()
+                fixture.store.close()
+                fixture.db.path = fixture.db.path.with_name('approximate.sqlite3')
+                fixture.store = RecorderStore.open_approximate(fixture.db.path)
+                original = Recorder._housekeeping
+                planned = []
+                changed = []
+                def housekeeping(recorder, target_ns, **kwargs):
+                    planned.append(target_ns)
+                    original(recorder, target_ns, **kwargs)
+                    if not changed and recorder.clock.anchor is not None:
+                        changed.append(True)
+                        recorder.clock.anchor = replace(recorder.clock.anchor,
+                            server_us=recorder.clock.anchor.server_us + shift)
+                from types import SimpleNamespace
+                recorder = Recorder(fixture.store, fixture.public,
+                    monotonic_ns=fixture.monotonic_ns, wall_us=fixture.wall_us,
+                    sleep=fixture.sleep, approximate_reference=SimpleNamespace(fetch=lambda **kwargs: None))
+                with patch.object(Recorder, '_housekeeping', housekeeping):
+                    result = recorder.run(RunConfig(mode='APPROXIMATE_REFERENCE'),
+                        should_stop=lambda: fixture.book_count >= 3)
+                self.assertEqual(result.exit_code, 0)
+                sends = [row[2] for row in fixture.requests if row[1] == '/books']
+                self.assertEqual(len(sends), 3)
+                first = planned[0]
+                self.assertGreaterEqual(sends[0], first)
+                self.assertGreaterEqual(sends[1], first + 2_000_000_000)
+                self.assertGreaterEqual(sends[2], first + 4_000_000_000)
+
+    def test_real_research_nominal_grid_transport_guards_and_rollover(self, stop_case=None, fault=None):
+        from dataclasses import replace
+        from polymarket_bot.recorder.service import Recorder
+        from polymarket_bot.recorder.free_reference import ApproximateReferenceSession, CoinbaseRestProvider, KrakenRestProvider
+        for shift in ((632_500,) if fault is not None else (-2_500_000, -632_500, 632_500, 2_500_000)):
+            with self.subTest(shift=shift):
+                fixture = self.fixture(offset_us=590_000_000)
+                fixture.store.close()
+                fixture.db.path = fixture.db.path.with_name('research.sqlite3')
+                fixture.store = RecorderStore.open_approximate(fixture.db.path)
+                sends, planned, calls = [], [], {}
+                from threading import Event, Timer
+                entered, release = Event(), Event()
+                def respond(request):
+                    if request.url.host not in ('api.coinbase.com', 'api.kraken.com'):
+                        return fixture.respond(request)
+                    if stop_case is not None and not entered.is_set():
+                        entered.set()
+                        if not release.wait(2):
+                            raise RuntimeError('provider barrier timed out')
+                    opportunity, identity, _ = recorder._research_pending
+                    anchor = recorder.clock.anchor
+                    assert anchor is not None
+                    now = fixture.monotonic_ns()
+                    opening = anchor.midpoint_ns + (identity['scheduled_us'] - anchor.server_us) * 1000
+                    end = anchor.midpoint_ns + (identity['scheduled_us'] + 2_000_000 - anchor.server_us) * 1000
+                    sends.append((now, identity['target_ns'], opening, end, opportunity))
+                    calls[request.url.host] = calls.get(request.url.host, 0) + 1
+                    if calls[request.url.host] == 1:
+                        return httpx.Response(429, json={})
+                    if request.url.host == 'api.kraken.com':
+                        return httpx.Response(200, json={'error': [], 'result': {'BTC/USD': {'c': ['100'], 'b': ['99'], 'a': ['101']}}})
+                    return httpx.Response(200, json={'price': '100', 'bid': '99', 'ask': '101',
+                        'time': fixture.utcnow().isoformat()})
+                client = httpx.Client(transport=httpx.MockTransport(respond))
+                self.addCleanup(client.close)
+                providers = {name: cls(client, monotonic_ns=fixture.monotonic_ns,
+                    wall_us=fixture.wall_us, sleep=lambda _: None) for name, cls in
+                    (('coinbase', CoinbaseRestProvider), ('kraken', KrakenRestProvider))}
+                session = ApproximateReferenceSession(providers=providers,
+                    monotonic_ns=fixture.monotonic_ns, wall_us=fixture.wall_us, sleep=lambda _: None)
+                recorder = Recorder(fixture.store, fixture.public, monotonic_ns=fixture.monotonic_ns,
+                    wall_us=fixture.wall_us, sleep=fixture.sleep, approximate_reference=session)
+                original_housekeeping = Recorder._housekeeping
+                original_submit = Recorder._approximate_submit
+                if fault in ('wait', 'reserve', 'drain'):
+                    method = '_wait' if fault == 'wait' else '_approximate_drain'
+                    target_object = fixture.store if fault == 'reserve' else recorder
+                    method = 'reserve_slot' if fault == 'reserve' else method
+                    operation = getattr(target_object, method)
+                    injected = []
+                    def expire(*args, **kwargs):
+                        value = operation(*args, **kwargs)
+                        if not injected and recorder.clock.anchor is not None:
+                            injected.append(True)
+                            fixture.advance(121)
+                        return value
+                    patcher = patch.object(target_object, method, side_effect=expire)
+                    patcher.start()
+                    self.addCleanup(patcher.stop)
+                changed = []
+                def housekeeping(owner, target_ns, **kwargs):
+                    planned.append(target_ns)
+                    original_housekeeping(owner, target_ns, **kwargs)
+                    if fault is not None and not changed and fault not in ('wait', 'reserve', 'drain'):
+                        changed.append(True)
+                        if fault == 'metadata':
+                            owner.revision = replace(owner.revision, capture_ready=False)
+                        elif fault == 'identity':
+                            owner.revision = None
+                        elif fault == 'changed_market':
+                            owner.revision = replace(owner.revision, market=replace(owner.revision.market, market_id='changed-market'))
+                        elif fault == 'expiry':
+                            fixture.advance(121)
+                        elif fault == 'discontinuity':
+                            owner.clock.anchor = replace(owner.clock.anchor, status='DISCONTINUITY')
+                        return
+                    if not changed and owner.clock.anchor is not None:
+                        changed.append(True)
+                        owner.clock.anchor = replace(owner.clock.anchor,
+                            midpoint_ns=owner.clock.anchor.midpoint_ns - shift * 1000,
+                            request_start_mono_ns=owner.clock.anchor.request_start_mono_ns - shift * 1000,
+                            request_end_mono_ns=owner.clock.anchor.request_end_mono_ns - shift * 1000)
+                        owner.anchor_id = owner.store.save_anchor(owner.run_id, owner.clock.anchor)
+                        if owner.clock.anchor.request_end_mono_ns > fixture.monotonic_ns():
+                            fixture.advance((owner.clock.anchor.request_end_mono_ns - fixture.monotonic_ns()) / 1e9)
+                def submit(owner, deadline_ns, **identity):
+                    accepted = original_submit(owner, deadline_ns, **identity)
+                    if accepted:
+                        if stop_case is not None:
+                            self.assertTrue(entered.wait(2))
+                            guard = fixture.public.before_attempt
+                            def stop_guard():
+                                timer = Timer(0.01, release.set)
+                                timer.start()
+                                self.addCleanup(timer.join)
+                                if stop_case == 'interrupt':
+                                    raise KeyboardInterrupt
+                                from polymarket_bot.recorder.service import _StopRequested
+                                raise _StopRequested
+                            fixture.public.before_attempt = stop_guard
+                        else:
+                            owner.approximate_worker._thread.join(2)
+                            self.assertFalse(owner.approximate_worker._thread.is_alive())
+                    return accepted
+                book_sends = []
+                def book(request, payload, f):
+                    if request.url.path == '/books':
+                        identity = recorder._book_identity
+                        anchor = recorder.clock.anchor
+                        assert anchor is not None
+                        book_sends.append((fixture.monotonic_ns(), identity['target_ns'],
+                            anchor.midpoint_ns + (recorder._research_pending[1]['scheduled_us'] - anchor.server_us) * 1000,
+                            anchor.midpoint_ns + (recorder._research_pending[1]['scheduled_us'] + 2_000_000 - anchor.server_us) * 1000))
+                setattr(fixture, 'hook', book)
+                no_target_patcher = None
+                if fault == 'no_target':
+                    from polymarket_bot.recorder import service
+                    select = service.select_future_slot
+                    def no_target(*args, **kwargs):
+                        return replace(select(*args, **kwargs), target=None)
+                    no_target_patcher = patch.object(service, 'select_future_slot', side_effect=no_target)
+                    no_target_patcher.start()
+                    self.addCleanup(no_target_patcher.stop)
+                deadline = fixture.monotonic_ns() + 20_000_000_000
+                with patch.object(Recorder, '_housekeeping', housekeeping), patch.object(Recorder, '_approximate_submit', submit):
+                    result = recorder.run(RunConfig(mode='APPROXIMATE_REFERENCE'),
+                        should_stop=lambda: fixture.book_count >= 5 or (fault == 'changed_market' and bool(changed)), deadline_ns=deadline)
+                if no_target_patcher is not None:
+                    no_target_patcher.stop()
+                self.assertEqual(result.exit_code, 2 if fault in ('reserve', 'drain') else 130 if stop_case == 'interrupt' else 0, result.reason)
+                if fault in ('reserve', 'drain'):
+                    self.assertEqual(result.reason, 'time_unavailable')
+                if fault is not None:
+                    events = [json.loads(row['detail_json']) for row in fixture.rows('SELECT detail_json FROM recorder_events')]
+                    submitted = [row for row in events if row.get('type') == 'APPROXIMATE_OPPORTUNITY' and row.get('disposition') == 'submitted']
+                    terminal = [row for row in events if row.get('type') == 'APPROXIMATE_OPPORTUNITY_COMPLETION']
+                    self.assertEqual({row['opportunity_id'] for row in terminal},
+                        {row['opportunity_id'] for row in events if row.get('type') == 'APPROXIMATE_FETCH'})
+                    self.assertEqual(len(submitted), len(terminal))
+                    if fault == 'metadata':
+                        self.assertTrue(any(row.get('disposition') == 'unsubmitted' and row.get('reason') == 'METADATA_NOT_READY' for row in events))
+                    if fault == 'changed_market':
+                        self.assertFalse(any(row.get('market_id') == '1001' and row.get('disposition') == 'submitted' for row in events))
+                    if fault == 'no_target':
+                        self.assertFalse(submitted)
+                        self.assertFalse(sends)
+                        self.assertFalse(book_sends)
+                    continue
+                self.assertTrue(sends)
+                if stop_case is not None:
+                    self.assertTrue(fixture.store._closed)
+                    assert recorder.approximate_worker is not None
+                    self.assertIsNone(recorder.approximate_worker._thread)
+                    events = [json.loads(row['detail_json']) for row in fixture.rows('SELECT detail_json FROM recorder_events')]
+                    terminal = [row for row in events if row.get('type') == 'APPROXIMATE_OPPORTUNITY_COMPLETION']
+                    self.assertEqual(len(terminal), 1)
+                    self.assertEqual(terminal[0]['disposition'], 'completed')
+                    client.close()
+                    self.assertTrue(client.is_closed)
+                    continue
+                for now, nominal, opening, end, *_ in sends + book_sends:
+                    self.assertGreaterEqual(now, nominal)
+                    self.assertGreaterEqual(now, opening)
+                    self.assertLess(now, end)
+                    self.assertLess(now, deadline)
+                events = [json.loads(row['detail_json']) for row in fixture.rows('SELECT detail_json FROM recorder_events')]
+                opportunities = [row for row in events if row.get('type') == 'APPROXIMATE_OPPORTUNITY']
+                targets = [row['target_ns'] for row in opportunities]
+                self.assertTrue(all(b - a == 2_000_000_000 for a, b in zip(targets, targets[1:])))
+                self.assertEqual(len(targets), len(set(targets)))
+                self.assertEqual(len({row['market_id'] for row in opportunities}), 2)
+                self.assertEqual(len([row for row in events if row.get('type') == 'APPROXIMATE_SESSION']), 1)
+                self.assertTrue(any(row['disposition'] == 'skipped' for row in opportunities))
+
+    def test_actual_book_guard_stops_with_provider_transport_pending(self):
+        for signal in ('stop', 'interrupt'):
+            with self.subTest(signal=signal):
+                self.test_real_research_nominal_grid_transport_guards_and_rollover(stop_case=signal)
+
+    def test_research_housekeeping_faults_have_no_unowned_fetches(self):
+        for fault in ('metadata', 'identity', 'changed_market', 'no_target', 'expiry', 'discontinuity', 'wait', 'reserve', 'drain'):
+            with self.subTest(fault=fault):
+                self.test_real_research_nominal_grid_transport_guards_and_rollover(fault=fault)
+
     def test_checkpoint_baseline_precedes_capture_and_shutdown_precedes_close(self):
         fixture = self.fixture()
         def before_capture(request,payload,f):

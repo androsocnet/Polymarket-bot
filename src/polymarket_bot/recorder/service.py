@@ -301,6 +301,14 @@ class Recorder:
                     operation=attempt.operation, path=attempt.path, result=attempt.result,
                     error_code=attempt.error_code, **identity))
 
+    def _nominal_target_ns(self, scheduled_us):
+        if self.config.mode != 'APPROXIMATE_REFERENCE':
+            return self.clock.deadline_ns(scheduled_us)
+        if not hasattr(self, '_nominal_projection'):
+            self._nominal_projection = (scheduled_us, self.clock.deadline_ns(scheduled_us))
+        origin_us, origin_ns = self._nominal_projection
+        return origin_ns + (scheduled_us - origin_us) * 1000
+
     def _research_start(self):
         from .free_reference import ResearchWindowEvidence
         if not hasattr(self, '_research_evidence'):
@@ -323,9 +331,13 @@ class Recorder:
         event_id = self.store.record_event(self.run_id, 'DISCOVERY_GAP',
             started_us=self.wall_us(), detail=detail)
         from dataclasses import replace
-        cutoff = self.monotonic_ns() - 60_000_000_000
+        cutoff = max(self._research_evidence.sampling_origin_ns,
+            getattr(self, '_research_retention_ns', self._research_evidence.sampling_origin_ns)
+            - 60_000_000_000) - 2_000_000_000
         retained = tuple(row for row in self._research_evidence.scheduled_opportunities
-            if row[1] >= cutoff or row[2] in ('submitted', 'completed'))
+            if row[1] > cutoff or row[2] in ('submitted', 'completed'))
+        if len(retained) >= 128:
+            raise ValueError('Research opportunity retention bound exceeded.')
         self._research_evidence = replace(self._research_evidence,
             scheduled_opportunities=retained + ((event_id, target_ns, disposition),))
         return event_id
@@ -350,6 +362,22 @@ class Recorder:
                 or self._research_evidence.sampling_origin_ns != evidence.sampling_origin_ns
                 or result.context != self._research_submitted_context):
             raise ValueError('Invalid persisted research origin or submitted context.')
+        lower = max(evidence.sampling_origin_ns, result.report.receipt_mono_ns - 60_000_000_000) - 2_000_000_000
+        durable = set()
+        floor = getattr(self, '_research_event_floor', self._research_session_event_id)
+        rows = self.store._rows('SELECT event_id FROM recorder_events WHERE event_id>=? ORDER BY event_id LIMIT 4097', (floor,))
+        if len(rows) > 4096:
+            raise ValueError('Research authority event bound exceeded.')
+        for row in self.store._rows("SELECT event_id,run_id,detail_json FROM recorder_events WHERE event_id>=? AND event_id<=? "
+                "AND json_extract(detail_json,'$.type')='APPROXIMATE_OPPORTUNITY'", (floor, rows[-1]['event_id'] if rows else floor)):
+            detail = json.loads(row['detail_json'])
+            if (row['run_id'] == self.run_id and detail.get('type') == 'APPROXIMATE_OPPORTUNITY'
+                    and lower < detail['target_ns'] <= result.report.receipt_mono_ns):
+                durable.add(row['event_id'])
+        members = [op for op, target, _ in evidence.scheduled_opportunities
+            if lower < target <= result.report.receipt_mono_ns]
+        if len(members) != len(set(members)) or set(members) != durable:
+            raise ValueError('Incomplete durable research scheduler membership.')
         for opportunity_id, target_ns, disposition in evidence.scheduled_opportunities:
             row = self.store._one('SELECT * FROM recorder_events WHERE event_id=?', (opportunity_id,))
             detail = json.loads(row['detail_json']) if row is not None else {}
@@ -372,10 +400,52 @@ class Recorder:
                 raise ValueError('Invalid durable research anchor or origin.')
 
     def _persist_research(self, result):
+        if self.store._connection.in_transaction:
+            raise ValueError('Research publication requires transaction ownership.')
+        with self.store._transaction():
+            mapping, evidence, result = self._publish_research(result)
+        self._retain_research(mapping, evidence, result)
+
+    def _publish_research(self, result):
         from dataclasses import asdict, replace
         from decimal import Decimal
         import json
         opportunity_id, identity, attempts = self._research_pending
+        original = self.store._one('SELECT * FROM recorder_events WHERE event_id=?', (opportunity_id,))
+        authority = json.loads(original['detail_json']) if original is not None else {}
+        if (original is None or original['run_id'] != self.run_id
+                or authority.get('type') != 'APPROXIMATE_OPPORTUNITY'
+                or type(authority.get('version')) is not int or authority.get('version') != 2
+                or authority.get('run_id') != self.run_id
+                or authority.get('disposition') != 'submitted'
+                or any(type(authority[key]) is not int for key in
+                    ('slot_id', 'slot_index', 'target_ns', 'scheduled_us') if key in authority)
+                or any(authority.get(key) != identity.get(key) for key in
+                    ('market_id', 'slot_id', 'slot_index', 'target_ns', 'scheduled_us'))
+                or any(type(identity[key]) is not int for key in
+                    ('slot_id', 'slot_index', 'target_ns', 'scheduled_us') if key in identity)):
+            raise ValueError('Invalid original research submission identity.')
+        rows = self.store._rows('SELECT event_id FROM recorder_events WHERE event_id>=? ORDER BY event_id LIMIT 4097', (opportunity_id,))
+        if len(rows) > 4096:
+            raise ValueError('Research publication event bound exceeded.')
+        for row in self.store._rows("SELECT detail_json FROM recorder_events WHERE event_id>=? AND event_id<=? AND run_id=? "
+                "AND json_extract(detail_json,'$.type') IN ('APPROXIMATE_FETCH','APPROXIMATE_OPPORTUNITY_COMPLETION') "
+                "AND json_extract(detail_json,'$.opportunity_id')=? LIMIT 1",
+                (opportunity_id, rows[-1]['event_id'] if rows else opportunity_id, self.run_id, opportunity_id)):
+            detail = json.loads(row['detail_json'])
+            if (detail.get('type') in ('APPROXIMATE_FETCH', 'APPROXIMATE_OPPORTUNITY_COMPLETION')
+                    and detail.get('opportunity_id') == opportunity_id):
+                raise ValueError('Duplicate research publication.')
+        new_ids = result.evidence.observation_ids[-len(result.observations):]
+        outcomes = [row for row in result.evidence.request_outcomes if row[2] in new_ids]
+        if (len(new_ids) != 2 or len(outcomes) != 2
+                or {(op, name) for op, name, _, _, _ in outcomes} !=
+                    {(opportunity_id, 'coinbase'), (opportunity_id, 'kraken')}
+                or not {(opportunity_id, 'coinbase'), (opportunity_id, 'kraken')}.issubset(result.evidence.expected_requests)
+                or any(row.get('run_id') != self.run_id or row.get('opportunity_id') != opportunity_id
+                    or any(row.get(key) != identity.get(key) for key in
+                        ('market_id', 'slot_id', 'slot_index', 'target_ns', 'scheduled_us')) for row in attempts)):
+            raise ValueError('Invalid current research acquisition owner.')
         receipt_ns = result.report.receipt_mono_ns
         ends = tuple(sorted(set(result.evidence.discontinuity_ends_ns + tuple(
             end for end in self._research_evidence.discontinuity_ends_ns if end <= receipt_ns))))
@@ -440,6 +510,11 @@ class Recorder:
             detail=dict(type='APPROXIMATE_OPPORTUNITY_COMPLETION', version=2, run_id=self.run_id,
                 opportunity_id=opportunity_id, reference_id=reference_id,
                 completion_ns=result.completion_ns, disposition='completed', **identity))
+        return mapping, evidence, result
+
+    def _retain_research(self, mapping, evidence, result):
+        from dataclasses import replace
+        self._research_retention_ns = result.report.receipt_mono_ns
         self._research_mapping = mapping
         known = {row[0] for row in evidence.scheduled_opportunities}
         evidence = replace(evidence,
@@ -448,7 +523,8 @@ class Recorder:
             row for row in self._research_evidence.scheduled_opportunities if row[0] not in known))
         self._research_evidence = evidence
         cutoff = result.report.receipt_mono_ns - 60_000_000_000
-        keep_ops = {op for op, target, _ in evidence.scheduled_opportunities if target >= cutoff}
+        lower = max(evidence.sampling_origin_ns, cutoff) - 2_000_000_000
+        keep_ops = {op for op, target, _ in evidence.scheduled_opportunities if target > lower}
         keep_ops.update(op for op, _, _, ns, _ in evidence.request_outcomes if ns >= cutoff)
         keep_ids = {i for op, _, i, _, _ in evidence.request_outcomes if op in keep_ops}
         indices = [index for index, i in enumerate(evidence.observation_ids) if i in keep_ids]
@@ -463,9 +539,17 @@ class Recorder:
             raise ValueError('Research sampling session unavailable.')
         self.approximate_reference._research_observations = tuple(result.window_observations[i] for i in indices)
         self._research_mapping = {i: mapping[i] for i in keep_ids}
+        self._research_event_floor = min((row[0] for row in self._research_evidence.scheduled_opportunities),
+            default=self._research_session_event_id)
 
     def _approximate_submit(self, deadline_ns, **identity):
-        if self.approximate_worker is None or not self.clock.usable() or self.monotonic_ns() >= deadline_ns:
+        deadline_ns = min(deadline_ns, self.run_deadline_ns)
+        now_ns = self.monotonic_ns()
+        before_open = now_ns < identity.get('target_ns', now_ns)
+        if self.clock.usable() and 'scheduled_us' in identity:
+            before_open = before_open or now_ns < self.clock.deadline_ns(identity['scheduled_us'])
+            deadline_ns = min(deadline_ns, self.clock.deadline_ns(identity['scheduled_us'] + 2_000_000))
+        if self.approximate_worker is None or not self.clock.usable() or before_open or now_ns >= deadline_ns:
             if hasattr(self, '_research_evidence'):
                 self._research_opportunity(identity.get('target_ns', self.monotonic_ns()), 'unsubmitted',
                     **{k: v for k, v in identity.items() if k != 'target_ns'})
@@ -482,8 +566,11 @@ class Recorder:
             from dataclasses import replace
             target_ns = identity.get('target_ns', self.monotonic_ns())
             busy = self.approximate_worker._thread is not None
-            opportunity_id = self._research_opportunity(target_ns, 'busy' if busy else 'submitted', **{k: v for k, v in identity.items() if k != 'target_ns'})
-            if busy:
+            stopped = self.approximate_worker._stopped
+            opportunity_id = self._research_opportunity(target_ns,
+                'busy' if busy else 'unsubmitted' if stopped else 'submitted',
+                **{k: v for k, v in identity.items() if k != 'target_ns'})
+            if busy or stopped:
                 return False
             if session.sampling_origin_ns is None:
                 raise ValueError('Research sampling session has no origin.')
@@ -511,10 +598,16 @@ class Recorder:
                         validated_window_end_ns=receipt_ns if complete else None)
                 result = session.fetch_research(context=context, evidence=evidence, deadline=deadline, validate_evidence=validate)
                 for name, provider in session._providers.items():
-                    attempts.extend(dict(row, run_id=run_id, opportunity_id=opportunity_id, **identity)
+                    attempts.extend(dict(row, run_id=run_id, opportunity_id=opportunity_id, **dict(identity, target_ns=target_ns))
                         for row in getattr(provider, 'request_attempts', ()))
                 return result
-            return self.approximate_worker.submit(research_fetch)
+            accepted = self.approximate_worker.submit(research_fetch)
+            if not accepted:
+                self.store.record_event(self.run_id, 'DISCOVERY_GAP', started_us=self.wall_us(),
+                    detail=dict(type='APPROXIMATE_OPPORTUNITY_COMPLETION', version=2, run_id=self.run_id,
+                        opportunity_id=opportunity_id, disposition='interrupted', reason='WORKER_REJECTED',
+                        **dict(identity, target_ns=target_ns)))
+            return accepted
         def fetch():
             result = session.fetch(run_id=run_id, anchor_id=anchor_id, project=project, deadline=deadline)
             return None if result is None else (*result, anchor_id)
@@ -833,7 +926,7 @@ class Recorder:
             if self.run_id:
                 try:
                     self.store.recover_interrupted(wall_us=self.wall_us(), run_id=self.run_id,
-                                                   finish_runs=False, reason="STOP_REQUESTED")
+                        finish_runs=False, reason='STOP_REQUESTED', recover_research=False)
                     self._shutdown("STOPPED", "STOP_REQUESTED")
                 except (RecorderStoreError, sqlite3.DatabaseError, OSError) as exc:
                     original_error = exc
@@ -844,7 +937,7 @@ class Recorder:
             try:
                 if self.run_id:
                     self.store.recover_interrupted(wall_us=self.wall_us(), run_id=self.run_id,
-                                                   finish_runs=False, reason="KEYBOARD_INTERRUPT")
+                        finish_runs=False, reason='KEYBOARD_INTERRUPT', recover_research=False)
                     self._shutdown("INTERRUPTED", "KEYBOARD_INTERRUPT")
             except (RecorderStoreError, sqlite3.DatabaseError, OSError) as exc:
                 original_error = exc
@@ -893,6 +986,8 @@ class Recorder:
         if self.approximate_worker is not None:
             self.approximate_worker.stop()
             self._approximate_drain(stopping=True)
+        self.store.recover_interrupted(wall_us=self.wall_us(), run_id=self.run_id,
+            finish_runs=False, reason=reason)
         self.store.record_event(self.run_id, "SHUTDOWN", started_us=self.wall_us(),
                                 detail={"reason": reason})
         self.store.finish_run(self.run_id, state=state, wall_us=self.wall_us(), reason=reason)
@@ -994,7 +1089,7 @@ class Recorder:
             grid = slot_grid(start_us)
             for index in selection.missed:
                 if hasattr(self, '_research_evidence'):
-                    self._research_opportunity(self.clock.deadline_ns(grid[index].scheduled_us), 'skipped',
+                    self._research_opportunity(self._nominal_target_ns(grid[index].scheduled_us), 'skipped',
                         market_id=market.market_id, slot_index=index, scheduled_us=grid[index].scheduled_us,
                         reason=self.miss_reason)
                 self.store.mark_missed(market.market_id, grid[index], run_id=self.run_id,
@@ -1013,7 +1108,7 @@ class Recorder:
                     continue
                 self._wait(self.clock.deadline_ns(end_us))
                 continue
-            target_ns = self.clock.deadline_ns(target.scheduled_us)
+            target_ns = self._nominal_target_ns(target.scheduled_us)
             timing = getattr(self, '_timing', None)
             if timing is not None:
                 timing('SELECTION', target_ns=target_ns, slot_index=target.index, market_id=market.market_id)
@@ -1021,8 +1116,9 @@ class Recorder:
             if (self.revision is None or self.revision.market.market_id != market.market_id
                     or not self.clock.usable()):
                 continue
-            target_ns = self.clock.deadline_ns(target.scheduled_us)
-            self._wait(target_ns)
+            if config.mode != 'APPROXIMATE_REFERENCE':
+                target_ns = self.clock.deadline_ns(target.scheduled_us)
+            self._wait(max(target_ns, self.clock.deadline_ns(target.scheduled_us)))
             if should_stop():
                 break
             if not self.clock.usable():

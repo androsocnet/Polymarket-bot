@@ -270,9 +270,19 @@ class RecorderStore:
     @contextmanager
     def _transaction(self):
         self._check_writer()
+        if self._connection.in_transaction:
+            try:
+                yield
+            except BaseException as exc:
+                self._transaction_error = exc
+                raise
+            return
+        self._transaction_error = None
         try:
             self._connection.execute("BEGIN IMMEDIATE")
             yield
+            if self._transaction_error is not None:
+                raise self._transaction_error
             self._connection.commit()
         except sqlite3.DatabaseError as exc:
             self._write_failed = True
@@ -1242,7 +1252,7 @@ and (fetch.attempt.path == '/ws/v1' or association.target_us <= fetch.received_s
                     self._insert("request_attempts", values)
 
     def recover_interrupted(self, *, wall_us: int, run_id: str | None = None,
-                            finish_runs: bool = True, reason: str = "RESTART_RECOVERY") -> None:
+                            finish_runs: bool = True, reason: str = "RESTART_RECOVERY", recover_research: bool = True) -> None:
         """Finalize old reservations without projecting across monotonic epochs."""
         self._check_writer()
         _integer(wall_us, "recovery_wall_us")
@@ -1270,6 +1280,21 @@ and (fetch.attempt.path == '/ws/v1' or association.target_us <= fetch.received_s
                     WHERE slot_id=?""", (wall_us, reason, slot["slot_id"]))
                 self._connection.execute("UPDATE recording_runs SET last_committed_wall_us=? WHERE run_id=?",
                                          (wall_us, slot["run_id"]))
+            events = self._rows('SELECT event_id,run_id,detail_json FROM recorder_events'
+                + (' WHERE run_id=?' if run_id is not None else ''), (run_id,) if run_id is not None else ())
+            terminal = {(row['run_id'], detail.get('opportunity_id')) for row in events
+                for detail in (json.loads(row['detail_json']),)
+                if detail.get('type') == 'APPROXIMATE_OPPORTUNITY_COMPLETION'}
+            for row in events:
+                detail = json.loads(row['detail_json'])
+                if (recover_research and detail.get('type') == 'APPROXIMATE_OPPORTUNITY' and detail.get('version') == 2
+                        and detail.get('disposition') == 'submitted'
+                        and (row['run_id'], row['event_id']) not in terminal):
+                    self.record_event(row['run_id'], 'DISCOVERY_GAP', started_us=wall_us,
+                        detail=dict(type='APPROXIMATE_OPPORTUNITY_COMPLETION', version=2,
+                            run_id=row['run_id'], opportunity_id=row['event_id'],
+                            disposition='interrupted', reason=reason,
+                            **{key: detail[key] for key in ('market_id', 'slot_id', 'slot_index', 'target_ns', 'scheduled_us') if key in detail}))
             if finish_runs:
                 self._connection.execute("""UPDATE recording_runs SET state='INTERRUPTED',ended_wall_us=?,
                     exit_reason=? WHERE state='RUNNING'""" + (" AND run_id=?" if run_id is not None else ""),
