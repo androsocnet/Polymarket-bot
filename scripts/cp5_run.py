@@ -72,17 +72,14 @@ class CP5Recorder(Recorder):
         retained = {event['attempt'] for event in tuple(getattr(self, '_audit_events', ()))}
         persisted.intersection_update(retained)
 
+    def _final_persistence(self):
+        self._flush_audit()
+        self._flush_timing()
+
     def _approximate_drain(self, **kwargs):
         result = super()._approximate_drain(**kwargs)
         self._flush_audit()
         return result
-
-    def _shutdown(self, state, reason):
-        try:
-            self._flush_audit()
-            self._flush_timing()
-        finally:
-            super()._shutdown(state, reason)
 
     def _housekeeping(self, target_ns, **kwargs):
         if len(getattr(self, '_timing_buffer', [])) >= 64:
@@ -210,6 +207,9 @@ class AuditTransport(httpx.BaseTransport):
             event.update(capture(request))
         event.update(complete=False, stream_closed=False, set_cookie_present=False)
         try:
+            guard = request.extensions.get('send_guard')
+            if guard is not None:
+                guard()
             response = self.inner.handle_request(request)
             event.update(status=response.status_code, redirect=300 <= response.status_code < 400,
                 response_header_presence=sorted(response.headers.keys()),
@@ -266,14 +266,57 @@ def supervise(command, timeout):
         elapsed_seconds=time.monotonic() - started, stdout=stdout, stderr=stderr)
 
 
-def child(path, seconds):
+def phase_verdict(supervisor, evidence):
+    if supervisor.get('watchdog_killed') or supervisor.get('returncode') != 0:
+        return dict(verdict='FAIL', reason='SUPERVISOR_FAILURE')
+    if supervisor.get('stderr'):
+        return dict(verdict='FAIL', reason='UNEXPECTED_STDERR')
+    if evidence.get('result', {}).get('reason') == 'opening_blocked':
+        return dict(verdict='BLOCKED', reason='PREPARATION_UNAVAILABLE')
+    valid = (evidence.get('result', {}).get('state') == 'STOPPED'
+        and evidence.get('result', {}).get('exit_code') == 0
+        and evidence.get('integrity') in ([('ok',)], [['ok']]) and not evidence.get('foreign_keys')
+        and evidence.get('user_version') == 2 and evidence.get('writer_reacquired')
+        and evidence.get('client_closed') and evidence.get('transport_closed')
+        and not evidence.get('worker_active') and not evidence.get('remaining_threads')
+        and evidence.get('intended_phase', {}).get('verdict') == 'PASS')
+    return dict(verdict='PASS' if valid else 'FAIL', reason='INTENDED_PHASE_EVIDENCE')
+
+
+def opening_plan(mode, *, now):
+    import math
+    if mode not in ('rollover', 'pilot'):
+        raise ValueError('CP5 opening mode required')
+    boundary = math.ceil((now+60)/900)*900
+    start = boundary-60
+    wait = start-now
+    if not 0 <= wait <= 900:
+        raise ValueError('CP5 opening alignment exceeds bound')
+    return dict(mode=mode, boundary=boundary, start=start, wait=wait,
+        seconds=70 if mode == 'rollover' else 1200,
+        supervisor=1015 if mode == 'rollover' else 2145)
+
+
+def child(path, seconds, *, mode=None, intended_boundary=None, wait_evidence=None):
     from polymarket_bot.market_data.http import PublicGet
     from polymarket_bot.recorder.free_reference import ApproximateReferenceSession, CoinbaseRestProvider, KrakenRestProvider
     from polymarket_bot.recorder.models import RunConfig
     from polymarket_bot.recorder.service import Recorder
     from polymarket_bot.recorder.store import RecorderStore
-    if path.exists() or path.name == 'cp5_smoke.sqlite3' or seconds not in (120, 1200):
+    if (path.exists() or path.name == 'cp5_smoke.sqlite3'
+            or (mode is None and seconds not in (120, 1200))
+            or (mode is not None and (mode not in ('rollover', 'pilot')
+                or seconds != (70 if mode == 'rollover' else 1200)
+                or type(intended_boundary) is not int or intended_boundary % 900 != 0))):
         raise ValueError('CP5 requires new bounded database')
+    acquisition_start_ns = time.monotonic_ns()
+    fixed_deadline_ns = acquisition_start_ns+seconds*1_000_000_000
+    if mode is not None:
+        assert isinstance(intended_boundary, int)
+        if time.time() >= intended_boundary-22:
+            raise ValueError('CP5 BLOCKED: intended preparation admission missed')
+        fixed_deadline_ns = min(fixed_deadline_ns,
+            acquisition_start_ns+round((intended_boundary+(10 if mode == 'rollover' else 1140)-time.time())*1e9))
     from collections import deque
     events = deque(maxlen=4096)
     transport = AuditTransport(httpx.HTTPTransport(retries=0, trust_env=False), events.append)
@@ -291,6 +334,11 @@ def child(path, seconds):
         recorder = CP5Recorder(store, public, monotonic_ns=time.monotonic_ns,
             wall_us=wall_us, sleep=time.sleep, approximate_reference=session)
         recorder._audit_events = events
+        recorder.opening_wait_evidence = wait_evidence
+        recorder.intended_boundary_us = intended_boundary*1_000_000 if isinstance(intended_boundary, int) else None
+        if mode is not None:
+            assert isinstance(intended_boundary, int)
+            recorder.intended_end_us = (intended_boundary+(10 if mode == 'rollover' else 1140))*1_000_000
         def capture_identity(request):
             identity = dict(getattr(recorder, '_book_identity', {})) if request.url.path in ('/book', '/books') else {}
             if request.url.path == '/book' and recorder.revision is not None:
@@ -303,8 +351,9 @@ def child(path, seconds):
                 identity['provider'] = 'coinbase' if request.url.host == 'api.exchange.coinbase.com' else 'kraken'
             return dict(identity, run_id=recorder.run_id, version=2)
         transport.capture_identity = capture_identity
+
         result = recorder.run(RunConfig(mode='APPROXIMATE_REFERENCE'), should_stop=lambda: False,
-            deadline_ns=time.monotonic_ns() + seconds * 1_000_000_000)
+            deadline_ns=fixed_deadline_ns)
     finally:
         active = recorder is not None and recorder.approximate_worker is not None and recorder.approximate_worker._thread is not None and recorder.approximate_worker._thread.is_alive()
         try:
@@ -335,19 +384,63 @@ def child(path, seconds):
         transport_closed=transport.closed, worker_active=active,
         remaining_threads=[thread.name for thread in threading.enumerate() if thread is not threading.main_thread()],
         writer_reacquired=True)
+    if mode is not None:
+        assert isinstance(intended_boundary, int)
+        from cp5_analyze import analyze_db, intended_phase
+        with closing(sqlite3.connect(path.resolve().as_uri()+'?mode=ro', uri=True)) as connection:
+            connection.row_factory = sqlite3.Row
+            markets = [dict(row) for row in connection.execute('SELECT * FROM markets')]
+            slots = [dict(row) for row in connection.execute('SELECT * FROM sample_slots')]
+            trace = [dict(json.loads(row['detail_json']), run_id=row['run_id'])
+                for row in connection.execute('SELECT * FROM recorder_events')]
+        evidence['intended_phase'] = intended_phase(analyze_db(path), markets, slots, trace,
+            intended_boundary*1_000_000, mode)
     print(json.dumps(evidence))
+    return evidence
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--db', type=Path, required=True)
-    parser.add_argument('--seconds', type=int, choices=(120, 1200), required=True)
+    parser.add_argument('--seconds', type=int, required=True)
+    parser.add_argument('--mode', choices=('rollover', 'pilot'))
+    parser.add_argument('--intended-boundary', type=int)
     parser.add_argument('--child', action='store_true')
+    parser.add_argument('--aligned-child', action='store_true')
     args = parser.parse_args()
-    if args.child:
-        child(args.db, args.seconds)
+    if args.child or args.aligned_child:
+        wait_evidence = None
+        if args.aligned_child:
+            wait_started = time.time()
+            delay = args.intended_boundary-60-wait_started
+            if not 0 <= delay <= 900:
+                raise ValueError('CP5 BLOCKED: alignment window missed')
+            time.sleep(delay)
+            wait_evidence = dict(intended_boundary=args.intended_boundary,
+                wait_started=wait_started, wait_ended=time.time(), wait_end_ns=time.monotonic_ns())
+            print(json.dumps(wait_evidence), flush=True)
+        child(args.db, args.seconds, mode=args.mode, intended_boundary=args.intended_boundary, wait_evidence=wait_evidence)
+    elif args.mode is not None:
+        plan = opening_plan(args.mode, now=time.time())
+        if args.seconds != plan['seconds'] or args.db.exists():
+            raise ValueError('CP5 fixed duration/new database required')
+        print(json.dumps(plan), flush=True)
+        supervised = supervise([sys.executable, __file__, '--aligned-child', '--db', str(args.db),
+            '--seconds', str(args.seconds), '--mode', args.mode,
+            '--intended-boundary', str(plan['boundary'])], plan['supervisor'])
+        evidence = {}
+        for line in str(supervised['stdout']).splitlines():
+            try:
+                decoded = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(decoded, dict) and 'result' in decoded:
+                evidence = decoded
+        decision = phase_verdict(supervised, evidence)
+        print(json.dumps(dict(supervisor=supervised, **decision)))
+        sys.exit(0 if decision['verdict'] == 'PASS' else 2 if decision['verdict'] == 'BLOCKED' else 1)
     else:
-        if args.seconds == 1200:
-            print(json.dumps({'alignment_wait_seconds': align()}), flush=True)
+        if args.seconds not in (120, 1200):
+            raise ValueError('CP5 ordinary duration rejected')
         print(json.dumps(supervise([sys.executable, __file__, '--child', '--db', str(args.db),
             '--seconds', str(args.seconds)], args.seconds + 45)))

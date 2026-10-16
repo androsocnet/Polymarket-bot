@@ -22,6 +22,30 @@ class StoreTests(unittest.TestCase):
         self.run = self.store.start_run(models.RunConfig(), wall_us=NOW_US, app_revision="task5-test")
         seed_writer_market(self.store, self.run)
 
+    def test_prepared_complete_event_json_boundary(self):
+        from typing import Any, cast
+        from polymarket_bot.market_data.models import MarketDataError
+        run_id = cast(Any, self).run
+        for event_type in ('PREPARED_ARM', 'PREPARED_ACTIVATION'):
+            for delta in (-1, 0, 1):
+                with self.subTest(event_type=event_type, delta=delta):
+                    detail: dict[str, Any] = dict(type=event_type, identity=['2002', '1002'], boundary_us=900000000,
+                        event=dict(description=''), list_evidence=[dict(sha256='a'*64, bytes=1689540, complete=True)])
+                    size = len(json.dumps(detail, sort_keys=True, separators=(',', ':'), allow_nan=False).encode())
+                    detail['event']['description'] = 'x'*(1_048_576-size+delta)
+                    count = len(self.rows('recorder_events'))
+                    if delta > 0:
+                        with self.assertRaises(MarketDataError) as caught:
+                            self.store.record_event(run_id, 'DISCOVERY_GAP', started_us=NOW_US, detail=detail)
+                        self.assertEqual(caught.exception.reason, 'EVIDENCE_BOUND_EXCEEDED')
+                        self.assertEqual(len(self.rows('recorder_events')), count)
+                        self.assertFalse(self.store._write_failed)
+                    else:
+                        event_id = self.store.record_event(run_id, 'DISCOVERY_GAP', started_us=NOW_US, detail=detail)
+                        saved = self.store._one('SELECT length(CAST(detail_json AS BLOB)) AS bytes FROM recorder_events WHERE event_id=?', (event_id,))
+                        assert saved is not None
+                        self.assertEqual(saved['bytes'], 1_048_576+delta)
+
     def rows(self, table, where="", params=()):
         cursor = self.store._connection.execute(f"SELECT * FROM {table} {where}", params)
         keys = [column[0] for column in cursor.description]

@@ -18,6 +18,75 @@ class RecorderBoundaryTests(unittest.TestCase):
         return client, PublicGet(client, monotonic=clock.monotonic, sleep=clock.sleep,
                                  utcnow=clock.utcnow, max_attempts=1)
 
+    def test_provider_final_guard_rechecks_shifted_active_window(self):
+        from polymarket_bot.recorder.free_reference import CoinbaseRestProvider, KrakenRestProvider
+        for cls in (CoinbaseRestProvider, KrakenRestProvider):
+            sends = []
+            allowed = [True]
+            with httpx.Client(transport=httpx.MockTransport(lambda request: sends.append(request) or
+                    httpx.Response(200, json={})), event_hooks={'request': [lambda request: allowed.__setitem__(0, False)]}) as client:
+                provider = cls(client, monotonic_ns=lambda: 0, wall_us=lambda: 0, sleep=lambda seconds: None)
+                def guard():
+                    if not allowed[0]:
+                        raise httpx.TimeoutException('active window closed')
+                provider.before_attempt = guard
+                provider.fetch_ticker(deadline=1)
+            self.assertEqual(sends, [])
+
+    def test_provider_hook_delay_cannot_send_after_deadline(self):
+        from polymarket_bot.recorder.free_reference import CoinbaseRestProvider, KrakenRestProvider
+        for cls in (CoinbaseRestProvider, KrakenRestProvider):
+            clock = FakeClock()
+            sends = []
+            with httpx.Client(transport=httpx.MockTransport(lambda request: sends.append(request) or
+                    httpx.Response(200, json={})), event_hooks={'request':[lambda request: clock.advance(2)]}) as client:
+                provider = cls(client, monotonic_ns=lambda: round(clock.value*1e9), wall_us=lambda: 0, sleep=clock.sleep)
+                provider.fetch_ticker(deadline=1)
+            self.assertEqual(sends, [])
+
+    def test_after_guard_hook_cannot_send_at_exclusive_end(self):
+        clock = FakeClock()
+        sends = []
+        def guard():
+            if clock.value >= 2:
+                raise MarketDataError('capture_window_closed', 'closed')
+        with httpx.Client(transport=httpx.MockTransport(lambda request: sends.append(request) or
+                httpx.Response(200, stream=httpx.ByteStream(b'[]'))),
+                event_hooks={'request':[lambda request: clock.advance(2)]}) as client:
+            public = PublicGet(client, monotonic=clock.monotonic, sleep=clock.sleep,
+                utcnow=clock.utcnow, before_attempt=guard)
+            try:
+                public.get_books((TOKEN_UP, TOKEN_DOWN), deadline=10)
+            except MarketDataError:
+                pass
+        self.assertEqual(sends, [])
+
+    def test_actual_book_guard_rechecks_both_targets_and_exclusive_end(self):
+        from polymarket_bot.recorder.service import Recorder
+        self.assertTrue(callable(getattr(Recorder, '_guard_book_attempt', None)))
+        from types import SimpleNamespace
+        sends = []
+        now = [10]
+        client, public = self.reader(lambda request: sends.append(request) or
+            httpx.Response(200, stream=httpx.ByteStream(b'[]')))
+        try:
+            from typing import Any, cast
+            recorder = cast(Any, object.__new__(Recorder))
+            recorder.monotonic_ns = lambda: now[0]
+            recorder.run_deadline_ns = 30
+            recorder.clock = SimpleNamespace(usable=lambda: True, deadline_ns=lambda us: us)
+            recorder._book_guard = (12, 15, 25)
+            public.before_attempt = recorder._guard_book_attempt
+            for moment in (10, 12, 14, 25, 30):
+                now[0] = moment
+                with self.assertRaises(MarketDataError):
+                    public.get_books((TOKEN_UP, TOKEN_DOWN), deadline=10)
+            now[0] = 15
+            public.get_books((TOKEN_UP, TOKEN_DOWN), deadline=10)
+            self.assertEqual(len(sends), 1)
+        finally:
+            client.close()
+
     def test_only_named_public_post_is_reachable(self):
         requests = []
         def respond(request):

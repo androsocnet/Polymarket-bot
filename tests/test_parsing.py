@@ -5,6 +5,29 @@ from polymarket_bot.market_data.models import MarketDataError
 from decimal import Decimal
 
 class ParsingTests(unittest.TestCase):
+    def test_explicit_future_start_preserves_actual_now_validation(self):
+        import inspect
+        from typing import Any, cast
+        parse_market = cast(Any, __import__('polymarket_bot.market_data.parsing', fromlist=['parse_market']).parse_market)
+        self.assertIn('expected_start', inspect.signature(parse_market).parameters)
+        start = NOW + timedelta(minutes=10)
+        market = make_market(eventStartTime=start.isoformat(),
+                             endDate=(start+timedelta(seconds=900)).isoformat())
+        self.assertIsNone(parse_market(make_event(), market, now=NOW))
+        self.assertIsNotNone(parse_market(make_event(), market, now=NOW, expected_start=start))
+        for expected, actual in ((start, start), (start, start+timedelta(seconds=1)),
+                                 (start.replace(tzinfo=None), NOW),
+                                 (start+timedelta(seconds=1), NOW)):
+            with self.subTest(expected=expected, actual=actual):
+                self.assertIsNone(parse_market(make_event(), market, now=actual, expected_start=expected))
+        for patch in ({'endDate': (start+timedelta(seconds=901)).isoformat()},
+                      {'slug': 'btc-updown-15m-1'}):
+            self.assertIsNone(parse_market(make_event(), dict(market, **patch), now=NOW, expected_start=start))
+        for patch in ({'outcomes': '["Up","Up"]'}, {'clobTokenIds': '["1","1"]'},
+                      {'eventStartTime': start.replace(tzinfo=None).isoformat()}):
+            with self.assertRaises(MarketDataError):
+                parse_market(make_event(), dict(market, **patch), now=NOW, expected_start=start)
+
     def test_reversed_outcomes_preserve_exact_token_mapping(self):
         market = make_market(outcomes='["Down", "Up"]')
         result = parse_market(make_event(), market, now=NOW)

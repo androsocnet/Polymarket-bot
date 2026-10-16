@@ -5,6 +5,330 @@ import unittest
 
 
 class CP5SafetyTests(unittest.TestCase):
+    def test_normal_reference_final_audit_after_join(self):
+        import json
+        import sqlite3
+        import tempfile
+        import threading
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from polymarket_bot.recorder.models import RunConfig
+        from polymarket_bot.recorder.store import RecorderStore
+        for state, reason in (('STOPPED', 'STOP_REQUESTED'), ('INTERRUPTED', 'KEYBOARD_INTERRUPT')):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory)/'normal.sqlite3'
+                recorder = cast(Any, object.__new__(self.harness().CP5Recorder))
+                recorder.store = RecorderStore.open(path)
+                recorder.run_id = recorder.store.start_run(RunConfig(), wall_us=1, app_revision='offline')
+                recorder.wall_us = recorder.monotonic_ns = lambda: 2
+                recorder.approximate_worker = None
+                recorder._reference_drain = lambda **kwargs: None
+                recorder._audit_events = [dict(attempt=1, started_wall_us=1)]
+                release = threading.Event()
+                def complete():
+                    release.wait(2)
+                    recorder._audit_events.append(dict(attempt=2, started_wall_us=2))
+                thread = threading.Thread(target=complete)
+                thread.start()
+                def stop():
+                    release.set()
+                    thread.join(2)
+                    self.assertFalse(thread.is_alive())
+                recorder.reference_worker = SimpleNamespace(stop=stop)
+                try:
+                    with patch('polymarket_bot.recorder.service.take_checkpoint'):
+                        recorder._shutdown(state, reason)
+                finally:
+                    stop()
+                    recorder.store.close()
+                connection = sqlite3.connect(path.resolve().as_uri()+'?mode=ro', uri=True)
+                try:
+                    details = [json.loads(row[0]) for row in connection.execute('SELECT detail_json FROM recorder_events')]
+                finally:
+                    connection.close()
+                self.assertEqual([row['attempt'] for row in details if row.get('type') == 'ACTUAL_SEND_ATTEMPT'], [1, 2])
+
+    def test_normal_audit_failure_never_finishes(self):
+        from unittest.mock import Mock, patch
+        recorder = cast(Any, object.__new__(self.harness().CP5Recorder))
+        recorder.store = Mock(_write_failed=False)
+        recorder.run_id = 'run'
+        recorder.wall_us = lambda: 1
+        recorder.reference_worker = Mock()
+        recorder.approximate_worker = None
+        recorder._reference_drain = Mock()
+        recorder._flush_audit = Mock(side_effect=OSError('audit failed'))
+        with patch('polymarket_bot.recorder.service.take_checkpoint') as checkpoint:
+            with self.assertRaisesRegex(OSError, 'audit failed'):
+                recorder._shutdown('STOPPED', 'STOP_REQUESTED')
+        recorder.reference_worker.stop.assert_called_once_with()
+        recorder.store.finish_run.assert_not_called()
+        recorder.store.recover_interrupted.assert_not_called()
+        checkpoint.assert_not_called()
+
+    def test_exceptional_final_audit_real_store(self):
+        import json
+        import sqlite3
+        import tempfile
+        from types import SimpleNamespace
+        from polymarket_bot.market_data.models import MarketDataError
+        from polymarket_bot.recorder.models import RunConfig
+        from polymarket_bot.recorder.store import RecorderStore
+        for reason in ('opening_blocked', 'invalid_metadata', 'transport_error'):
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / 'audit.sqlite3'
+                recorder = cast(Any, object.__new__(self.harness().CP5Recorder))
+                recorder.store = RecorderStore.open_approximate(path)
+                recorder.run_id = recorder.store.start_run(RunConfig(mode='APPROXIMATE_REFERENCE'),
+                    wall_us=1, app_revision='offline')
+                recorder.finalized = 0
+                recorder.public = SimpleNamespace(max_attempts=2, before_attempt=None)
+                recorder.reference_worker = recorder.approximate_worker = None
+                recorder.wall_us = lambda: 2
+                recorder.monotonic_ns = lambda: 2
+                recorder._audit_events = [dict(attempt=1, started_wall_us=1, path='/time')]
+                import threading
+                from types import SimpleNamespace
+                ready = threading.Event()
+                release = threading.Event()
+                def complete():
+                    ready.set()
+                    release.wait(2)
+                    recorder._audit_events.append(dict(attempt=2, started_wall_us=2, path='/time'))
+                thread = threading.Thread(target=complete)
+                thread.start()
+                self.assertTrue(ready.wait(2))
+                def stop():
+                    release.set()
+                    thread.join(2)
+                    self.assertFalse(thread.is_alive())
+                recorder.approximate_worker = SimpleNamespace(_thread=thread, stop=stop)
+                def record(config, **kwargs):
+                    raise MarketDataError(reason, 'Offline failure.')
+                recorder._record = record
+                result = recorder._execute_started_run(RunConfig(mode='BOOK_ONLY'), should_stop=lambda: False)
+                self.assertEqual(result.reason, reason)
+                connection = sqlite3.connect(path.resolve().as_uri()+'?mode=ro', uri=True)
+                try:
+                    events = [json.loads(row[0]) for row in connection.execute(
+                        "SELECT detail_json FROM recorder_events WHERE kind='DISCOVERY_GAP'")]
+                finally:
+                    connection.close()
+                self.assertEqual([event['attempt'] for event in events
+                    if event.get('type') == 'ACTUAL_SEND_ATTEMPT'], [1, 2])
+                recorder._flush_audit()
+
+    def test_failed_writer_metadata_exit_reports_persistence_failure(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        from polymarket_bot.market_data.models import MarketDataError
+        from polymarket_bot.recorder.models import RunConfig
+        recorder = cast(Any, object.__new__(self.harness().CP5Recorder))
+        recorder.store = Mock(_write_failed=True)
+        recorder.run_id, recorder.finalized = 'run', 0
+        recorder.public = SimpleNamespace(max_attempts=2, before_attempt=None)
+        recorder.reference_worker = recorder.approximate_worker = None
+        recorder._record = Mock(side_effect=MarketDataError('opening_blocked', 'Offline.'))
+        recorder._flush_audit = Mock()
+        result = recorder._execute_started_run(RunConfig(mode='BOOK_ONLY'), should_stop=lambda: False)
+        self.assertEqual((result.exit_code, result.reason), (1, 'audit_persistence_failed'))
+        recorder._flush_audit.assert_not_called()
+        recorder.store.recover_interrupted.assert_not_called()
+        recorder.store.close.assert_called_once_with()
+
+    def test_writer_failure_never_flushes_audit(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        from polymarket_bot.recorder.models import RunConfig
+        from polymarket_bot.recorder.store import RecorderStoreError
+        recorder = cast(Any, object.__new__(self.harness().CP5Recorder))
+        recorder.store = Mock(_write_failed=True)
+        recorder.run_id, recorder.finalized = 'run', 0
+        recorder.public = SimpleNamespace(max_attempts=2, before_attempt=None)
+        recorder.reference_worker = recorder.approximate_worker = None
+        recorder._record = Mock(side_effect=RecorderStoreError('fatal_invariant', 'Offline.'))
+        recorder._flush_audit = Mock()
+        result = recorder._execute_started_run(RunConfig(mode='BOOK_ONLY'), should_stop=lambda: False)
+        self.assertEqual(result.reason, 'fatal_invariant')
+        recorder._flush_audit.assert_not_called()
+        recorder.store.finish_run.assert_not_called()
+        recorder.store.recover_interrupted.assert_not_called()
+        recorder.store.close.assert_called_once_with()
+
+    def test_exceptional_audit_flush_failure_closes_store(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        from polymarket_bot.market_data.models import MarketDataError
+        from polymarket_bot.recorder.models import RunConfig
+        recorder = cast(Any, object.__new__(self.harness().CP5Recorder))
+        recorder.store = Mock(_write_failed=False)
+        recorder.run_id, recorder.finalized = 'run', 0
+        recorder.public = SimpleNamespace(max_attempts=2, before_attempt=None)
+        recorder.reference_worker = None
+        recorder.approximate_worker = Mock()
+        recorder.approximate_worker._thread = None
+        recorder.wall_us = lambda: 1
+        recorder._record = Mock(side_effect=MarketDataError('opening_blocked', 'Offline.'))
+        recorder._flush_audit = Mock(side_effect=OSError('audit persistence failed'))
+        with self.assertRaisesRegex(OSError, 'audit persistence failed'):
+            recorder._execute_started_run(RunConfig(mode='BOOK_ONLY'), should_stop=lambda: False)
+        recorder.store.close.assert_called_once_with()
+        recorder.store.finish_run.assert_not_called()
+        self.assertGreaterEqual(recorder.approximate_worker.stop.call_count, 1)
+
+    def test_metadata_phase_deadline_at_final_send(self):
+        import httpx
+        from datetime import datetime, timezone
+        from polymarket_bot.market_data.http import PublicGet
+        from polymarket_bot.market_data.models import MarketDataError
+        module = self.harness()
+        for delay_at in ('hook', 'capture', 'retry'):
+            for end in (9.999, 10.0, 11.0):
+                with self.subTest(delay_at=delay_at, end=end):
+                    now = [0.0]
+                    sends, events, guards = [], [], []
+                    def send(request):
+                        sends.append(now[0])
+                        return httpx.Response(503 if delay_at == 'retry' and len(sends) == 1 else 200,
+                            stream=httpx.ByteStream(b'{}'))
+                    def advance(request):
+                        if delay_at != 'retry' or sends:
+                            now[0] = end
+                    transport = module.AuditTransport(httpx.MockTransport(send), events.append)
+                    if delay_at == 'capture':
+                        def capture(request):
+                            advance(request)
+                            return {}
+                        transport.capture_identity = capture
+                    with httpx.Client(transport=transport, trust_env=False,
+                            event_hooks={'request': [] if delay_at == 'capture' else [advance]}) as client:
+                        public = PublicGet(client, monotonic=lambda: now[0], sleep=lambda _: None,
+                            utcnow=lambda: datetime(2026, 10, 16, tzinfo=timezone.utc),
+                            max_attempts=2, before_attempt=lambda: guards.append(now[0]))
+                        if end < 10:
+                            self.assertEqual(public.get_json('gamma', '/events', deadline=10).payload, {})
+                        else:
+                            with self.assertRaises(MarketDataError):
+                                public.get_json('gamma', '/events', deadline=10)
+                    self.assertEqual(sends, ([0.0] if delay_at == 'retry' else []) +
+                        ([end] if end < 10 else []))
+                    self.assertTrue(guards)
+                    if delay_at == 'capture' and end >= 10:
+                        self.assertEqual(events[-1]['error'], 'MarketDataError')
+
+    def test_phase_verdict_rejects_stderr_and_preserves_evidence(self):
+        import copy
+        module = self.harness()
+        evidence = dict(result=dict(state='STOPPED', exit_code=0), integrity=[['ok']],
+            foreign_keys=[], user_version=2, writer_reacquired=True, client_closed=True,
+            transport_closed=True, worker_active=False, remaining_threads=[],
+            intended_phase=dict(verdict='PASS'))
+        supervisor = dict(watchdog_killed=False, returncode=0, stderr='')
+        self.assertEqual(module.phase_verdict(supervisor, evidence)['verdict'], 'PASS')
+        for stderr in ('unexpected diagnostic', ' ', '\n'):
+            supervisor['stderr'] = stderr
+            before = copy.deepcopy((supervisor, evidence))
+            self.assertEqual(module.phase_verdict(supervisor, evidence),
+                dict(verdict='FAIL', reason='UNEXPECTED_STDERR'))
+            self.assertEqual((supervisor, evidence), before)
+
+    def test_opening_cli_orchestration_fixed_bounds_and_watchdog(self):
+        import json
+        import runpy
+        import subprocess
+        import sys
+        from unittest.mock import Mock, patch
+        script = str(Path(__file__).parents[1]/'scripts'/'cp5_run.py')
+        for mode, seconds, timeout in (('rollover', 70, 1015), ('pilot', 1200, 2145)):
+            process = Mock(returncode=-9)
+            process.communicate.side_effect = [subprocess.TimeoutExpired('child', timeout), ('', '')]
+            args = [script, '--db', 'offline_unused_task8.sqlite3', '--seconds', str(seconds), '--mode', mode]
+            with patch.object(sys, 'argv', args), patch('subprocess.Popen', return_value=process) as launch, \
+                    patch('time.time', return_value=840), patch('builtins.print'), self.assertRaises(SystemExit) as stopped:
+                runpy.run_path(script, run_name='__main__')
+            self.assertEqual(stopped.exception.code, 1)
+            self.assertEqual(process.communicate.call_args_list[0].kwargs, {'timeout': timeout})
+            self.assertEqual(process.communicate.call_args_list[1].kwargs, {'timeout': 15})
+            process.kill.assert_called_once()
+            command = launch.call_args.args[0]
+            self.assertIn('--aligned-child', command)
+            self.assertEqual(command[command.index('--intended-boundary')+1], '900')
+            self.assertEqual(command[command.index('--seconds')+1], str(seconds))
+        args = [script, '--aligned-child', '--db', 'offline_unused_task8.sqlite3', '--seconds', '70',
+            '--mode', 'rollover', '--intended-boundary', '900']
+        with patch.object(sys, 'argv', args), patch('time.time', side_effect=[0, 879, 879]), \
+                patch('time.sleep') as sleep, patch('builtins.print'), self.assertRaisesRegex(ValueError, 'admission missed'):
+            runpy.run_path(script, run_name='__main__')
+        sleep.assert_called_once_with(840)
+        with patch.object(sys, 'argv', args), patch('time.time', side_effect=[-60, 879, 879]), \
+                patch('time.sleep') as sleep, patch('builtins.print'), self.assertRaisesRegex(ValueError, 'admission missed'):
+            runpy.run_path(script, run_name='__main__')
+        sleep.assert_called_once_with(900)
+        with patch.object(sys, 'argv', args), patch('time.time', return_value=-60.001), \
+                patch('time.sleep') as sleep, patch('builtins.print'), self.assertRaisesRegex(ValueError, 'alignment window missed'):
+            runpy.run_path(script, run_name='__main__')
+        sleep.assert_not_called()
+
+    def test_audit_identity_delay_rechecks_final_send_guard(self):
+        import httpx
+        module = self.harness()
+        sends, events = [], []
+        now = [0]
+        transport = module.AuditTransport(httpx.MockTransport(lambda request:
+            sends.append(request) or httpx.Response(200)), events.append)
+        def capture(request):
+            now[0] = 2
+            return {}
+        def guard():
+            if now[0] >= 2:
+                raise httpx.TimeoutException('closed')
+        transport.capture_identity = capture
+        with httpx.Client(transport=transport) as client:
+            with self.assertRaises(httpx.TimeoutException):
+                client.send(httpx.Request('GET', 'https://clob.polymarket.com/time',
+                    extensions={'send_guard': guard}))
+        self.assertEqual(sends, [])
+
+    def test_intended_pilot_requires_unique_grid_and_matching_arm(self):
+        import copy
+        module = self.analyzer()
+        boundary = 900_000_000
+        markets = [dict(market_id='m', window_start_us=boundary, window_end_us=boundary+900_000_000)]
+        slots = [dict(market_id='m', run_id='r', slot_index=i, status='COMPLETE',
+            scheduled_us=boundary+i*2_000_000) for i in range(450)]
+        events = [dict(type='PREPARED_ARM', boundary_us=boundary, run_id='r', armed_ns=-2_000_000,
+            target_ns=0), dict(type='PREPARED_ACTIVATION', boundary_us=boundary, run_id='r',
+            target_ns=0, active_target_ns=0, activated_ns=0)]
+        events += [dict(type='ACTUAL_SEND_ATTEMPT', market_id='m', run_id='r', path='/books',
+            slot_index=i, started_mono_ns=i*2_000_000_000) for i in range(5)]
+        summary = dict(integrity=['ok'], foreign_keys=[], user_version=2, isolation={}, replay={'exact':True},
+            pilot_causal_availability={'windows':[dict(run_id='r', market_id='m', verdict='PASS')]})
+        self.assertEqual(module.intended_phase(summary, markets, slots, events, boundary, 'pilot')['verdict'], 'PASS')
+        for fault in ('duplicate', 'schedule', 'arm_run'):
+            ledger, trace = copy.deepcopy((slots, events))
+            if fault == 'duplicate': ledger[-1] = dict(ledger[-2])
+            if fault == 'schedule': ledger[20]['scheduled_us'] = boundary+20*2_000_000+1
+            if fault == 'arm_run': trace[0]['run_id'] = 'other'
+            with self.subTest(fault=fault):
+                self.assertEqual(module.intended_phase(summary, markets, ledger, trace, boundary, 'pilot')['verdict'], 'FAIL')
+
+    def test_intended_phase_rejects_other_market_and_missing_arm(self):
+        module = self.analyzer()
+        self.assertTrue(callable(getattr(module, 'intended_phase', None)))
+        summary = dict(integrity=['ok'], foreign_keys=[], user_version=2,
+            isolation={}, replay={'exact':True}, runs=[{'run_id':'r','state':'STOPPED'}],
+            pilot_causal_availability={'windows':[{'run_id':'r','market_id':'other','verdict':'PASS'}]})
+        self.assertEqual(module.intended_phase(summary, [], [], [], 900_000_000, 'pilot')['verdict'], 'FAIL')
+
+    def test_phase_verdict_kill_failure_and_unavailable(self):
+        module = self.harness()
+        self.assertTrue(callable(getattr(module, 'phase_verdict', None)))
+        self.assertEqual(module.phase_verdict({'watchdog_killed':True,'returncode':0}, {})['verdict'], 'FAIL')
+        self.assertEqual(module.phase_verdict({'watchdog_killed':False,'returncode':2}, {})['verdict'], 'FAIL')
+        evidence = {'result':{'reason':'opening_blocked'}}
+        self.assertEqual(module.phase_verdict({'watchdog_killed':False,'returncode':0}, evidence)['verdict'], 'BLOCKED')
+        self.assertEqual(module.phase_verdict({'watchdog_killed':False,'returncode':0}, {})['verdict'], 'FAIL')
+
     def gate_fixture(self, count=15) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         reports = [dict(reference_id=i + 1, run_id='r', revision=2, opportunity_id=i + 1,
             receipt_mono_ns=60_000_000_000 + i * 2_000_000_000,
@@ -861,6 +1185,21 @@ class CP5SafetyTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 module.child(Path(directory) / 'new.sqlite3', 120)
         store.close.assert_called_once()
+
+    def test_opening_runner_fixed_boundary_and_bounds(self):
+        module = self.harness()
+        self.assertTrue(callable(getattr(module, 'opening_plan', None)))
+        for mode, seconds, timeout in (('rollover', 70, 1015), ('pilot', 1200, 2145)):
+            plan = module.opening_plan(mode, now=901)
+            self.assertEqual((plan['boundary'], plan['start'], plan['wait']), (1800, 1740, 839))
+            self.assertEqual((plan['seconds'], plan['supervisor']), (seconds, timeout))
+            self.assertLessEqual(plan['wait'], 900)
+        with self.assertRaises(ValueError):
+            module.opening_plan('smoke', now=901)
+        with self.assertRaises(ValueError):
+            module.child(Path('never-created.sqlite3'), 70)
+        with self.assertRaises(ValueError):
+            module.child(Path('never-created.sqlite3'), 1200, mode='pilot', intended_boundary=1)
 
     def test_alignment_wait_bounded(self):
         module = self.harness()

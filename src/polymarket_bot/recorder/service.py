@@ -1,14 +1,16 @@
 """Single-owner, fixed-cadence recorder coordinator."""
 from datetime import datetime, timedelta, timezone
 import sqlite3
-from typing import Callable
+
+import httpx
+from typing import Any, Callable
 
 from polymarket_bot.market_data.gamma import GammaClient
 from polymarket_bot.market_data.models import MarketDataError
 from polymarket_bot.market_data.http import PublicGet
 from .books import collect_books
 from .clock import RecorderClock
-from .metadata import acquire_market, refresh_revision
+from .metadata import acquire_market, refresh_revision, acquire_next_market, revalidate_prepared, _identity
 from .metrics import take_checkpoint
 from .models import RunConfig, RunResult, SlotCommit
 from .reference import disabled_reference
@@ -125,6 +127,12 @@ def _epoch_us(value):
 
 
 class Recorder:
+    _prepared: dict[str, Any] | None = None
+    _preparation_phase: tuple | None = None
+    intended_boundary_us: int | None = None
+    intended_end_us: int | None = None
+    opening_wait_evidence: dict | None = None
+
     def __init__(self, store: RecorderStore, public: PublicGet, *,
                  monotonic_ns: Callable[[], int], wall_us: Callable[[], int],
                  sleep: Callable[[float], None], offline_reference=None,
@@ -582,6 +590,16 @@ class Recorder:
             attempts = []
             self._research_pending = (opportunity_id, dict(identity, target_ns=target_ns), attempts)
             def research_fetch():
+                def admit():
+                    now = self.monotonic_ns()
+                    scheduled = identity.get('scheduled_us')
+                    if (not self.clock.usable() or getattr(self, '_capture_stop_requested', lambda: False)()
+                            or now < target_ns or now >= min(deadline_ns, self.run_deadline_ns)
+                            or (scheduled is not None and (now < self.clock.deadline_ns(scheduled)
+                                or now >= self.clock.deadline_ns(scheduled+2_000_000)))):
+                        raise httpx.TimeoutException('Provider active acquisition window closed')
+                for provider in session._providers.values():
+                    provider.before_attempt = admit
                 def validate(accumulated, receipt_ns):
                     known = {row[0] for row in accumulated.scheduled_opportunities}
                     extra = tuple(row for row in self._research_evidence.scheduled_opportunities if row[0] not in known)
@@ -687,8 +705,10 @@ class Recorder:
                     self.store._connection.execute('UPDATE reference_feeds SET verified_us=? WHERE feed_id=?',
                         (verified, CHAINLINK_FEED_ID))
                 self.offline_reference.discovery_verified_us = verified
+        self._cap_intended_end()
         self.next_clock_ns = anchor.midpoint_ns + 60_000_000_000
         if anchor.status == "DISCONTINUITY":
+            self._prepared = self._armed_opening = None
             self._discontinuity_end_ns = anchor.request_end_mono_ns
             if hasattr(self, '_research_evidence'):
                 from dataclasses import replace
@@ -719,6 +739,9 @@ class Recorder:
 
     def _housekeeping(self, target_ns, *, before_boundary=False):
         """Serial logical jobs share the writer and stop at the armed target."""
+        prepared = getattr(self, '_prepared', None)
+        if prepared is not None and prepared['armed_ns'] is not None:
+            return
         deadline_ns = min(target_ns - 1_000_000, self.run_deadline_ns)
         if self.monotonic_ns() >= deadline_ns:
             return
@@ -772,6 +795,190 @@ class Recorder:
             return
         self._reconcile(deadline_ns)
 
+    def _cap_intended_end(self):
+        end = getattr(self, 'intended_end_us', None)
+        if end is not None and self.clock.usable():
+            previous = self.run_deadline_ns
+            calibrated = self.clock.deadline_ns(end)
+            self.run_deadline_ns = min(previous, calibrated)
+            decision = (previous, calibrated, self.run_deadline_ns)
+            if decision != getattr(self, '_endpoint_decision', None):
+                self.store.record_event(self.run_id, 'DISCOVERY_GAP', started_us=self.wall_us(),
+                    detail=dict(type='INTENDED_ENDPOINT', diagnostic_only=True, run_id=self.run_id,
+                        intended_end_us=end, previous_deadline_ns=previous,
+                        calibrated_endpoint_ns=calibrated, effective_deadline_ns=self.run_deadline_ns,
+                        decided_ns=self.monotonic_ns()))
+                self._endpoint_decision = decision
+
+    def _guard_book_attempt(self):
+        guard = getattr(self, '_book_guard', None)
+        if guard is None:
+            return
+        nominal, scheduled_us, end_us = guard
+        now = self.monotonic_ns()
+        if (not self.clock.usable() or now < nominal or now < self.clock.deadline_ns(scheduled_us)
+                or now >= min(self.run_deadline_ns, self.clock.deadline_ns(end_us))):
+            raise MarketDataError('capture_window_closed', 'Book attempt outside armed slot bounds.')
+
+    def _check_opening_deadline(self):
+        intended = getattr(self, 'intended_boundary_us', None)
+        if intended is None or not self.clock.usable():
+            return
+        if self.revision is not None and _epoch_us(self.revision.market.window_start) == intended:
+            return
+        prepared = getattr(self, '_prepared', None)
+        if self._now() >= intended-1000 and (prepared is None or prepared['armed_ns'] is None):
+            raise MarketDataError('opening_blocked', 'Intended successor unavailable before arming cutoff.')
+
+    def _preparation_wake_ns(self, boundary_us):
+        phase = getattr(self, '_preparation_phase', None)
+        stage = phase[1] if phase else 'NEW'
+        lead = 30_000_000 if stage == 'NEW' else 12_000_000 if stage == 'PREPARED' else 0
+        wake = self.clock.deadline_ns(boundary_us-lead)
+        if wake <= self.monotonic_ns():
+            wake = self.clock.deadline_ns(boundary_us)
+        return min(self.run_deadline_ns, wake)
+
+    def _phase_trace(self, phase, reason, boundary, started_ns, deadline_ns, *, failure_reason=None):
+        self.store.record_event(self.run_id, 'DISCOVERY_GAP', started_us=self.wall_us(),
+            detail=dict(type='PREPARATION_PHASE', diagnostic_only=True, run_id=self.run_id, phase=phase, reason=reason,
+                failure_reason=failure_reason, boundary_us=boundary, started_ns=started_ns, ended_ns=self.monotonic_ns(),
+                deadline_ns=deadline_ns, run_deadline_ns=self.run_deadline_ns,
+                active_target_ns=self.clock.deadline_ns(boundary) if self.clock.usable() else None,
+                nominal_target_ns=self._nominal_target_ns(boundary) if self.clock.usable() else None))
+
+    def _prepare_next(self, deadline_ns: int) -> None:
+        if self.revision is None or not self.clock.usable():
+            self._prepared = None
+            return
+        previous = self.revision
+        boundary = _epoch_us(previous.market.window_end)
+        intended = getattr(self, 'intended_boundary_us', None)
+        if intended is not None and boundary != intended:
+            if _epoch_us(previous.market.window_start) == intended:
+                return
+            self._prepared = None
+            raise MarketDataError('opening_blocked', 'Calibrated predecessor does not own intended boundary.')
+        owner = (self.run_id, previous.market.event_id, _identity(previous))
+        phase = getattr(self, '_preparation_phase', None)
+        if phase is None or phase[0] != owner:
+            self._prepared = None
+            self._preparation_phase = (owner, 'NEW')
+        now = self._now()
+        assert self._preparation_phase is not None
+        stage = self._preparation_phase[1]
+        if stage == 'NEW' and now >= boundary-30_000_000:
+            self._preparation_phase = (owner, 'FAILED')
+            phase_start = self.monotonic_ns()
+            phase_end = phase_start+10_000_000_000
+            self._phase_trace(stage, 'START', boundary, phase_start, phase_end)
+            if phase_end > deadline_ns:
+                self._phase_trace(stage, 'INSUFFICIENT_RUN_BUDGET', boundary, phase_start, phase_end)
+                self._prepared = None
+                return
+            if phase_end > self.clock.deadline_ns(boundary-12_000_000):
+                self._phase_trace(stage, 'MISSED_ADMISSION', boundary, phase_start, phase_end)
+                return
+            try:
+                candidate = self._control(lambda: acquire_next_market(previous, self.gamma, self.public,
+                    clock=self.clock, deadline=phase_end/1e9))
+            except MarketDataError as exc:
+                self._phase_trace(stage, exc.code, boundary, phase_start, phase_end, failure_reason=exc.reason)
+                return
+            if self.monotonic_ns() >= phase_end:
+                self._phase_trace(stage, 'LATE_COMPLETION', boundary, phase_start, phase_end)
+                return
+            if (not self.clock.usable() or self.revision is not previous
+                    or candidate.market.market_id in self.invalidated):
+                self._phase_trace(stage, 'REJECTED_COMPLETION', boundary, phase_start, phase_end)
+                return
+            self._phase_trace(stage, 'COMPLETE', boundary, phase_start, phase_end)
+            self._prepared = dict(revision=candidate, owner=owner, prepared_ns=self.monotonic_ns(),
+                                  armed_ns=None, target_ns=self._nominal_target_ns(boundary), boundary=boundary)
+            self._preparation_phase = (owner, 'PREPARED')
+            stage = 'PREPARED'
+        if stage == 'PREPARED' and self._now() >= boundary-12_000_000:
+            self._preparation_phase = (owner, 'FAILED')
+            prepared, self._prepared = self._prepared, None
+            phase_start = self.monotonic_ns()
+            phase_end = phase_start+10_000_000_000
+            self._phase_trace(stage, 'START', boundary, phase_start, phase_end)
+            if phase_end > deadline_ns:
+                self._phase_trace(stage, 'INSUFFICIENT_RUN_BUDGET', boundary, phase_start, phase_end)
+                self._prepared = None
+                return
+            cutoff = self.clock.deadline_ns(boundary)-1_000_000
+            if prepared is None or phase_end > cutoff:
+                self._phase_trace(stage, 'MISSED_CUTOFF', boundary, phase_start, phase_end)
+                return
+            try:
+                candidate = self._control(lambda: revalidate_prepared(previous, prepared['revision'],
+                    self.gamma, self.public, clock=self.clock, deadline=phase_end/1e9))
+            except MarketDataError as exc:
+                self._phase_trace(stage, exc.code, boundary, phase_start, phase_end, failure_reason=exc.reason)
+                return
+            if self.monotonic_ns() >= min(phase_end, cutoff):
+                self._phase_trace(stage, 'LATE_COMPLETION', boundary, phase_start, phase_end)
+                return
+            if (not self.clock.usable() or self.revision is not previous
+                    or candidate.market.market_id in self.invalidated):
+                self._phase_trace(stage, 'REJECTED_COMPLETION', boundary, phase_start, phase_end)
+                return
+            self._phase_trace(stage, 'COMPLETE', boundary, phase_start, phase_end)
+            prepared.update(revision=candidate, armed_ns=self.monotonic_ns(), validated_ns=self.monotonic_ns())
+            self.store.record_event(self.run_id, 'DISCOVERY_GAP', started_us=self._now(),
+                detail=dict(type='PREPARED_ARM', boundary_us=boundary, predecessor=previous.market.market_id,
+                    identity=tuple(value.isoformat() if isinstance(value, datetime) else value
+                        for value in (candidate.market.event_id, *_identity(candidate))),
+                    prepared_ns=prepared['prepared_ns'], validated_ns=prepared['validated_ns'],
+                    armed_ns=prepared['armed_ns'], target_ns=prepared['target_ns'],
+                    active_target_ns=self.clock.deadline_ns(boundary), phase_deadline_ns=phase_end,
+                    cutoff_ns=cutoff, event=candidate.market.metadata.get('prepared_event'),
+                    list_evidence=candidate.market.metadata.get('prepared_list_evidence')))
+            self._prepared = prepared
+            self._preparation_phase = (owner, 'ARMED')
+
+    def _activate_prepared(self) -> bool:
+        prepared = getattr(self, '_prepared', None)
+        if prepared is None or prepared['armed_ns'] is None:
+            return False
+        if not self.clock.usable() or self.revision is None:
+            self._prepared = None
+            return False
+        previous = self.revision
+        candidate = prepared['revision']
+        boundary = prepared['boundary']
+        owner = (self.run_id, previous.market.event_id, _identity(previous))
+        if (owner != prepared['owner'] or not candidate.capture_ready
+                or previous.market.market_id in self.invalidated or candidate.market.market_id in self.invalidated
+                or prepared['armed_ns'] >= prepared['target_ns']-1_000_000):
+            self._prepared = None
+            return False
+        now_ns, now = self.monotonic_ns(), self._now()
+        if now_ns < prepared['target_ns'] or now < boundary:
+            return False
+        self._prepared = None
+        if now >= boundary+2_000_000 or now_ns >= self.run_deadline_ns:
+            return False
+        with self.store._transaction():
+            revision_id = self.store.save_market_revision(self.run_id, candidate)
+            self._save_boundary_plans(candidate)
+            self.store.expire_market(previous.market.market_id, observed_us=now)
+            self.store.record_event(self.run_id, 'DISCOVERY_GAP', started_us=now,
+                market_id=candidate.market.market_id, detail=dict(type='PREPARED_ACTIVATION',
+                    predecessor=previous.market.market_id, boundary_us=boundary,
+                    prepared_ns=prepared['prepared_ns'], validated_ns=prepared['validated_ns'],
+                    armed_ns=prepared['armed_ns'], target_ns=prepared['target_ns'], activated_ns=now_ns,
+                    active_target_ns=self.clock.deadline_ns(boundary),
+                    event=candidate.market.metadata.get('prepared_event'),
+                    list_evidence=candidate.market.metadata.get('prepared_list_evidence')))
+            if self.discovery_gap_id is not None:
+                self.store.finish_discovery_gap(self.discovery_gap_id, run_id=self.run_id, ended_us=now)
+        self.discovery_gap_id = None
+        self.revision, self.revision_id = candidate, revision_id
+        self._armed_opening = (candidate.market.market_id, prepared['target_ns'])
+        return True
+
     def _checkpoint_due(self, target_ns=None):
         """Admit hourly work only in a transaction gap with armed-target budget.
 
@@ -787,6 +994,12 @@ class Recorder:
         self.next_checkpoint_ns = self.monotonic_ns()+3_600_000_000_000
 
     def _save_revision(self, candidate):
+        previous = getattr(self, 'revision', None)
+        if previous is not None and candidate != previous:
+            self._prepared = self._armed_opening = None
+            phase = getattr(self, '_preparation_phase', None)
+            if phase is not None:
+                self._preparation_phase = (phase[0], 'FAILED')
         try:
             revision_id = self.store.save_market_revision(self.run_id, candidate)
         except RecorderStoreError as exc:
@@ -807,6 +1020,10 @@ class Recorder:
                     "time_domain": "SERVER" if server_time_available else "LOCAL_WALL"})
             return False
         self.revision, self.revision_id = candidate, revision_id
+        self._save_boundary_plans(candidate)
+        return True
+
+    def _save_boundary_plans(self, candidate):
         if self.reference_worker is not None:
             from .reference import boundary_reference
             market = candidate.market
@@ -849,6 +1066,7 @@ class Recorder:
         self.run_deadline_ns = deadline_ns if deadline_ns is not None else 2**63 - 1
         requested_stop = should_stop
         should_stop = lambda: self.monotonic_ns() >= self.run_deadline_ns or requested_stop()
+        self._capture_stop_requested = should_stop
         self.run_id, self.finalized = "", 0
         try:
             return self._execute_run(config, should_stop=should_stop)
@@ -919,6 +1137,7 @@ class Recorder:
         def stop_guard():
             if should_stop():
                 raise _StopRequested
+            self._guard_book_attempt()
         self.public.before_attempt = stop_guard
         try:
             return self._record(config, should_stop=should_stop)
@@ -951,8 +1170,15 @@ class Recorder:
                              exc.code if isinstance(exc, RecorderStoreError) else "storage_failure")
         except MarketDataError as exc:
             original_error = exc
+            if self.run_id and self.store._write_failed:
+                return RunResult(self.run_id, 'FAILED', 1, self.finalized, 'audit_persistence_failed')
             if self.run_id and not self.store._write_failed:
                 self.store.recover_interrupted(wall_us=self.wall_us(), run_id=self.run_id, finish_runs=False)
+                if self.reference_worker is not None:
+                    self.reference_worker.stop()
+                if self.approximate_worker is not None:
+                    self.approximate_worker.stop()
+                self._final_persistence()
                 self.store.finish_run(self.run_id, state='FAILED', wall_us=self.wall_us(), reason=exc.code)
             return RunResult(self.run_id, 'FAILED', 2, self.finalized, exc.code)
         finally:
@@ -979,13 +1205,18 @@ class Recorder:
                         if worker is None or worker._thread is None or not worker._thread.is_alive():
                             self.store.close()
 
+    def _final_persistence(self):
+        pass
+
     def _shutdown(self, state, reason):
+        self._prepared = self._armed_opening = None
         if self.reference_worker is not None:
             self.reference_worker.stop()
             self._reference_drain(stopping=True)
         if self.approximate_worker is not None:
             self.approximate_worker.stop()
             self._approximate_drain(stopping=True)
+        self._final_persistence()
         self.store.recover_interrupted(wall_us=self.wall_us(), run_id=self.run_id,
             finish_runs=False, reason=reason)
         self.store.record_event(self.run_id, "SHUTDOWN", started_us=self.wall_us(),
@@ -1007,6 +1238,7 @@ class Recorder:
     def _record(self, config, *, should_stop):
         self.config = config
         self.revalidate = False
+        self._prepared = self._preparation_phase = self._armed_opening = None
         previous_wall_us, self.known_markets = self.store.restart_context()
         self.invalidated = {row["market_id"] for row in self.known_markets if row["lifecycle"] == "INVALIDATED"}
         self.store.recover_interrupted(wall_us=self.wall_us())
@@ -1016,6 +1248,10 @@ class Recorder:
         take_checkpoint(self.store,run_id=self.run_id,wall_us=self.wall_us())
         self.next_checkpoint_ns = self.monotonic_ns()+3_600_000_000_000
         self.store.record_event(self.run_id, "STARTUP", started_us=self.wall_us())
+        wait_evidence = self.opening_wait_evidence
+        if wait_evidence is not None:
+            self.store.record_event(self.run_id, 'DISCOVERY_GAP', started_us=self.wall_us(),
+                detail=dict(type='OPENING_WAIT', diagnostic_only=True, run_id=self.run_id, **wait_evidence))
         from .free_reference import ApproximateReferenceSession
         if isinstance(self.approximate_reference, ApproximateReferenceSession):
             self._research_start()
@@ -1034,6 +1270,7 @@ class Recorder:
         self.discovery_gap_id = None
         self.discovery_gap_start = None
         while not should_stop():
+            self._check_opening_deadline()
             if self.reference_worker is not None:
                 health = getattr(self.offline_reference, 'check_health', None)
                 if health is not None:
@@ -1041,6 +1278,7 @@ class Recorder:
             if self.revision is None or not self.clock.usable():
                 self._checkpoint_due()
             if not self.clock.usable():
+                self._prepared = self._armed_opening = None
                 self.miss_reason = "CLOCK_PAUSE" if self.clock.anchor else "BEFORE_START"
                 if self.monotonic_ns() < self.next_clock_ns:
                     self._wait(self.next_clock_ns)
@@ -1080,12 +1318,20 @@ class Recorder:
                     continue
                 if self._save_revision(candidate):
                     self._finish_discovery_gap(candidate.observed_us)
+            self._prepare_next(self.run_deadline_ns)
+            self._activate_prepared()
             market = self.revision.market
             start_us = _epoch_us(market.window_start)
             end_us = _epoch_us(market.window_end)
             now = self._now()
-            selection = select_future_slot(market, now_us=now,
-                terminal_indices=self.store.covered_indices(market.market_id))
+            opening = getattr(self, '_armed_opening', None)
+            if opening is not None and opening[0] == market.market_id:
+                from .models import SlotSelection, SlotTarget
+                self._armed_opening = None
+                selection = SlotSelection((), SlotTarget(0, start_us))
+            else:
+                selection = select_future_slot(market, now_us=now,
+                    terminal_indices=self.store.covered_indices(market.market_id))
             grid = slot_grid(start_us)
             for index in selection.missed:
                 if hasattr(self, '_research_evidence'):
@@ -1103,16 +1349,22 @@ class Recorder:
                 continue
             target = selection.target
             if target is None:
-                self._housekeeping(self.clock.deadline_ns(end_us), before_boundary=True)
+                prepared = getattr(self, '_prepared', None)
+                if prepared is not None and prepared['armed_ns'] is not None:
+                    self._wait(max(prepared['target_ns'], self.clock.deadline_ns(end_us)))
+                    continue
+                control_ns = self._preparation_wake_ns(end_us)
+                self._housekeeping(control_ns, before_boundary=control_ns == self.clock.deadline_ns(end_us))
                 if self.revision is None or not self.clock.usable():
                     continue
-                self._wait(self.clock.deadline_ns(end_us))
+                self._wait(self._preparation_wake_ns(end_us))
                 continue
             target_ns = self._nominal_target_ns(target.scheduled_us)
             timing = getattr(self, '_timing', None)
             if timing is not None:
                 timing('SELECTION', target_ns=target_ns, slot_index=target.index, market_id=market.market_id)
-            self._housekeeping(target_ns)
+            if target.index != 0 or opening is None:
+                self._housekeeping(target_ns)
             if (self.revision is None or self.revision.market.market_id != market.market_id
                     or not self.clock.usable()):
                 continue
@@ -1164,11 +1416,13 @@ class Recorder:
             try:
                 if timing is not None:
                     timing('DISPATCH_READY', slot_id=slot_id, slot_index=target.index, target_ns=target_ns)
+                self._book_guard = (target_ns, target.scheduled_us, min(target.scheduled_us+2_000_000, end_us))
                 books = collect_books(self.public, market,
                     deadline=min(self.run_deadline_ns, self.clock.deadline_ns(min(target.scheduled_us+2_000_000, end_us)))/1_000_000_000,
                     receipt_server_us=lambda moment: project(round(moment*1_000_000_000)),
                     uncertainty_us=self.clock.anchor.uncertainty_us)
             finally:
+                self._book_guard = None
                 self.public.on_attempt = previous
             ended_ns = self.monotonic_ns()
             if hasattr(self, '_research_evidence'):

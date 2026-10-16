@@ -9,6 +9,28 @@ class MarketDataError(Exception):
         super().__init__(message)
         self.code, self.http_status, self.market = code, http_status, market
 
+    @property
+    def reason(self) -> str:
+        from json import JSONDecodeError
+        cause: BaseException | None = self
+        numeric = False
+        while cause is not None:
+            if isinstance(cause, (JSONDecodeError, UnicodeDecodeError)):
+                return 'JSON_DECODE_ERROR'
+            numeric = numeric or isinstance(cause, MarketDataError) and cause.code == 'invalid_numeric'
+            cause = cause.__cause__
+        if numeric:
+            return 'NUMERIC_PARSE_ERROR'
+        if self.code == 'transport_error' and str(self) == 'Response exceeds 10 MiB.':
+            return 'RESPONSE_TOO_LARGE'
+        if self.code == 'no_next_market':
+            return 'NO_VALID_SUCCESSOR'
+        if self.code == 'ambiguous_market':
+            return 'AMBIGUOUS_SUCCESSOR'
+        if str(self) == 'Successor event evidence exceeds bound.':
+            return 'EVIDENCE_BOUND_EXCEEDED'
+        return 'EVENT_SCHEMA_INVALID' if self.code == 'invalid_metadata' else self.code
+
 @dataclass(frozen=True)
 class TokenOutcome:
     label: str

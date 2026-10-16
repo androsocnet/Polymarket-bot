@@ -921,8 +921,12 @@ and (fetch.attempt.path == '/ws/v1' or association.target_us <= fetch.received_s
             _integer(ended_us, "ended_us")
             _require(ended_us >= started_us, "Recorder event end precedes its start.")
         _require(kind in ("STARTUP", "SHUTDOWN", "RESTART", "DISCOVERY_GAP",
-                          "CLOCK_PAUSE", "IDENTITY_CONFLICT", "STORAGE_FAILURE")
+                        "CLOCK_PAUSE", "IDENTITY_CONFLICT", "STORAGE_FAILURE")
                  and type(detail) is dict, "Invalid recorder event.")
+        payload = _json(detail)
+        if detail.get('type') in ('PREPARED_ARM', 'PREPARED_ACTIVATION') and len(payload.encode()) > 1_048_576:
+            from polymarket_bot.market_data.models import MarketDataError
+            raise MarketDataError('invalid_metadata', 'Successor event evidence exceeds bound.')
         with self._transaction():
             self._run(run_id)
             if market_id is not None:

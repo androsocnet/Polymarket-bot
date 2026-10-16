@@ -1,6 +1,6 @@
 """Strict normalization of Gamma's current BTC market metadata."""
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from .models import MarketDataError, MarketDescriptor, TokenOutcome
 from .numeric import load_numeric_json, parse_decimal, parse_integer
 
@@ -51,7 +51,8 @@ def is_btc_family(event: dict[str, object], market: dict[str, object]) -> bool:
              isinstance(market.get("question"), str) and
              bool(re.search(r"\bup\s+or\s+down\b", market["question"], re.I))))
 
-def parse_market(event: dict[str, object], market: dict[str, object], *, now: datetime) -> MarketDescriptor | None:
+def parse_market(event: dict[str, object], market: dict[str, object], *, now: datetime,
+                 expected_start: datetime | None = None) -> MarketDescriptor | None:
     if not is_btc_family(event, market):
         return None
     for row in (event, market):
@@ -60,7 +61,15 @@ def parse_market(event: dict[str, object], market: dict[str, object], *, now: da
         if type(row.get("active")) is not bool or type(row.get("closed")) is not bool:
             raise _invalid("Event/market active and closed flags must be booleans.")
     start, end = _time(market.get("eventStartTime"), "eventStartTime"), _time(market.get("endDate"), "endDate")
-    if (end-start).total_seconds() != 900 or not start <= now < end:
+    if (end-start).total_seconds() != 900:
+        return None
+    if expected_start is None:
+        if not start <= now < end:
+            return None
+    elif (expected_start.tzinfo is None or expected_start.utcoffset() is None
+          or expected_start.utcoffset() != timedelta(0)
+          or now.tzinfo is None or now.utcoffset() is None
+          or not now < expected_start or start != expected_start):
         return None
     for row in (event, market):
         slug = row.get("slug", "")

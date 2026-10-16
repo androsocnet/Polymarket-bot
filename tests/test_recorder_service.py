@@ -3,6 +3,7 @@ import json
 import sqlite3
 import unittest
 from unittest.mock import patch
+from typing import Any, cast
 
 import httpx
 
@@ -13,6 +14,458 @@ from polymarket_bot.recorder.store import RecorderStore, RecorderStoreError
 
 
 class RecorderServiceTests(unittest.TestCase):
+    def test_failed_preparation_has_durable_phase_trace(self):
+        from polymarket_bot.recorder.service import Recorder
+        from polymarket_bot.recorder.metadata import acquire_market
+        from polymarket_bot.market_data.models import MarketDataError
+        fixture = self.fixture(offset_us=570_000_000)
+        recorder = cast(Any, Recorder(fixture.store, fixture.public, monotonic_ns=fixture.monotonic_ns,
+            wall_us=fixture.wall_us, sleep=fixture.sleep))
+        recorder.run_id = fixture.store.start_run(RunConfig(), wall_us=fixture.wall_us(), app_revision='test')
+        recorder.run_deadline_ns = fixture.monotonic_ns()+100_000_000_000
+        recorder.config = RunConfig()
+        recorder._calibrate(fixture.monotonic()+10)
+        recorder.revision = acquire_market(recorder.gamma, recorder.public, clock=recorder.clock,
+            deadline=fixture.monotonic()+10, use_fast_path=False)
+        with patch('polymarket_bot.recorder.service.acquire_next_market', side_effect=MarketDataError('no_next_market','none')):
+            recorder._prepare_next(recorder.run_deadline_ns)
+        trace = [json.loads(row['detail_json']) for row in fixture.store._rows('SELECT detail_json FROM recorder_events')]
+        failed = [row for row in trace if row.get('type') == 'PREPARATION_PHASE' and row.get('reason') == 'no_next_market']
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0].get('failure_reason'), 'NO_VALID_SUCCESSOR')
+        self.assertIn('deadline_ns', failed[0])
+        self.assertIn('active_target_ns', failed[0])
+        from json import JSONDecodeError
+        failures = [('invalid_metadata', 'schema', 'EVENT_SCHEMA_INVALID'),
+            ('invalid_metadata', 'Successor event evidence exceeds bound.', 'EVIDENCE_BOUND_EXCEEDED'),
+            ('ambiguous_market', 'none', 'AMBIGUOUS_SUCCESSOR'),
+            ('transport_error', 'Response exceeds 10 MiB.', 'RESPONSE_TOO_LARGE'),
+            ('invalid_numeric', 'numeric', 'NUMERIC_PARSE_ERROR'),
+            ('invalid_metadata', 'json', 'JSON_DECODE_ERROR')]
+        for code, message, expected in failures:
+            with self.subTest(expected=expected):
+                recorder._preparation_phase = None
+                error = MarketDataError(code, message)
+                if message == 'json':
+                    error.__cause__ = JSONDecodeError('invalid', '', 0)
+                with patch('polymarket_bot.recorder.service.acquire_next_market', side_effect=error):
+                    recorder._prepare_next(recorder.run_deadline_ns)
+                saved = json.loads(fixture.store._rows(
+                    'SELECT detail_json FROM recorder_events ORDER BY event_id DESC LIMIT 1')[0]['detail_json'])
+                self.assertEqual(saved['reason'], code)
+                self.assertEqual(saved['failure_reason'], expected)
+                self.assertNotIn('message', saved)
+        recorder._preparation_phase = None
+        def late(*args, **kwargs):
+            fixture.advance(10)
+            return recorder.revision
+        with patch('polymarket_bot.recorder.service.acquire_next_market', side_effect=late):
+            recorder._prepare_next(recorder.run_deadline_ns)
+        trace = [json.loads(row['detail_json']) for row in fixture.store._rows('SELECT detail_json FROM recorder_events')]
+        reasons = [row['reason'] for row in trace if row.get('type') == 'PREPARATION_PHASE']
+        self.assertIn('LATE_COMPLETION', reasons)
+        self.assertNotIn('COMPLETE', reasons)
+
+    def test_calibrated_endpoint_never_extends_fixed_deadline(self):
+        from polymarket_bot.recorder.service import Recorder
+        self.assertTrue(callable(getattr(Recorder, '_cap_intended_end', None)))
+        from types import SimpleNamespace
+        recorder = cast(Any, object.__new__(Recorder))
+        events = []
+        recorder.store = SimpleNamespace(record_event=lambda *args, **kwargs: events.append(kwargs['detail']))
+        recorder.run_id = 'r'
+        recorder.wall_us = lambda: 0
+        recorder.monotonic_ns = lambda: 0
+        recorder.intended_end_us = 910_000_000
+        recorder.run_deadline_ns = 75_000_000_000
+        recorder.clock = SimpleNamespace(usable=lambda: True, deadline_ns=lambda us: (us-855_000_000)*1000)
+        recorder._cap_intended_end()
+        self.assertEqual(recorder.run_deadline_ns, 55_000_000_000)
+        recorder.clock.deadline_ns = lambda us: 80_000_000_000
+        recorder._cap_intended_end()
+        self.assertEqual(recorder.run_deadline_ns, 55_000_000_000)
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[0]['previous_deadline_ns'], 75_000_000_000)
+        self.assertEqual(events[1]['calibrated_endpoint_ns'], 80_000_000_000)
+        self.assertEqual(events[1]['effective_deadline_ns'], 55_000_000_000)
+
+    def test_predecessor_revision_change_discards_preparation(self):
+        from dataclasses import replace
+        from polymarket_bot.recorder.service import Recorder
+        from polymarket_bot.recorder.metadata import acquire_market
+        fixture = self.fixture()
+        recorder = cast(Any, Recorder(fixture.store, fixture.public, monotonic_ns=fixture.monotonic_ns,
+            wall_us=fixture.wall_us, sleep=fixture.sleep))
+        recorder.run_deadline_ns = fixture.monotonic_ns()+100_000_000_000
+        recorder.run_id = fixture.store.start_run(RunConfig(), wall_us=fixture.wall_us(), app_revision='test')
+        recorder._calibrate(fixture.monotonic()+10)
+        previous = acquire_market(recorder.gamma, recorder.public, clock=recorder.clock,
+            deadline=fixture.monotonic()+10, use_fast_path=False)
+        recorder._save_revision(previous)
+        recorder._prepared = {'owner':'old'}
+        recorder._preparation_phase = ('boundary', 'PREPARED')
+        recorder._save_revision(replace(previous, capture_ready=False))
+        self.assertIsNone(recorder._prepared)
+        self.assertEqual(recorder._preparation_phase, ('boundary', 'FAILED'))
+
+    def test_prepared_activation_rejects_late_stale_invalidated_and_storage_failure(self):
+        from dataclasses import replace
+        from polymarket_bot.recorder.service import Recorder
+        from polymarket_bot.recorder.metadata import acquire_market
+        for fault in ('late', 'owner', 'invalidated', 'clock', 'storage'):
+            with self.subTest(fault=fault):
+                fixture = self.fixture(offset_us=570_000_000)
+                recorder = cast(Any, Recorder(fixture.store, fixture.public, monotonic_ns=fixture.monotonic_ns,
+                    wall_us=fixture.wall_us, sleep=fixture.sleep))
+                recorder.run_id = fixture.store.start_run(RunConfig(), wall_us=fixture.wall_us(), app_revision='test')
+                recorder.run_deadline_ns = fixture.monotonic_ns()+100_000_000_000
+                recorder.invalidated = set()
+                recorder.config = RunConfig()
+                recorder.discovery_gap_id = None
+                recorder._calibrate(fixture.monotonic()+10)
+                prior = acquire_market(recorder.gamma, recorder.public, clock=recorder.clock,
+                    deadline=fixture.monotonic()+10, use_fast_path=False)
+                recorder._save_revision(prior)
+                boundary = int(prior.market.window_end.timestamp()*1e6)
+                future = replace(prior, market=replace(prior.market, market_id='1002',
+                    condition_id='0x'+'cd'*32, window_start=prior.market.window_end,
+                    window_end=prior.market.window_end+__import__('datetime').timedelta(seconds=900),
+                    up=replace(prior.market.up, token_id='3'), down=replace(prior.market.down, token_id='4')),
+                    gamma_raw=b'{"id":"1002"}')
+                from polymarket_bot.recorder.metadata import _identity
+                target = recorder._nominal_target_ns(boundary)
+                recorder._prepared = dict(revision=future, owner=(recorder.run_id, prior.market.event_id, _identity(prior)),
+                    boundary=boundary, prepared_ns=target-30_000_000_000, validated_ns=target-2_000_000_000,
+                    armed_ns=target-2_000_000_000, target_ns=target)
+                fixture.advance((target-fixture.monotonic_ns())/1e9)
+                if fault == 'late': fixture.advance(2)
+                if fault == 'owner': recorder.run_id = 'other'
+                if fault == 'invalidated': recorder.invalidated.add('1002')
+                if fault == 'clock': recorder.clock.anchor = None
+                if fault == 'storage':
+                    with patch.object(fixture.store, 'record_event', side_effect=OSError('write failed')):
+                        with self.assertRaises(OSError): recorder._activate_prepared()
+                    self.assertEqual(cast(Any, fixture.store._one('SELECT count(*) AS n FROM markets'))['n'], 1)
+                    self.assertEqual(cast(Any, fixture.store._one("SELECT lifecycle FROM markets WHERE market_id='1001'"))['lifecycle'], 'CURRENT')
+                else:
+                    self.assertFalse(recorder._activate_prepared())
+                self.assertIsNone(recorder._prepared)
+                self.assertIs(recorder.revision, prior)
+
+    def test_final_arm_skips_metadata_and_calibration_housekeeping(self):
+        from polymarket_bot.recorder.service import Recorder
+        recorder = cast(Any, object.__new__(Recorder))
+        recorder._prepared = {'armed_ns': 1}
+        recorder.monotonic_ns = lambda: 0
+        recorder.run_deadline_ns = 100_000_000
+        recorder._reference_housekeeping = lambda _: self.fail('Control IO after final arm')
+        recorder._housekeeping(50_000_000)
+
+    def test_intended_opening_unavailable_is_blocked_not_retargeted(self):
+        from polymarket_bot.recorder.service import Recorder
+        from polymarket_bot.market_data.models import MarketDataError
+        self.assertTrue(callable(getattr(Recorder, '_check_opening_deadline', None)))
+        recorder = cast(Any, object.__new__(Recorder))
+        from types import SimpleNamespace
+        recorder.intended_boundary_us = 900_000_000
+        recorder._now = lambda: 899_999_000
+        recorder.clock = SimpleNamespace(usable=lambda: True)
+        recorder.revision = None
+        with self.assertRaises(MarketDataError):
+            recorder._check_opening_deadline()
+
+    def test_prepared_arm_clears_on_clock_discontinuity(self):
+        from polymarket_bot.recorder.service import Recorder
+        from polymarket_bot.market_data.http import JsonRead
+        fixture = self.fixture()
+        recorder = cast(Any, Recorder(fixture.store, fixture.public, monotonic_ns=fixture.monotonic_ns,
+            wall_us=fixture.wall_us, sleep=fixture.sleep))
+        recorder.run_id = fixture.store.start_run(RunConfig(), wall_us=fixture.wall_us(), app_revision='test')
+        recorder.run_deadline_ns = fixture.monotonic_ns()+100_000_000_000
+        recorder._calibrate(fixture.monotonic()+10)
+        recorder._prepared = {'sentinel':True}
+        recorder._armed_opening = ('old', 1)
+        cast(Any, fixture).server_shift_us = 20_000_000
+        recorder._calibrate(fixture.monotonic()+10)
+        self.assertIsNone(recorder._prepared)
+        self.assertIsNone(recorder._armed_opening)
+
+    def test_preparation_incomplete_budget_never_starts_network(self):
+        from polymarket_bot.recorder.service import Recorder
+        from types import SimpleNamespace
+        from datetime import datetime, timezone
+        recorder = cast(Any, object.__new__(Recorder))
+        market = SimpleNamespace(window_end=datetime.fromtimestamp(900, timezone.utc),
+            window_start=datetime.fromtimestamp(0, timezone.utc), event_id='e', market_id='m',
+            condition_id='c', up=SimpleNamespace(token_id='1'), down=SimpleNamespace(token_id='2'))
+        recorder.revision = SimpleNamespace(market=market, up_index=0, down_index=1)
+        recorder.clock = SimpleNamespace(usable=lambda: True, deadline_ns=lambda us: us*1000)
+        recorder.run_id = 'r'
+        recorder.monotonic_ns = lambda: 875_000_000_000
+        recorder._now = lambda: 875_000_000
+        recorder._phase_trace = lambda *args: None
+        recorder._control = lambda operation: self.fail('Incomplete phase budget admitted')
+        recorder._prepare_next(880_000_000_000)
+        self.assertIsNone(recorder._prepared)
+
+    def test_preparation_rejects_intended_boundary_mismatch(self):
+        from polymarket_bot.recorder.service import Recorder
+        from types import SimpleNamespace
+        from datetime import datetime, timezone
+        from polymarket_bot.market_data.models import MarketDataError
+        from typing import Any, cast
+        recorder = cast(Any, object.__new__(Recorder))
+        recorder.revision = SimpleNamespace(market=SimpleNamespace(window_end=datetime.fromtimestamp(900, timezone.utc)))
+        recorder.clock = SimpleNamespace(usable=lambda: True)
+        recorder.intended_boundary_us = 1800_000_000
+        recorder.run_id = 'r'
+        recorder.revision.market.event_id = 'e'
+        recorder.revision.market.market_id = 'm'
+        recorder.revision.market.condition_id = 'c'
+        recorder.revision.market.window_start = datetime.fromtimestamp(0, timezone.utc)
+        recorder.revision.market.up = SimpleNamespace(token_id='1')
+        recorder.revision.market.down = SimpleNamespace(token_id='2')
+        recorder.revision.up_index, recorder.revision.down_index = 0, 1
+        recorder._now = lambda: 0
+        with self.assertRaises(MarketDataError):
+            recorder._prepare_next(10)
+
+    def test_prepared_state_cleared_on_shutdown_and_clock_loss(self):
+        from polymarket_bot.recorder.service import Recorder
+        from types import SimpleNamespace
+        from typing import Any, cast
+        recorder = cast(Any, object.__new__(Recorder))
+        recorder._prepared = {'sentinel': True}
+        recorder._armed_opening = ('old', 1)
+        recorder.reference_worker = recorder.approximate_worker = None
+        recorder.store = SimpleNamespace(recover_interrupted=lambda **kw: None,
+            record_event=lambda *a, **kw: None, finish_run=lambda *a, **kw: None)
+        recorder.run_id = 'r'
+        recorder.wall_us = lambda: 0
+        with patch('polymarket_bot.recorder.service.take_checkpoint'):
+            recorder._shutdown('STOPPED', 'test')
+        self.assertIsNone(recorder._prepared)
+        self.assertIsNone(recorder._armed_opening)
+
+    def test_preparation_control_wakes_without_remaining_slot(self):
+        from polymarket_bot.recorder.service import Recorder
+        self.assertTrue(callable(getattr(Recorder, '_preparation_wake_ns', None)))
+        from types import SimpleNamespace
+        from typing import Any, cast
+        recorder = cast(Any, object.__new__(Recorder))
+        recorder.run_deadline_ns = 100_000_000_000
+        recorder.monotonic_ns = lambda: 0
+        recorder.clock = SimpleNamespace(deadline_ns=lambda us: us*1000)
+        recorder._preparation_phase = None
+        self.assertEqual(recorder._preparation_wake_ns(90_000_000), 60_000_000_000)
+        recorder._preparation_phase = ('owner', 'PREPARED')
+        self.assertEqual(recorder._preparation_wake_ns(90_000_000), 78_000_000_000)
+        recorder._preparation_phase = ('owner', 'ARMED')
+        self.assertEqual(recorder._preparation_wake_ns(90_000_000), 90_000_000_000)
+
+    def test_prepared_rollover_captures_actual_five_opening_targets(self):
+        from datetime import datetime, timezone
+        from polymarket_bot.recorder.service import Recorder
+        from tests.support import make_event, make_market
+        fixture = self.fixture(offset_us=540_000_000)
+        boundary = ((fixture.wall_us()//900_000_000)+1)*900_000_000
+        future = make_market(id='1002', conditionId='0x'+'cd'*32, clobTokenIds='["3","4"]',
+            eventStartTime=datetime.fromtimestamp(boundary/1e6, timezone.utc).isoformat(),
+            endDate=datetime.fromtimestamp(boundary/1e6+900, timezone.utc).isoformat())
+        def hook(request, payload, owner):
+            if request.url.path == '/events':
+                return httpx.Response(200, stream=httpx.ByteStream(json.dumps([make_event(markets=[owner.market_row()]),
+                    make_event(id='2002', markets=[future])]).encode()))
+            if request.url.path == '/markets/1002':
+                return httpx.Response(200, stream=httpx.ByteStream(json.dumps(future).encode()))
+            if request.url.path == '/clob-markets/'+'0x'+'cd'*32:
+                return httpx.Response(200, stream=httpx.ByteStream(b'{"t":[{"t":"3"},{"t":"4"}]}'))
+        cast(Any, fixture).hook = hook
+        recorder = Recorder(fixture.store, fixture.public, monotonic_ns=fixture.monotonic_ns,
+            wall_us=fixture.wall_us, sleep=fixture.sleep)
+        result = recorder.run(RunConfig(), should_stop=lambda: fixture.wall_us() >= boundary+10_000_000,
+            deadline_ns=fixture.monotonic_ns()+70_000_000_000)
+        self.assertEqual(result.exit_code, 0)
+        slots = fixture.rows("SELECT slot_index,start_mono_ns AS started_mono_ns,scheduled_us FROM sample_slots WHERE market_id='1002' AND status='COMPLETE' ORDER BY slot_index")
+        self.assertEqual([row['slot_index'] for row in slots], list(range(5)))
+        for row in slots:
+            self.assertGreaterEqual(row['started_mono_ns'], fixture.epoch_ns+(row['scheduled_us']-fixture.initial_wall_us)*1000)
+        self.assertTrue(fixture.rows("SELECT event_id FROM recorder_events WHERE detail_json LIKE '%PREPARED_ACTIVATION%'"))
+
+    def test_prepared_approximate_rollover_delayed_submission_keeps_actual_bounds(self):
+        from datetime import datetime, timezone
+        from polymarket_bot.recorder.service import Recorder
+        from polymarket_bot.recorder.free_reference import ApproximateReferenceSession, CoinbaseRestProvider, KrakenRestProvider
+        from tests.support import make_event, make_market
+        fixture = self.fixture(offset_us=540_000_000)
+        boundary = ((fixture.wall_us()//900_000_000)+1)*900_000_000
+        future = make_market(id='1002', conditionId='0x'+'cd'*32, clobTokenIds='["3","4"]',
+            eventStartTime=datetime.fromtimestamp(boundary/1e6, timezone.utc).isoformat(),
+            endDate=datetime.fromtimestamp(boundary/1e6+900, timezone.utc).isoformat())
+        sends = []
+        def hook(request, payload, owner):
+            if request.url.path == '/events':
+                return httpx.Response(200, stream=httpx.ByteStream(json.dumps([make_event(markets=[owner.market_row()]),
+                    make_event(id='2002', markets=[future])]).encode()))
+            if request.url.path == '/markets/1002':
+                return httpx.Response(200, stream=httpx.ByteStream(json.dumps(future).encode()))
+            if request.url.path == '/clob-markets/'+'0x'+'cd'*32:
+                return httpx.Response(200, stream=httpx.ByteStream(b'{"t":[{"t":"3"},{"t":"4"}]}'))
+            if request.url.path in ('/book', '/books'):
+                sends.append((fixture.wall_us(), fixture.monotonic_ns()))
+        cast(Any, fixture).hook = hook
+        fixture.store.close()
+        fixture.db.path = fixture.db.path.parent / 'research.sqlite3'
+        fixture.store = RecorderStore.open_approximate(fixture.db.path)
+        provider_sends = []
+        with httpx.Client(transport=httpx.MockTransport(lambda request: provider_sends.append(fixture.monotonic_ns())
+                or httpx.Response(200, json={}))) as client:
+            providers = {name: cls(client, monotonic_ns=fixture.monotonic_ns, wall_us=fixture.wall_us,
+                sleep=lambda seconds: None) for name, cls in (('coinbase', CoinbaseRestProvider), ('kraken', KrakenRestProvider))}
+            session = ApproximateReferenceSession(providers=providers, monotonic_ns=fixture.monotonic_ns,
+                wall_us=fixture.wall_us, sleep=lambda seconds: None)
+            recorder = cast(Any, Recorder(fixture.store, fixture.public, monotonic_ns=fixture.monotonic_ns,
+                wall_us=fixture.wall_us, sleep=fixture.sleep, approximate_reference=session))
+            original = recorder._approximate_submit
+            def delayed(deadline_ns, **identity):
+                if identity.get('market_id') == '1002':
+                    fixture.advance(2)
+                return original(deadline_ns, **identity)
+            recorder._approximate_submit = delayed
+            result = recorder.run(RunConfig(mode='APPROXIMATE_REFERENCE'),
+                should_stop=lambda: fixture.wall_us() >= boundary+10_000_000,
+                deadline_ns=fixture.monotonic_ns()+70_000_000_000)
+        self.assertEqual(result.exit_code, 0, result)
+        self.assertTrue(fixture.rows("SELECT event_id FROM recorder_events WHERE detail_json LIKE '%PREPARED_ACTIVATION%'"),
+            fixture.rows("SELECT detail_json FROM recorder_events WHERE detail_json LIKE '%PREPARATION_PHASE%'"))
+        self.assertFalse([wall for wall, mono in sends if boundary <= wall < boundary+10_000_000])
+        self.assertTrue(fixture.rows("SELECT slot_id FROM sample_slots WHERE market_id='1002'"))
+
+    def test_prepared_activation_atomic_single_use_and_admission(self):
+        from dataclasses import replace
+        from polymarket_bot.recorder.service import Recorder
+        from polymarket_bot.recorder.metadata import acquire_market
+        self.assertTrue(callable(getattr(Recorder, '_prepare_next', None)))
+        fixture = self.fixture(offset_us=570_000_000)
+        recorder = cast(Any, Recorder(fixture.store, fixture.public, monotonic_ns=fixture.monotonic_ns,
+            wall_us=fixture.wall_us, sleep=fixture.sleep))
+        recorder.run_id = fixture.store.start_run(RunConfig(), wall_us=fixture.wall_us(), app_revision='test')
+        recorder.run_deadline_ns = fixture.monotonic_ns()+100_000_000_000
+        recorder.invalidated = set()
+        recorder.discovery_gap_id = None
+        recorder.discovery_gap_start = None
+        recorder.next_clock_ns = 2**63-1
+        recorder.config = RunConfig()
+        recorder._calibrate(fixture.monotonic()+10)
+        previous = acquire_market(recorder.gamma, recorder.public, clock=recorder.clock,
+            deadline=fixture.monotonic()+10, use_fast_path=False)
+        recorder._save_revision(previous)
+        boundary = int(previous.market.window_end.timestamp()*1_000_000)
+        future = replace(previous, market=replace(previous.market, market_id='1002', event_id='2002',
+            condition_id='0x'+'cd'*32, window_start=previous.market.window_end,
+            window_end=previous.market.window_end+__import__('datetime').timedelta(seconds=900),
+            up=replace(previous.market.up, token_id='3'), down=replace(previous.market.down, token_id='4')))
+        provenance = [dict(sha256='a'*64, bytes=1689540, complete=True, replay='selected_event_only')]
+        future = replace(future, gamma_raw=b'{"id":"1002"}', market=replace(future.market,
+            metadata=dict(future.market.metadata, prepared_list_evidence=provenance)))
+        with patch('polymarket_bot.recorder.service.acquire_next_market', return_value=future), patch(
+                'polymarket_bot.recorder.service.revalidate_prepared', return_value=future):
+            recorder._prepare_next(recorder.run_deadline_ns)
+            self.assertIs(recorder.revision, previous)
+            self.assertEqual(cast(Any, fixture.store._one('SELECT count(*) AS n FROM markets'))['n'], 1)
+            fixture.advance((recorder.clock.deadline_ns(boundary-12_000_000)-fixture.monotonic_ns())/1e9)
+            recorder._prepare_next(recorder.run_deadline_ns)
+            self.assertIsNotNone(recorder._prepared)
+            self.assertTrue(fixture.store._rows("SELECT event_id FROM recorder_events WHERE detail_json LIKE '%PREPARED_ARM%'"))
+            arm = json.loads(fixture.store._rows("SELECT detail_json FROM recorder_events WHERE detail_json LIKE '%PREPARED_ARM%'")[0]['detail_json'])
+            arm_bytes = len(json.dumps(arm, sort_keys=True, separators=(',', ':')).encode())
+            self.assertLessEqual(arm_bytes, 1_048_576)
+            self.assertEqual(arm.get('list_evidence'), provenance)
+            self.assertFalse(recorder._activate_prepared())
+            fixture.advance((max(recorder._nominal_target_ns(boundary), recorder.clock.deadline_ns(boundary))-
+                fixture.monotonic_ns())/1e9)
+            recorder.reference_worker = object()
+            self.assertTrue(recorder._activate_prepared())
+            self.assertEqual({row['role'] for row in fixture.store._rows(
+                "SELECT role FROM reference_associations WHERE market_id='1002'")}, {'OPENING', 'CLOSING'})
+            recorder.reference_worker = None
+            self.assertEqual(recorder.revision.market.market_id, '1002')
+            self.assertFalse(recorder._activate_prepared())
+            self.assertEqual(cast(Any, fixture.store._one("SELECT lifecycle FROM markets WHERE market_id='1001'"))['lifecycle'], 'EXPIRED')
+
+    def test_arm_activation_durable_boundary(self):
+        from dataclasses import replace
+        from datetime import timedelta as dt
+        from polymarket_bot.recorder.service import Recorder
+        from polymarket_bot.recorder.metadata import acquire_market
+        from polymarket_bot.recorder.models import RunConfig
+        import json
+        fixture = self.fixture(offset_us=570_000_000)
+        store = fixture.store
+        recorder = cast(Any, Recorder(store, fixture.public, monotonic_ns=fixture.monotonic_ns,
+            wall_us=fixture.wall_us, sleep=fixture.sleep))
+        try:
+            recorder.run_id = store.start_run(RunConfig(), wall_us=fixture.wall_us(), app_revision='test')
+            recorder.run_deadline_ns = fixture.monotonic_ns()+100_000_000_000
+            recorder.invalidated = set()
+            recorder.discovery_gap_id = None
+            recorder.discovery_gap_start = None
+            recorder.next_clock_ns = 2**63-1
+            recorder.config = RunConfig()
+            recorder._calibrate(fixture.monotonic()+10)
+            previous = acquire_market(recorder.gamma, recorder.public, clock=recorder.clock,
+                deadline=fixture.monotonic()+10, use_fast_path=False)
+            recorder._save_revision(previous)
+            boundary = int(previous.market.window_end.timestamp()*1_000_000)
+            recorder.intended_boundary_us = boundary
+            future_base = replace(previous, market=replace(previous.market, market_id='1002', event_id='2002',
+                condition_id='0x'+'cd'*32, window_start=previous.market.window_end,
+                window_end=previous.market.window_end+dt(seconds=900),
+                up=replace(previous.market.up, token_id='3'), down=replace(previous.market.down, token_id='4')))
+            future_base = replace(future_base, gamma_raw=b'{"id":"1002"}')
+            future_base = replace(future_base, market=replace(future_base.market, metadata=dict(
+                future_base.market.metadata, prepared_list_evidence=[])))
+            with patch('polymarket_bot.recorder.service.acquire_next_market', return_value=future_base), patch(
+                    'polymarket_bot.recorder.service.revalidate_prepared', return_value=future_base):
+                recorder._prepare_next(recorder.run_deadline_ns)
+                fixture.advance((recorder.clock.deadline_ns(boundary-12_000_000)-fixture.monotonic_ns())/1e9)
+                recorder._prepare_next(recorder.run_deadline_ns)
+            base_arm = store._rows("SELECT detail_json FROM recorder_events WHERE detail_json LIKE '%PREPARED_ARM%' ORDER BY event_id DESC")[0]
+            base_bytes = len(base_arm['detail_json'].encode())
+            saved_prepared = dict(recorder._prepared)
+            budget = 1_048_576 - base_bytes
+            overhead = len(json.dumps([{'fill': ''}], separators=(',', ':'))) - 2
+            for delta in (-1, 0, 1):
+                with self.subTest(delta=delta):
+                    recorder._prepared = dict(saved_prepared)
+                    recorder._preparation_phase = (saved_prepared['owner'], 'PREPARED')
+                    if budget + delta > overhead:
+                        fill_size = max(0, budget + delta - overhead)
+                        future = replace(future_base, market=replace(future_base.market, metadata=dict(
+                            future_base.market.metadata, prepared_list_evidence=[{'fill': 'x' * fill_size}])))
+                    else:
+                        future = future_base
+                    with patch('polymarket_bot.recorder.service.acquire_next_market', return_value=future), patch(
+                            'polymarket_bot.recorder.service.revalidate_prepared', return_value=future):
+                        fix = (recorder.clock.deadline_ns(boundary-12_000_000)-fixture.monotonic_ns())/1e9
+                        fixture.advance(fix if fix > 0 else 0)
+                        if delta > 0:
+                            from polymarket_bot.market_data.models import MarketDataError
+                            with self.assertRaises(MarketDataError) as caught:
+                                recorder._prepare_next(recorder.run_deadline_ns)
+                            self.assertEqual(caught.exception.reason, 'EVIDENCE_BOUND_EXCEEDED')
+                            self.assertIsNone(recorder._prepared)
+                        else:
+                            recorder._prepare_next(recorder.run_deadline_ns)
+                            arm_row = store._rows("SELECT detail_json FROM recorder_events WHERE detail_json LIKE '%PREPARED_ARM%' ORDER BY event_id DESC")[0]
+                            actual = len(arm_row['detail_json'].encode())
+                            self.assertLessEqual(actual, 1_048_576)
+                            if delta <= 0:
+                                self.assertEqual(actual, 1_048_576+delta)
+        finally:
+            store.close()
+            fixture.close()
+
     def test_approximate_session_lifecycle_owned_by_recorder(self):
         import tempfile
         from pathlib import Path

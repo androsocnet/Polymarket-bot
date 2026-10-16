@@ -124,6 +124,53 @@ def acquire_market(gamma, public, *, clock, deadline: float, use_fast_path: bool
     return _revision(market, source, selected[-1].raw_body, public, clock, deadline)
 
 
+def acquire_next_market(previous: MarketRevision, gamma, public, *, clock, deadline: float) -> MarketRevision:
+    from polymarket_bot.market_data.discovery import discover_next
+    if gamma.get is not public:
+        raise ValueError('Gamma discovery and recorder evidence must share PublicGet.')
+    attempts = []
+    import hashlib
+    list_evidence = []
+    callback = public.on_attempt
+    def observe(attempt):
+        if attempt.result == 'success' and attempt.raw_complete and attempt.path == '/events':
+            list_evidence.append(dict(sha256=hashlib.sha256(attempt.raw_body).hexdigest(),
+                bytes=len(attempt.raw_body), complete=True, selectors=attempt.selectors,
+                replay='selected_event_only'))
+        if attempt.result == 'success' and attempt.raw_complete and attempt.path.startswith('/markets/'):
+            attempts[:] = [attempt]
+        if callback is not None:
+            callback(attempt)
+    public.on_attempt = observe
+    try:
+        market, source = discover_next(gamma, clock=clock, deadline=deadline, current=previous.market)
+    finally:
+        public.on_attempt = callback
+    if not attempts or attempts[0].path != '/markets/'+market.market_id:
+        raise MarketDataError('invalid_metadata', 'Successor detail evidence unavailable.')
+    import json
+    event = market.metadata.get('prepared_event')
+    evidence = dict(event=event, list_evidence=list_evidence)
+    if not isinstance(event, dict) or not list_evidence or len(json.dumps(evidence, default=str).encode()) > 1_048_576:
+        raise MarketDataError('invalid_metadata', 'Successor event evidence exceeds bound.')
+    market = replace(market, metadata=dict(market.metadata, prepared_list_evidence=list_evidence))
+    revision = _revision(market, source, attempts[0].raw_body, public, clock, deadline)
+    if not isinstance(revision.config.get('t'), list):
+        raise MarketDataError('invalid_metadata', 'Successor CLOB mapping unavailable.')
+    if not revision.capture_ready or public.monotonic() >= deadline or not clock.usable():
+        raise MarketDataError('invalid_metadata', 'Successor not ready within phase deadline.')
+    return revision
+
+
+def revalidate_prepared(previous: MarketRevision, prepared: MarketRevision,
+                        gamma, public, *, clock, deadline: float) -> MarketRevision:
+    candidate = acquire_next_market(previous, gamma, public, clock=clock, deadline=deadline)
+    if ((candidate.market.event_id, _identity(candidate)) != (prepared.market.event_id, _identity(prepared))
+            or candidate.config != prepared.config):
+        raise MarketDataError('identity_conflict', 'Prepared successor identity/configuration changed.')
+    return candidate
+
+
 def _identity(revision: MarketRevision) -> tuple:
     market = revision.market
     return (market.market_id, market.condition_id, market.window_start, market.window_end,

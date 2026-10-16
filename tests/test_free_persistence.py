@@ -699,7 +699,41 @@ class ResearchPersistenceTests(FreePersistenceTests):
             try:
                 self.assertTrue(worker.submit(work))
                 self.assertTrue(entered.wait(2))
-                recorder._research_opportunity(12_000_000_000, 'busy', market_id='next-market', slot_index=0)
+                from dataclasses import replace
+                from datetime import timedelta
+                from tests.support import make_event, make_market, NOW
+                from polymarket_bot.market_data.parsing import parse_market
+                from polymarket_bot.recorder.metadata import _identity
+                from polymarket_bot.recorder.models import MarketRevision
+                event: dict[str, object] = dict(make_event())
+                raw_market: dict[str, object] = dict(make_market())
+                market = parse_market(event, raw_market, now=NOW)
+                assert market is not None
+                prior = MarketRevision(market, 1, 0, '', '', json.dumps(make_market()).encode(), b'{}', NOW_US, {}, 'test', (), True)
+                recorder.reference_worker = None
+                recorder.discovery_gap_id = None
+                recorder.invalidated = set()
+                recorder.config = RunConfig(mode='APPROXIMATE_REFERENCE')
+                recorder._save_revision(prior)
+                future = replace(prior, market=replace(market, market_id='1002', event_id='2002',
+                    condition_id='0x'+'cd'*32, window_start=market.window_end,
+                    window_end=market.window_end+timedelta(seconds=900),
+                    up=replace(market.up, token_id='3'), down=replace(market.down, token_id='4')),
+                    gamma_raw=json.dumps(make_market(id='1002', clobTokenIds='["4","3"]')).encode())
+                boundary = int(market.window_end.timestamp()*1_000_000)
+                target = recorder._nominal_target_ns(boundary)
+                recorder._prepared = dict(revision=future,
+                    owner=(recorder.run_id, market.event_id, _identity(prior)), boundary=boundary,
+                    prepared_ns=target-30_000_000_000, validated_ns=target-2_000_000_000,
+                    armed_ns=target-2_000_000_000, target_ns=target)
+                recorder.run_deadline_ns = target+10_000_000_000
+                with patch.object(recorder, 'monotonic_ns', return_value=target):
+                    self.assertTrue(recorder._activate_prepared())
+                    self.assertEqual(recorder.revision.market.market_id, '1002')
+                    self.assertFalse(recorder._approximate_submit(target+2_000_000_000,
+                        target_ns=target, scheduled_us=boundary, market_id='1002', slot_index=0))
+                self.assertTrue(self.store._rows("SELECT event_id FROM recorder_events WHERE detail_json LIKE '%PREPARED_ACTIVATION%'"))
+                self.assertEqual(recorder._research_evidence.scheduled_opportunities[-1][2], 'busy')
                 self.assertEqual(recorder._research_pending, pending)
                 self.assertEqual(recorder.approximate_reference.sampling_origin_ns, origin)
                 release.set()
@@ -710,15 +744,18 @@ class ResearchPersistenceTests(FreePersistenceTests):
                 self.assertEqual(fetch['opportunity_id'], pending[0])
                 self.assertEqual(fetch['target_ns'], pending[1]['target_ns'])
                 recorder.config = RunConfig(mode='APPROXIMATE_REFERENCE')
-                with patch.object(recorder.clock, 'deadline_ns', return_value=20_000_000_000):
-                    self.assertEqual(recorder._nominal_target_ns(900_000_000), 20_000_000_000)
-                    self.assertEqual(recorder._nominal_target_ns(902_000_000), 22_000_000_000)
+                self.assertEqual(recorder._nominal_target_ns(boundary), target)
+                self.assertEqual(recorder._nominal_target_ns(boundary+2_000_000), target+2_000_000_000)
+                for key in ('market_id', 'slot_id', 'slot_index', 'scheduled_us'):
+                    self.assertEqual(fetch.get(key), pending[1].get(key))
+                self.assertEqual(recorder.revision.market.market_id, '1002')
             finally:
                 release.set()
                 worker.stop()
             raise OSError('checked pending rollover')
         with self.assertRaises(OSError):
-            self.test_revision_two_recorder_flow(before_drain=before_drain)
+            self.test_revision_two_recorder_flow(before_drain=before_drain,
+                submit_identity=dict(market_id='1001', slot_index=299))
 
     def test_completed_undrained_rollover_binds_changed_market(self):
         from dataclasses import replace

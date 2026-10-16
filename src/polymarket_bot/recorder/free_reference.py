@@ -128,11 +128,14 @@ class CoinbaseRestProvider:
 
     def __init__(self, client: httpx.Client, *, monotonic_ns: Callable[[], int],
                  wall_us: Callable[[], int], clock_seconds=None, project=None, sleep=time.sleep):
+        from polymarket_bot.market_data.http import install_send_admission
+        install_send_admission(client)
         self._client = client
         self._monotonic_ns = monotonic_ns
         self._wall_us = wall_us
         self._project = project
         self._sleep = sleep
+        self.before_attempt: Callable[[], None] | None = None
         self.request_attempts = []
 
     def fetch_ticker(self, *, deadline: float | None = None,
@@ -159,9 +162,16 @@ class CoinbaseRestProvider:
             last_attempt_ns = send_ns
             body = bytearray()
             status = None
+            def admit():
+                before_attempt = getattr(self, 'before_attempt', None)
+                if before_attempt is not None:
+                    before_attempt()
+                actual = self._monotonic_ns()
+                if actual >= end_ns or (context is not None and _captured_projection(context, actual) is None):
+                    raise httpx.TimeoutException('Provider acquisition admission expired')
             request = httpx.Request("GET", self._ENDPOINT,
                 headers={"Accept": "application/json", "Accept-Encoding": "identity"},
-                extensions={"timeout": dict.fromkeys(("connect", "read", "write", "pool"), min(5.0, remaining))})
+                extensions={"send_guard": admit, "timeout": dict.fromkeys(("connect", "read", "write", "pool"), min(5.0, remaining))})
             try:
                 response = self._client.send(request, stream=True, auth=None, follow_redirects=False)
                 self._client.cookies.clear()

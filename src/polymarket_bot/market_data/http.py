@@ -41,6 +41,28 @@ class HttpAttempt:
     raw_body: bytes
     raw_complete: bool
 
+class AdmissionTransport(httpx.BaseTransport):
+    def __init__(self, inner):
+        self.inner = inner
+
+    def handle_request(self, request):
+        guard = request.extensions.get('send_guard')
+        if guard is not None:
+            guard()
+        return self.inner.handle_request(request)
+
+    def close(self):
+        self.inner.close()
+
+
+def install_send_admission(client):
+    if not isinstance(client._transport, AdmissionTransport):
+        client._transport = AdmissionTransport(client._transport)
+    for key, transport in tuple(client._mounts.items()):
+        if transport is not None and not isinstance(transport, AdmissionTransport):
+            client._mounts[key] = AdmissionTransport(transport)
+
+
 class PublicGet:
     def __init__(self, client: httpx.Client, *, monotonic: Callable[[], float],
                  sleep: Callable[[float], None], utcnow: Callable[[], datetime],
@@ -57,6 +79,7 @@ class PublicGet:
         self.monotonic_ns = monotonic_ns or (lambda: int(self.monotonic() * 1_000_000_000))
         self.on_attempt = on_attempt
         self.before_attempt = before_attempt
+        install_send_admission(client)
 
     def get_json(self, source: Literal["gamma", "clob", "data"], path: str, *,
                  params: dict[str, str | int] | None = None, deadline: float) -> JsonRead:
@@ -115,6 +138,11 @@ class PublicGet:
                      "GAMMA_EVENTS" if path == "/events" else
                      "GAMMA_EVENT" if path.startswith("/events/slug/") else
                      "GAMMA_MARKET")
+        def send_guard():
+            if self.before_attempt is not None:
+                self.before_attempt()
+            self._remaining(deadline)
+
         had_pre_existing_cookies = bool(self.client.cookies)
         try:
             for attempt in range(self.max_attempts):
@@ -139,6 +167,7 @@ class PublicGet:
                 try:
                     with self.client.stream(method, url, params=params, json=json_body, follow_redirects=False,
                                             headers={"Accept-Encoding":"identity"},
+                                            extensions={'send_guard': send_guard},
                                             timeout=httpx.Timeout(min(self.phase_timeout, remaining))) as response:
                         self._remaining(deadline)
                         status = response.status_code

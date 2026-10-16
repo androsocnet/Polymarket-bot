@@ -525,6 +525,47 @@ def pilot_causal_availability(reports, slots, attempts):
         source_time_semantics='SOURCE_TIME_WITHIN_CLOCK_UNCERTAINTY is not exact UTC ordering')
 
 
+def intended_phase(summary, markets, slots, events, boundary_us, mode):
+    selected = [row for row in markets if row['window_start_us'] == boundary_us
+        and row['window_end_us'] == boundary_us+900_000_000]
+    if len(selected) != 1:
+        return dict(verdict='FAIL', reason='INTENDED_MARKET_UNAVAILABLE')
+    market = selected[0]
+    activations = [row for row in events if row.get('type') == 'PREPARED_ACTIVATION'
+        and row.get('boundary_us') == boundary_us]
+    arms = [row for row in events if row.get('type') == 'PREPARED_ARM' and row.get('boundary_us') == boundary_us]
+    if len(activations) != 1 or len(arms) != 1:
+        return dict(verdict='FAIL', reason='PREPARATION_EVIDENCE_UNAVAILABLE')
+    activation, arm = activations[0], arms[0]
+    run_id = activation.get('run_id')
+    ledger = [row for row in slots if row['market_id'] == market['market_id'] and row['run_id'] == run_id]
+    opening = [row for row in ledger if row['slot_index'] < 5]
+    sends = [row for row in events if row.get('type') == 'ACTUAL_SEND_ATTEMPT'
+        and row.get('market_id') == market['market_id'] and row.get('run_id') == run_id
+        and row.get('path') in ('/books', '/book')]
+    valid = (summary.get('integrity') == ['ok'] and not summary.get('foreign_keys')
+        and summary.get('user_version') == 2 and not any(summary.get('isolation', {}).values())
+        and summary.get('replay', {}).get('exact') and arm.get('run_id') == run_id
+        and arm['target_ns'] == activation['target_ns']
+        and arm['armed_ns'] < arm['target_ns']-1_000_000
+        and len(opening) == 5
+        and all(row['scheduled_us'] == boundary_us+row['slot_index']*2_000_000 for row in ledger)
+        and activation['activated_ns'] >= max(activation['target_ns'], activation['active_target_ns'])
+        and {row['slot_index'] for row in opening} == set(range(5))
+        and all(row['status'] == 'COMPLETE' for row in opening))
+    for index in range(5):
+        attempts = [row for row in sends if row.get('slot_index') == index]
+        valid = valid and bool(attempts)
+        for row in attempts:
+            lower = max(activation['target_ns'], activation['active_target_ns'])+index*2_000_000_000
+            valid = valid and lower <= row['started_mono_ns'] < activation['active_target_ns']+(index+1)*2_000_000_000
+    if mode == 'pilot':
+        valid = valid and len(ledger) == 450 and {row['slot_index'] for row in ledger} == set(range(450)) and any(row.get('verdict') == 'PASS'
+            and row.get('market_id') == market['market_id'] and row.get('run_id') == run_id
+            for row in summary.get('pilot_causal_availability', {}).get('windows', []))
+    return dict(verdict='PASS' if valid else 'FAIL', market_id=market['market_id'], run_id=run_id)
+
+
 def analyze_db(db_path: Path):
     with closing(sqlite3.connect(db_path.resolve().as_uri() + '?mode=ro', uri=True)) as conn:
         return quality(conn)

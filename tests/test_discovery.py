@@ -11,6 +11,38 @@ class DiscoveryTests(unittest.TestCase):
         self.clock = ServerClock(JsonRead(int(NOW.timestamp()),0,0),monotonic=self.time.monotonic)
     def discover(self, gamma, fast=True):
         return discover_current(gamma, clock=self.clock, deadline=120, use_fast_path=fast)
+    def test_next_discovery_complete_identity_and_original_event(self):
+        from typing import Any, cast
+        discovery = cast(Any, __import__('polymarket_bot.market_data.discovery', fromlist=['discover_next']))
+        self.assertTrue(callable(getattr(discovery, 'discover_next', None)))
+        from polymarket_bot.market_data.parsing import parse_market
+        current = cast(Any, parse_market)(make_event(), make_market(), now=NOW)
+        self.assertIsNotNone(current)
+        start = NOW+timedelta(minutes=10)
+        future = make_market(id='1002', conditionId='0x'+'cd'*32,
+            clobTokenIds='["3","4"]', outcomes='["Down","Up"]',
+            eventStartTime=start.isoformat(), endDate=(start+timedelta(seconds=900)).isoformat())
+        event = make_event(id='2002', markets=[future])
+        gamma = FakeGamma(events=[make_event(), event])
+        selected, source = discovery.discover_next(gamma, clock=self.clock, deadline=120, current=current)
+        self.assertEqual((selected.market_id, source), ('1002', 'filtered_next_list'))
+        self.assertEqual(selected.metadata['prepared_event'], event)
+        self.assertEqual(gamma.slug_calls, [])
+        self.assertEqual(gamma.refresh_calls, [('1002', 120)])
+        self.assertEqual(gamma.list_calls, [(NOW, NOW+timedelta(minutes=30), 0, 120)])
+        for patch in ({'id':'1003'}, {'conditionId':CONDITION}, {'clobTokenIds':'["5","6"]'},
+                      {'outcomes':'["Up","Down"]'}, {'endDate':start.isoformat()},
+                      {'events':[{'id':'wrong'}]}):
+            with self.subTest(patch=patch), self.assertRaises(MarketDataError):
+                discovery.discover_next(FakeGamma(events=[event], refresh=dict(future, **patch)),
+                    clock=self.clock, deadline=120, current=current)
+        bad_sets = ([], [event]*500, [event, dict(event, title='changed')],
+                    [event, make_event(id='2003', markets=[dict(future, id='1003')])],
+                    [make_event(markets=[dict(future, clobTokenIds='["3","'+TOKEN_UP+'"]')])])
+        for events in bad_sets:
+            with self.subTest(events=len(events)), self.assertRaises(MarketDataError):
+                discovery.discover_next(FakeGamma(events=events), clock=self.clock, deadline=120, current=current)
+
     def test_list_discovery_survives_slug_rename_and_disabled_fast_path(self):
         gamma = FakeGamma(fast=AssertionError("Fast path must be disabled"))
         result, source = self.discover(gamma, fast=False)

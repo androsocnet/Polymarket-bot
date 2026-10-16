@@ -3,6 +3,7 @@ import json
 import unittest
 from dataclasses import replace
 from datetime import timedelta
+from typing import Any, cast
 
 import httpx
 
@@ -77,6 +78,132 @@ class MetadataTests(unittest.TestCase):
                            sleep=self.time.sleep, utcnow=self.time.utcnow,
                            max_attempts=1, on_attempt=attempts.append)
         return GammaClient(public), public, paths, attempts, raw_event, raw_market, raw_config
+
+    def test_successor_failure_reasons(self):
+        from polymarket_bot.recorder.metadata import acquire_next_market
+        gamma, public, *_ = self.transport()
+        previous = acquire_market(gamma, public, clock=self.clock, deadline=120, use_fast_path=False)
+        start = previous.market.window_end
+        future = make_market(id='1002', conditionId='0x'+'cd'*32, clobTokenIds='["3","4"]',
+            eventStartTime=start.isoformat(), endDate=(start+timedelta(seconds=900)).isoformat())
+        ambiguous = [make_event(id='2002', markets=[future]), make_event(id='2003', markets=[dict(
+            future, id='1003', conditionId='0x'+'ef'*32, clobTokenIds='["5","6"]')])]
+        cases = [(json.dumps(ambiguous).encode(), 'AMBIGUOUS_SUCCESSOR'), (b'[{', 'JSON_DECODE_ERROR'), (b'[{"x":1e999999999999999999}]', 'NUMERIC_PARSE_ERROR'),
+            (b'{}', 'EVENT_SCHEMA_INVALID'), (b'[]', 'NO_VALID_SUCCESSOR'),
+            (b' '* (10*1024*1024+1), 'RESPONSE_TOO_LARGE')]
+        for body, reason in cases:
+            with self.subTest(reason=reason):
+                attempts = []
+                with httpx.Client(transport=httpx.MockTransport(lambda request:
+                        httpx.Response(200, stream=httpx.ByteStream(body))), trust_env=False) as client:
+                    public = PublicGet(client, monotonic=self.time.monotonic, sleep=self.time.sleep,
+                        utcnow=self.time.utcnow, max_attempts=1, on_attempt=attempts.append)
+                    with self.assertRaises(MarketDataError) as caught:
+                        acquire_next_market(previous, GammaClient(public), public, clock=self.clock, deadline=120)
+                    self.assertEqual(getattr(caught.exception, 'reason', None), reason)
+                    self.assertEqual(len(attempts), 1)
+                    self.assertEqual(public.on_attempt, attempts.append)
+
+    def test_large_successor_list_keeps_bounded_provenance(self):
+        import hashlib
+        from polymarket_bot.recorder.metadata import acquire_next_market
+        gamma, public, *_ = self.transport()
+        previous = acquire_market(gamma, public, clock=self.clock, deadline=120, use_fast_path=False)
+        previous = replace(previous, market=replace(previous.market, condition_id='0x'+'ef'*32))
+        start = previous.market.window_end
+        future = make_market(id='1002', clobTokenIds='["3","4"]', eventStartTime=start.isoformat(),
+            endDate=(start+timedelta(seconds=900)).isoformat())
+        event = make_event(id='2002', markets=[future])
+        compact = json.dumps([event]).encode()
+        body = compact+b' '*(1_689_540-len(compact))
+        attempts = []
+        def respond(request):
+            raw = body if request.url.path == '/events' else json.dumps(future).encode() if request.url.path == '/markets/1002' else b'{"t":[{"t":"3"},{"t":"4"}]}'
+            return httpx.Response(200, stream=httpx.ByteStream(raw))
+        with httpx.Client(transport=httpx.MockTransport(respond), trust_env=False) as client:
+            public = PublicGet(client, monotonic=self.time.monotonic, sleep=self.time.sleep,
+                utcnow=self.time.utcnow, max_attempts=1, on_attempt=attempts.append)
+            revision = acquire_next_market(previous, GammaClient(public), public, clock=self.clock, deadline=120)
+        self.assertTrue(revision.capture_ready)
+        self.assertEqual(cast(Any, revision.market.metadata['prepared_list_evidence'])[0]['sha256'], hashlib.sha256(body).hexdigest())
+        self.assertEqual(cast(Any, revision.market.metadata['prepared_list_evidence'])[0]['bytes'], len(body))
+        self.assertEqual(attempts[0].raw_body, body)
+        self.assertLess(len(json.dumps(revision.market.metadata, default=str)), 1_048_576)
+
+    def test_successor_evidence_exact_boundary(self):
+        from polymarket_bot.recorder.metadata import acquire_next_market
+        gamma, public, *_ = self.transport()
+        previous = acquire_market(gamma, public, clock=self.clock, deadline=120, use_fast_path=False)
+        previous = replace(previous, market=replace(previous.market, condition_id='0x'+'ef'*32))
+        start = previous.market.window_end
+        future = make_market(id='1002', clobTokenIds='["3","4"]', eventStartTime=start.isoformat(),
+            endDate=(start+timedelta(seconds=900)).isoformat())
+        event = make_event(id='2002', markets=[future], evidence='')
+        gamma, public, *_ = self.transport(market=future, event=event, config={'t':[{'t':'3'},{'t':'4'}]})
+        revision = acquire_next_market(previous, gamma, public, clock=self.clock, deadline=120)
+        size = len(json.dumps(dict(event=event, list_evidence=revision.market.metadata['prepared_list_evidence']), default=str).encode())
+        padding = 1_048_576-size-4
+        for delta in (-1, 0, 1):
+            with self.subTest(delta=delta):
+                event['evidence'] = 'x'*(padding+delta)
+                gamma, public, *_ = self.transport(market=future, event=event, config={'t':[{'t':'3'},{'t':'4'}]})
+                if delta <= 0:
+                    candidate = acquire_next_market(previous, gamma, public, clock=self.clock, deadline=120)
+                    actual = len(json.dumps(dict(event=event, list_evidence=candidate.market.metadata['prepared_list_evidence']), default=str).encode())
+                    self.assertEqual(actual, 1_048_576+delta)
+                else:
+                    with self.assertRaises(MarketDataError) as caught:
+                        acquire_next_market(previous, gamma, public, clock=self.clock, deadline=120)
+                    self.assertEqual(caught.exception.reason, 'EVIDENCE_BOUND_EXCEEDED')
+
+    def test_prepared_event_evidence_bounded_before_arming(self):
+        from polymarket_bot.recorder.metadata import acquire_next_market
+        gamma, public, _, _, _, _, _ = self.transport()
+        previous = acquire_market(gamma, public, clock=self.clock, deadline=120, use_fast_path=False)
+        previous = replace(previous, market=replace(previous.market, condition_id='0x'+'ef'*32))
+        start = previous.market.window_end
+        future = make_market(id='1002', clobTokenIds='["3","4"]', eventStartTime=start.isoformat(),
+            endDate=(start+timedelta(seconds=900)).isoformat())
+        gamma, public, _, _, _, _, _ = self.transport(market=future,
+            event=make_event(id='2002', markets=[future], evidence='x'*1_048_576),
+            config={'t':[{'t':'3'},{'t':'4'}]})
+        with self.assertRaises(MarketDataError) as caught:
+            acquire_next_market(previous, gamma, public, clock=self.clock, deadline=120)
+        self.assertEqual(caught.exception.reason, 'EVIDENCE_BOUND_EXCEEDED')
+
+    def test_prepared_identity_change_blocks_activation(self):
+        from polymarket_bot.recorder import metadata
+        self.assertTrue(callable(getattr(metadata, 'acquire_next_market', None)))
+        gamma, public, _, _, _, _, _ = self.transport()
+        previous = acquire_market(gamma, public, clock=self.clock, deadline=120, use_fast_path=False)
+        original = previous
+        start = previous.market.window_end
+        market = make_market(id='1002', clobTokenIds='["3","4"]', outcomes='["Down","Up"]',
+            eventStartTime=start.isoformat(), endDate=(start+timedelta(seconds=900)).isoformat())
+        previous = replace(previous, market=replace(previous.market, condition_id='0x'+'ef'*32))
+        config = {'t':[{'t':'3','o':'Down'},{'t':'4','o':'Up'}]}
+        gamma, public, paths, _, raw_event, raw_market, raw_config = self.transport(
+            market=market, event=make_event(id='2002', markets=[market]), config=config)
+        prepared = metadata.acquire_next_market(previous, gamma, public, clock=self.clock, deadline=120)
+        self.assertEqual((prepared.up_index, prepared.down_index), (1, 0))
+        self.assertEqual((prepared.gamma_raw, prepared.clob_config_raw), (raw_market, raw_config))
+        import hashlib
+        self.assertEqual(cast(Any, prepared.market.metadata['prepared_list_evidence'])[0]['sha256'],
+                         hashlib.sha256(('['+raw_event.decode()+']').encode()).hexdigest())
+        self.assertEqual(cast(Any, prepared.market.metadata['prepared_event'])['id'], '2002')
+        self.assertFalse(any('/slug/' in path for path in paths))
+        refreshed = metadata.revalidate_prepared(previous, prepared, gamma, public, clock=self.clock, deadline=120)
+        self.assertGreater(refreshed.observed_us, prepared.observed_us)
+        market['clobTokenIds'] = '["5","6"]'
+        with self.assertRaises(MarketDataError):
+            metadata.revalidate_prepared(previous, prepared, gamma, public, clock=self.clock, deadline=120)
+        self.assertEqual(original.market.market_id, '1001')
+        market['clobTokenIds'] = '["3","4"]'
+        for bad in ({'mts':'0.01'}, {'t':None}, {'t':[{'t':'3','o':'Up'},{'t':'4','o':'Down'}]}):
+            config.clear()
+            cast(Any, config).update(bad)
+            with self.assertRaises(MarketDataError):
+                metadata.acquire_next_market(previous, gamma, public, clock=self.clock, deadline=120)
 
     def test_forced_fallback_independent_of_slug(self):
         gamma, public, paths, attempts, _, raw_market, _ = self.transport()
