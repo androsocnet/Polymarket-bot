@@ -1165,7 +1165,16 @@ class Recorder:
             return RunResult(self.run_id, "INTERRUPTED", 130, self.finalized, "KEYBOARD_INTERRUPT")
         except (RecorderStoreError, sqlite3.DatabaseError, OSError) as exc:
             original_error = exc
-            # No further persistence or HTTP follows a failed writer/invariant.
+            if (self.run_id and isinstance(exc, RecorderStoreError)
+                    and exc.code == 'fatal_invariant' and not self.store._write_failed):
+                if self.reference_worker is not None:
+                    self.reference_worker.stop()
+                if self.approximate_worker is not None:
+                    self.approximate_worker.stop()
+                self._final_persistence()
+                self.store.recover_interrupted(wall_us=self.wall_us(), run_id=self.run_id,
+                    finish_runs=False, reason=exc.code)
+                self.store.finish_run(self.run_id, state='FAILED', wall_us=self.wall_us(), reason=exc.code)
             return RunResult(self.run_id, "FAILED", 1, self.finalized,
                              exc.code if isinstance(exc, RecorderStoreError) else "storage_failure")
         except MarketDataError as exc:

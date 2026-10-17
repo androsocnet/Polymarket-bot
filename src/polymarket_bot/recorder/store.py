@@ -26,9 +26,21 @@ EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
 def _json(value) -> str:
+    def canonical(item):
+        if item is None or type(item) in (bool, str):
+            return item
+        if type(item) is int and -(2**63) <= item <= 2**63 - 1:
+            return item
+        if type(item) is Decimal:
+            return decimal_text(item)
+        if type(item) is list or type(item) is tuple:
+            return [canonical(child) for child in item]
+        if type(item) is dict and all(type(key) is str for key in item):
+            return {key: canonical(child) for key, child in item.items()}
+        raise TypeError("Unsupported recorder JSON value.")
     try:
-        return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
-    except (ValueError, TypeError, RecursionError) as exc:
+        return json.dumps(canonical(value), sort_keys=True, separators=(",", ":"), allow_nan=False)
+    except (ValueError, TypeError, RecursionError, MarketDataError) as exc:
         raise RecorderStoreError("fatal_invariant", "Recorder JSON evidence is not supported.") from exc
 
 
@@ -934,7 +946,7 @@ and (fetch.attempt.path == '/ws/v1' or association.target_us <= fetch.received_s
                          "Recorder event market is unknown.")
             return self._insert("recorder_events", dict(
                 run_id=run_id, market_id=market_id, kind=kind,
-                started_us=started_us, ended_us=ended_us, detail_json=_json(detail)))
+                started_us=started_us, ended_us=ended_us, detail_json=payload))
 
     def finish_discovery_gap(self, event_id: int, *, run_id: str, ended_us: int) -> None:
         """Fill an open acquisition interval once; diagnostic events cannot close."""
