@@ -16,6 +16,7 @@ import httpx
 
 
 from polymarket_bot.recorder.service import Recorder
+from polymarket_bot.recorder.store import _json
 
 
 class CP5Recorder(Recorder):
@@ -49,10 +50,10 @@ class CP5Recorder(Recorder):
                     for observed_wall, detail in pending:
                         self.store._insert('recorder_events', dict(run_id=self.run_id, market_id=None,
                             kind='DISCOVERY_GAP', started_us=observed_wall, ended_us=None,
-                            detail_json=json.dumps(detail)))
+                            detail_json=_json(detail)))
                     self.store._insert('recorder_events', dict(run_id=self.run_id, market_id=None,
                         kind='DISCOVERY_GAP', started_us=wall_us(), ended_us=None,
-                        detail_json=json.dumps(dict(type='SCHEDULER_TIMING', version=1,
+                        detail_json=_json(dict(type='SCHEDULER_TIMING', version=1,
                             diagnostic_only=True, time_domain='RUN_MONOTONIC', phase='DIAGNOSTIC_PERSISTENCE',
                             mono_ns=self.monotonic_ns(), start_mono_ns=started,
                             end_mono_ns=self.monotonic_ns(), event_count=len(pending),
@@ -111,6 +112,12 @@ _retained_runs = []
 
 def wall_us():
     return time.time_ns() // 1000
+
+
+def opening_wait_evidence(intended_boundary, *, wait_started, wait_ended, wait_end_ns):
+    return dict(intended_boundary=intended_boundary,
+                wait_started_wall_us=round(wait_started * 1_000_000),
+                wait_ended_wall_us=round(wait_ended * 1_000_000), wait_end_ns=wait_end_ns)
 
 
 class AuditStream(httpx.SyncByteStream):
@@ -252,6 +259,18 @@ def align(now=time.time, sleep=time.sleep):
     return delay
 
 
+def aligned_wait_delay(intended_boundary, now):
+    delay = intended_boundary-60-now
+    if not 0 <= delay <= 900:
+        raise ValueError('CP5 BLOCKED: alignment window missed')
+    return delay
+
+
+def require_admission(intended_boundary, now):
+    if now >= intended_boundary-22:
+        raise ValueError('CP5 BLOCKED: intended preparation admission missed')
+
+
 def supervise(command, timeout):
     started = time.monotonic()
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -313,8 +332,7 @@ def child(path, seconds, *, mode=None, intended_boundary=None, wait_evidence=Non
     fixed_deadline_ns = acquisition_start_ns+seconds*1_000_000_000
     if mode is not None:
         assert isinstance(intended_boundary, int)
-        if time.time() >= intended_boundary-22:
-            raise ValueError('CP5 BLOCKED: intended preparation admission missed')
+        require_admission(intended_boundary, time.time())
         fixed_deadline_ns = min(fixed_deadline_ns,
             acquisition_start_ns+round((intended_boundary+(10 if mode == 'rollover' else 1140)-time.time())*1e9))
     from collections import deque
@@ -412,12 +430,10 @@ if __name__ == '__main__':
         wait_evidence = None
         if args.aligned_child:
             wait_started = time.time()
-            delay = args.intended_boundary-60-wait_started
-            if not 0 <= delay <= 900:
-                raise ValueError('CP5 BLOCKED: alignment window missed')
+            delay = aligned_wait_delay(args.intended_boundary, wait_started)
             time.sleep(delay)
-            wait_evidence = dict(intended_boundary=args.intended_boundary,
-                wait_started=wait_started, wait_ended=time.time(), wait_end_ns=time.monotonic_ns())
+            wait_evidence = opening_wait_evidence(args.intended_boundary, wait_started=wait_started,
+                wait_ended=time.time(), wait_end_ns=time.monotonic_ns())
             print(json.dumps(wait_evidence), flush=True)
         child(args.db, args.seconds, mode=args.mode, intended_boundary=args.intended_boundary, wait_evidence=wait_evidence)
     elif args.mode is not None:
