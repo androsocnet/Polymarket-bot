@@ -89,7 +89,7 @@ class PublicGet:
                     re.fullmatch(r"/clob-markets/0x[0-9a-fA-F]{64}", path))) or
                    (source == "data" and path == "/v2/resolutions") or
                    (source == "gamma" and (path == "/events" or
-                    re.fullmatch(r"/events/slug/[A-Za-z0-9_-]+|/markets/[0-9]+", path))))
+                    re.fullmatch(r"/events/slug/[A-Za-z0-9_-]+|/events/[0-9]{1,256}|/markets/[0-9]+", path))))
         if not allowed:
             raise MarketDataError("transport_error", "Only approved public GET endpoints are allowed.")
         allowed_keys = ({"active", "closed", "end_date_min", "end_date_max", "limit", "offset",

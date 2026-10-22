@@ -7,9 +7,24 @@ collector is disabled; every recorder run is `REFERENCE_INCOMPLETE`. Neither
 command trades or produces a strategy-complete dataset.
 
 There is no wallet, Polymarket authentication, order/cancellation path, strategy,
-signal, simulated trading, or BTC spot-feed substitution. Dormant isolated
-Chainlink HMAC, REST and WebSocket adapters exist, but CLI runtime activation
-remains refused. No `.env` or credential file is loaded.
+signal, simulated trading, or BTC spot-feed substitution in the snapshot and
+recorder commands. Dormant isolated Chainlink HMAC, REST and WebSocket adapters
+exist, but CLI runtime activation remains refused. No `.env` or credential file
+is loaded.
+
+## Linux PAPER MVP
+
+A separate, isolated `linux_mvp` package provides a supervised PAPER_ONLY service
+for an Ubuntu VPS. **Phase 1** ships an `ingest` service that reuses the public
+discovery/book stack, stores both top-of-book observations and window rollovers in
+its own SQLite schema, and writes no decisions or orders. The paper engine,
+hypothetical fills, and read-only report remain in the tree for Phase 2 but are
+dormant; the systemd unit runs `ingest`. It has no credentials, signing, or order
+endpoint, and refuses any mode other than `PAPER_ONLY`. See the
+[architecture and gap analysis](docs/superpowers/linux-mvp-architecture-and-gap-analysis.md),
+[design](docs/superpowers/specs/2026-10-22-linux-mvp-paper-bot-design.md), and
+[deployment runbook](docs/linux-mvp-runbook.md). It does not change or satisfy
+any CP5/CP6 contract.
 
 ## Setup and commands
 
