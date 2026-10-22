@@ -10,7 +10,7 @@ import unittest
 from unittest import mock
 
 from polymarket_bot.linux_mvp import __main__ as cli
-from polymarket_bot.linux_mvp.collector import CollectionStopped
+from polymarket_bot.linux_mvp.collector import CollectionStopped, LiveCollector
 from polymarket_bot.linux_mvp.config import Settings
 from polymarket_bot.linux_mvp.ingest import IngestEngine
 from polymarket_bot.linux_mvp.service import Service
@@ -181,6 +181,13 @@ class IngestTests(unittest.TestCase):
         self.assertEqual(service.run(max_cycles=5), 'STOPPED')
         self.assertEqual(sum(delays), 0.25)
         self.assertEqual(self.store.heartbeat_row(BOT)['status'], 'STOPPED')
+
+    def test_live_collector_stop_predicate_aborts_before_attempt(self):
+        collector = LiveCollector()
+        self.addCleanup(collector.close)
+        collector.set_stop_check(lambda: True)
+        with self.assertRaises(CollectionStopped):
+            collector._before_attempt()
 
     def test_stop_during_collection_aborts_cleanly(self):
         class InterruptingCollector:
