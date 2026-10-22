@@ -216,9 +216,9 @@ and a source-stability inventory. Commands use the repository venv Python and th
 
 | Suite | Result | Log SHA-256 |
 |---|---|---|
-| Phase 1 MVP suites (config, store, engine, report, service, deploy, soak, ingest) | 76/76 OK (`42.875 s`) | `b835b618ab7524aa96182ca3b328b526383375bd0e1890ab815a00b94bd08579` |
+| Phase 1 MVP suites (config, store, engine, report, service, deploy, soak, ingest) | 77/77 OK (`28.453 s`) | `1a806ce545939ded90cb08a659b5f99bf63c4789123df0e699f47da4552932b1` |
 | exact 239-test baseline replay (original accepted test IDs, unchanged) | 239/239 OK (`236.906 s`) | `c625a35478669fb9a34af42af34498e850cf40ba995e22cc6b375a9f65832cde` |
-| focused regression (accepted paper, strategy, full_window, recorder-selected, discovery, snapshot) + all Phase 1 MVP suites | 258/258 OK (`257.421 s`) | `c04386ceeb3dd95753f48b71d1a638bfb529134df71ba71518b9d67e27faedb4` |
+| focused regression (accepted paper, strategy, full_window, recorder-selected, discovery, snapshot) + all Phase 1 MVP suites | 259/259 OK (`256.797 s`) | `6b24bb1530a3c4da286cae163ab42ca09461b9783a82057b9850205921868e9f` |
 | full discovery (prior tree, disclosure only) | 1116 tests, 0 failures, **2 errors**, `source_stable=true` | `f6651f6045cba83f11151d2098d2294dc8c955ba152dd8860da7c3a2d375a2eb` |
 
 The two full-discovery errors are not Phase 1 failures: one expects the historical
