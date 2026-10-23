@@ -57,6 +57,8 @@ def build_report(db_path: Path, *, run_id: str | None = None, now_us: int | None
                                  (bot_id,)).fetchall()
         orders = conn.execute('SELECT market_id, status, side, outcome, notional, fee, realized, reason '
                               'FROM orders WHERE bot_id=?', (bot_id,)).fetchall()
+        positions_rows = conn.execute('SELECT market_id, outcome, quantity, cost_basis FROM positions '
+                                      'WHERE bot_id=?', (bot_id,)).fetchall()
         equity_rows = conn.execute('SELECT cash, exposure, unrealized, missing_marks FROM equity '
                                    'WHERE bot_id=? ORDER BY id', (bot_id,)).fetchall()
 
@@ -68,6 +70,22 @@ def build_report(db_path: Path, *, run_id: str | None = None, now_us: int | None
     filled_notional = sum((_d(row[4]) for row in orders if row[1] in ('FILLED', 'PARTIAL')), ZERO)
     realized = sum((_d(row[6]) for row in orders if row[1] in ('FILLED', 'PARTIAL')), ZERO)
     rejection_reasons = Counter(row[7] for row in orders if row[1] == 'REJECTED')
+    open_positions = []
+    unresolved_positions = []
+    window_status_map = {row[0]: row[1] for row in windows}
+    for market_id, outcome, quantity, cost_basis in positions_rows:
+        q = _d(quantity)
+        if q > ZERO:
+            pos_dict = {
+                'market_id': market_id,
+                'outcome': outcome,
+                'quantity': str(q),
+                'cost_basis': str(_d(cost_basis)),
+                'window_status': window_status_map.get(market_id, 'UNKNOWN'),
+            }
+            open_positions.append(pos_dict)
+            if window_status_map.get(market_id) in ('ACTIVE', 'UNKNOWN_SETTLEMENT', None):
+                unresolved_positions.append(pos_dict)
     per_window = []
     for market_id, status, start_us, end_us in windows:
         owned = [row for row in orders if row[0] == market_id]
@@ -112,6 +130,19 @@ def build_report(db_path: Path, *, run_id: str | None = None, now_us: int | None
                    'fees': str(fees), 'filled_notional': str(filled_notional),
                    'realized': str(realized)},
         'rejections': dict(rejection_reasons),
+        'positions': {
+            'open': len(open_positions),
+            'unresolved': len(unresolved_positions),
+            'unknown_settlement': len(unresolved_positions),
+            'items': open_positions,
+        },
+        'performance': {
+            'realized_pnl': str(realized),
+            'unrealized_pnl': None if last_unrealized is None else str(last_unrealized),
+            'drawdown': None if drawdown is None else str(drawdown),
+            'verified_settled_trades': 0,
+            'win_rate_verified_settled': None,
+        },
         'account': {
             'initial_cash': str(_d(initial_cash)),
             'cash': None if last_equity is None else str(_d(last_equity[0])),
@@ -145,6 +176,8 @@ def render(report: dict) -> str:
         f"decisions: total={report['decisions']['total']} by_action={report['decisions']['by_action']}",
         f"orders: total={report['orders']['total']} by_status={report['orders']['by_status']} "
         f"fees={report['orders']['fees']}",
+        f"positions: open={report['positions']['open']} unresolved={report['positions']['unresolved']}",
+        f"performance: win_rate_verified={report['performance']['win_rate_verified_settled']}",
         f"account: cash={account['cash']} exposure={account['exposure']} "
         f"realized={account['realized']} unrealized={account['unrealized']} "
         f"net_value={account['net_value']}",

@@ -81,6 +81,19 @@ class ReportTests(unittest.TestCase):
         two = build_report(self.path, now_us=99)
         self.assertEqual(one, two)
 
+    def test_report_includes_positions_and_settlement_metrics(self):
+        report = build_report(self.path, now_us=123456)
+        self.assertIn('positions', report)
+        self.assertEqual(report['positions']['open'], 1)
+        self.assertEqual(report['positions']['unresolved'], 1)
+        self.assertEqual(report['positions']['unknown_settlement'], 1)
+        self.assertEqual(len(report['positions']['items']), 1)
+        self.assertEqual(report['positions']['items'][0]['outcome'], 'UP')
+        self.assertIn('performance', report)
+        self.assertIsNone(report['performance']['win_rate_verified_settled'])
+        self.assertEqual(report['performance']['verified_settled_trades'], 0)
+        self.assertEqual(report['performance']['realized_pnl'], report['account']['realized'])
+
     def test_empty_database_is_refused(self):
         empty = Path(self.tmp.name) / 'empty.sqlite'
         MvpStore.open(empty).close()
