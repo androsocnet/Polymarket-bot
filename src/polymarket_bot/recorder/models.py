@@ -46,6 +46,17 @@ class ResolutionObservation:
 class RunConfig:
     mode: str = "BOOK_ONLY"  # "BOOK_ONLY", "REFERENCE_REQUIRED", "APPROXIMATE_REFERENCE"
     use_fast_path: bool = True
+    selected_event_id: str | None = None
+    selected_market_id: str | None = None
+
+    def __post_init__(self):
+        import re
+        ids = (self.selected_event_id, self.selected_market_id)
+        if any(value is not None for value in ids):
+            if (self.mode != 'BOOK_ONLY' or any(type(value) is not str or
+                    re.fullmatch(r'[0-9]{1,256}', value) is None for value in ids)):
+                raise ValueError('Selected BOOK_ONLY mode requires paired decimal event and market IDs.')
+
     policy_revision: str = field(default="recorder-v1", init=False)
     cadence_us: int = field(default=2_000_000, init=False)
     window_us: int = field(default=900_000_000, init=False)

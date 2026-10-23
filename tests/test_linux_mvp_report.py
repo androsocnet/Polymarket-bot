@@ -29,12 +29,12 @@ class ReportTests(unittest.TestCase):
             self.engine.step()
 
     def test_counts_accounting_and_per_window(self):
-        report = build_report(self.path, now_us=123456)
+        report = build_report(self.path, now_us=us(START))
         self.assertEqual(report['schema'], 'mvp-report-v1')
         self.assertEqual(report['mode'], 'PAPER_ONLY')
         self.assertEqual(report['execution'], 'HYPOTHETICAL_PAPER_ONLY')
         self.assertEqual(report['settlement'], 'UNKNOWN_NOT_INFERRED')
-        self.assertEqual(report['generated_us'], 123456)
+        self.assertEqual(report['generated_us'], us(START))
         self.assertEqual(report['decisions']['total'], 4)
         self.assertEqual(report['decisions']['by_action'], {'HOLD': 3, 'BUY UP': 1})
         self.assertEqual(report['orders']['total'], 1)

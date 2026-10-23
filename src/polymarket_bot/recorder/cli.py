@@ -57,6 +57,8 @@ def _parser() -> argparse.ArgumentParser:
     record.add_argument("--mode", required=True, choices=("book-only", "reference-required", "approximate-reference"))
     record.add_argument("--db", required=True, type=Path)
     record.add_argument("--no-fast-path", action="store_true")
+    record.add_argument("--event-id")
+    record.add_argument("--market-id")
     record.add_argument("--duration-seconds", type=_duration_seconds)
     report = subcommands.add_parser("report", help="Measure an existing database without writes or APIs.")
     report.add_argument("--db", required=True, type=Path)
@@ -68,7 +70,8 @@ def _parser() -> argparse.ArgumentParser:
 _retained_approximate_runs = []
 
 
-def _record(path: Path, use_fast_path: bool, mode: str, duration_seconds: float | None = None) -> int:
+def _record(path: Path, use_fast_path: bool, mode: str, duration_seconds: float | None = None,
+            *, event_id=None, market_id=None, transport=None) -> int:
     deadline_ns = None if duration_seconds is None else time.monotonic_ns() + int(
         _duration_seconds(str(duration_seconds)) * 1_000_000_000)
     if mode == "approximate-reference":
@@ -116,22 +119,29 @@ def _record(path: Path, use_fast_path: bool, mode: str, duration_seconds: float 
         print("activation_required: verified Chainlink reference runtime is unavailable.", file=sys.stderr)
         return 2
     else:
-        return _record_book_only(path, use_fast_path, deadline_ns=deadline_ns)
+        return _record_book_only(path, use_fast_path, deadline_ns=deadline_ns,
+                                 event_id=event_id, market_id=market_id,
+                                 **({'transport': transport} if transport is not None else {}))
 
 
-def _record_book_only(path: Path, use_fast_path: bool, *, deadline_ns: int | None = None) -> int:
+def _record_book_only(path: Path, use_fast_path: bool, *, deadline_ns: int | None = None,
+                      event_id=None, market_id=None, transport=None) -> int:
     print("BOOK_ONLY / REFERENCE_INCOMPLETE: public book evidence; no verified live reference coverage.")
     store = None
     try:
-        store = RecorderStore.open(path)
-        with httpx.Client(trust_env=False, follow_redirects=False) as client:
+        if market_id is not None and path.exists():
+            raise RecorderStoreError('selected_database_not_fresh', 'Selected mode requires a fresh database path.')
+        store = RecorderStore.open(path, require_new=True) if market_id is not None else RecorderStore.open(path)
+        with httpx.Client(trust_env=False, follow_redirects=False,
+                          **({'transport': transport} if transport is not None else {})) as client:
             public = PublicGet(client, monotonic=time.monotonic, monotonic_ns=time.monotonic_ns,
                                sleep=time.sleep, utcnow=lambda: datetime.now(timezone.utc),
                                max_attempts=2)
             recorder = Recorder(store, public, monotonic_ns=time.monotonic_ns,
                                 wall_us=_wall_us,
                                 sleep=time.sleep)
-            result = recorder.run(RunConfig(use_fast_path=use_fast_path), should_stop=lambda: False,
+            result = recorder.run(RunConfig(use_fast_path=use_fast_path,
+                                  selected_event_id=event_id, selected_market_id=market_id), should_stop=lambda: False,
                                   deadline_ns=deadline_ns)
         print(f"run_id={result.run_id} state={result.state} slots_finalized={result.slots_finalized} reason={result.reason}")
         return result.exit_code
@@ -177,14 +187,28 @@ def _report(path: Path, start_us: int, end_us: int) -> int:
     return 0
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(argv: Sequence[str] | None = None, *, transport=None) -> int:
     try:
         args = _parser().parse_args(argv)
     except SystemExit as exc:
         return int(exc.code)
+    if transport is not None and (args.command != 'record' or args.mode != 'book-only'
+                                  or args.event_id is None or args.market_id is None):
+        print('transport_injection_requires_selected_book_only', file=sys.stderr)
+        return 2
     if args.command == "record":
         if args.mode == "reference-required":
             print("activation_required: verified Chainlink reference runtime is unavailable.", file=sys.stderr)
             return 2
+        try:
+            RunConfig(mode=args.mode.upper().replace('-', '_'), selected_event_id=args.event_id,
+                      selected_market_id=args.market_id)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        if args.event_id is not None:
+            return _record(args.db, not args.no_fast_path, args.mode, args.duration_seconds,
+                           event_id=args.event_id, market_id=args.market_id,
+                           **({'transport': transport} if transport is not None else {}))
         return _record(args.db, not args.no_fast_path, args.mode, args.duration_seconds)
     return _report(args.db, args.start, args.end)

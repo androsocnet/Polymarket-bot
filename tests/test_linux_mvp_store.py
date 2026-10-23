@@ -67,6 +67,7 @@ class StoreTests(unittest.TestCase):
                                              'slot_index': 4}))
 
     def test_order_ids_dedupe_and_execute_once(self):
+        self.store.ensure_window(BOT, RUN, **MARKET, at_us=us(START))
         order = dict(order_id='o-1', bot_id=BOT, run_id=RUN, market_id=MARKET_ID,
                      token_id=UP_TOKEN, outcome='UP', side='BUY', quantity=Decimal('9.99'),
                      decision_slot_id=MARKET_ID + ':3', reason='SIGNAL_BUY',
@@ -93,6 +94,7 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.store.trade_count(BOT, MARKET_ID), 1)
 
     def test_partial_fill_is_terminal_and_retry_is_noop(self):
+        self.store.ensure_window(BOT, RUN, **MARKET, at_us=us(START))
         self.store.queue_order(order_id='o-2', bot_id=BOT, run_id=RUN, market_id=MARKET_ID,
                                token_id=UP_TOKEN, outcome='UP', side='BUY',
                                quantity=Decimal('5'), decision_slot_id='d', reason='SIGNAL_BUY',
@@ -106,6 +108,7 @@ class StoreTests(unittest.TestCase):
                                                      at_us=us(START) + 1))
 
     def test_no_liquidity_rejects_without_position(self):
+        self.store.ensure_window(BOT, RUN, **MARKET, at_us=us(START))
         self.store.queue_order(order_id='o-3', bot_id=BOT, run_id=RUN, market_id=MARKET_ID,
                                token_id=UP_TOKEN, outcome='UP', side='BUY',
                                quantity=Decimal('1'), decision_slot_id='d', reason='SIGNAL_BUY',
@@ -119,6 +122,7 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.store.cash(BOT), Decimal('100'))
 
     def test_sell_realizes_pnl_and_reduces_basis(self):
+        self.store.ensure_window(BOT, RUN, **MARKET, at_us=us(START))
         for order_id, side, quantity in (('b', 'BUY', '10'), ('s', 'SELL', '10')):
             self.store.queue_order(order_id=order_id, bot_id=BOT, run_id=RUN, market_id=MARKET_ID,
                                    token_id=UP_TOKEN, outcome='UP', side=side,
@@ -150,7 +154,7 @@ class StoreTests(unittest.TestCase):
             self.store.start_run('r-bad', BOT, initial_cash=Decimal('100'),
                                  config={}, started_us=us(START), mode='LIVE')
         with self.assertRaises(sqlite3.IntegrityError):
-            self.store.close_window(BOT, MARKET_ID, 'SETTLED', at_us=us(START), note='')
+            self.store.close_window(BOT, MARKET_ID, 'LIVE_TRADING', at_us=us(START), note='')
 
     def test_reopen_keeps_state_and_lock_is_optional(self):
         self.store.ensure_window(BOT, RUN, **MARKET, at_us=us(START))

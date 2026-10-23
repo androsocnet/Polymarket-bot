@@ -2,14 +2,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_FLOOR
+from decimal import Decimal, ROUND_FLOOR, localcontext
 import json
 import time
 
 from ..market_data.models import MarketDataError
 from .config import Settings
-from .settlement import classify_resolution
-from .store import ZERO, MvpStore
+from .store import ARITHMETIC, ZERO, MvpStore
 
 UP, DOWN = 'UP', 'DOWN'
 
@@ -46,7 +45,6 @@ class PaperEngine:
         self.consecutive_errors = 0
         self.cycles = 0
         self._loss_event_day = None
-        self._last_settlement_poll = {}
 
     # -- cycle ---------------------------------------------------------------
     def step(self) -> StepResult:
@@ -64,6 +62,11 @@ class PaperEngine:
                 self._beat(at, heartbeat.get('market_id'), 'STOPPED', None)
             return StepResult('STOPPED', reason='EMERGENCY_STOP')
 
+        self._reconcile_settlements(at)
+        at = self.now_us()
+        if self.settings.stop_path.exists():
+            self._beat(at, heartbeat.get('market_id'), 'STOPPED', None)
+            return StepResult('STOPPED', reason='EMERGENCY_STOP')
         day_start = (at // 86_400_000_000) * 86_400_000_000
         if self.store.realized(self.bot_id, since_us=day_start) <= -self.settings.max_daily_loss:
             day = at // 86_400_000_000
@@ -74,8 +77,7 @@ class PaperEngine:
             self._beat(at, heartbeat.get('market_id'), 'RISK_STOPPED', 'DAILY_LOSS_LIMIT')
             return StepResult('RISK_STOPPED', reason='DAILY_LOSS_LIMIT')
 
-        self._reconcile_settlements(at)
-
+        self.store.reconcile(self.bot_id)
         try:
             snapshot = self.collector.collect()
         except MarketDataError as exc:
@@ -86,8 +88,22 @@ class PaperEngine:
             self._beat(at, heartbeat.get('market_id'), status, exc.reason)
             return StepResult(status, reason=exc.reason)
         self.consecutive_errors = 0
+        at = self.now_us()
+        if self.settings.stop_path.exists():
+            self._beat(at, heartbeat.get('market_id'), 'STOPPED', None)
+            return StepResult('STOPPED', reason='EMERGENCY_STOP')
 
         market = snapshot.market
+        persisted = self.store.window(self.bot_id, market.market_id)
+        identities = self.store.observations_for_market(self.bot_id, market.market_id)
+        expected_tokens = {'UP': market.up.token_id, 'DOWN': market.down.token_id}
+        if (persisted is not None and (persisted['condition_id'] != market.condition_id
+                or persisted['start_us'] != _us(market.window_start)
+                or persisted['end_us'] != _us(market.window_end)
+                or persisted['event_id'] != market.event_id)
+                or any(expected_tokens.get(row['outcome']) != row['token_id'] for row in identities)):
+            self._beat(at, market.market_id, 'FAILED_STOP', 'IDENTITY_CONFLICT')
+            return StepResult('FAILED_STOP', market.market_id, reason='IDENTITY_CONFLICT')
         start_us, end_us = _us(market.window_start), _us(market.window_end)
         validated = _us(snapshot.validated_at)
         active = self.store.active_window(self.bot_id)
@@ -143,6 +159,11 @@ class PaperEngine:
                 fresh[outcome] = book
 
         self._execute_pending(market.market_id, slot_index, fresh, at)
+        day_start = (at // 86_400_000_000) * 86_400_000_000
+        if self.store.realized(self.bot_id, since_us=day_start) <= -self.settings.max_daily_loss:
+            self._mark(market.market_id, fresh, at)
+            self._beat(at, market.market_id, 'RISK_STOPPED', 'DAILY_LOSS_LIMIT')
+            return StepResult('RISK_STOPPED', market.market_id, reason='DAILY_LOSS_LIMIT')
 
         if self.store.decision(self.bot_id, market.market_id, slot_id) is not None:
             self._mark(market.market_id, fresh, at)
@@ -258,8 +279,11 @@ class PaperEngine:
             return
         result = self.store.execute_pending(self.bot_id, fresh, self.settings.fee_bps, at_us=at)
         if result is not None:
+            detail = {k: str(v) for k, v in result.items()}
+            detail.update(signal_to_terminal_us=at - pending['created_us'],
+                          latency_kind='PAPER_DECISION_TO_TERMINAL_WALL_CLOCK')
             self.store.event(self.bot_id, self.run_id, at_us=at, kind='order_executed',
-                             detail=json.dumps({k: str(v) for k, v in result.items()}, sort_keys=True))
+                             detail=json.dumps(detail, sort_keys=True))
 
     def _reject_pending_of(self, market_id: str, at: int) -> None:
         pending = self.store.pending_order(self.bot_id)
@@ -272,22 +296,23 @@ class PaperEngine:
                              detail=f'{pending["order_id"]}:{reason}')
 
     def _mark(self, market_id: str, fresh: dict, at: int) -> None:
-        positions = self.store.open_positions(self.bot_id)
-        exposure = sum((position['cost_basis'] for position in positions), ZERO)
-        unrealized = ZERO
-        missing = 0
-        for position in positions:
-            if position['quantity'] <= 0:
-                continue
-            book = fresh.get(position['outcome']) if position['market_id'] == market_id else None
-            if book is None or book.best_bid is None:
-                missing += 1
-                continue
-            unrealized += position['quantity'] * book.best_bid - position['cost_basis']
-        self.store.equity(self.bot_id, self.run_id, at_us=at, market_id=market_id,
-                          cash=self.store.cash(self.bot_id), exposure=exposure,
-                          realized=self.store.realized(self.bot_id),
-                          unrealized=None if missing else unrealized, missing_marks=missing)
+        with localcontext(ARITHMETIC):
+            positions = self.store.open_positions(self.bot_id)
+            exposure = sum((position['cost_basis'] for position in positions), ZERO)
+            unrealized = ZERO
+            missing = 0
+            for position in positions:
+                if position['quantity'] <= 0:
+                    continue
+                book = fresh.get(position['outcome']) if position['market_id'] == market_id else None
+                if book is None or book.best_bid is None:
+                    missing += 1
+                    continue
+                unrealized += position['quantity'] * book.best_bid - position['cost_basis']
+            self.store.equity(self.bot_id, self.run_id, at_us=at, market_id=market_id,
+                              cash=self.store.cash(self.bot_id), exposure=exposure,
+                              realized=self.store.realized(self.bot_id),
+                              unrealized=None if missing else unrealized, missing_marks=missing)
 
     def _abandon(self, window: dict, at: int, status: str, note: str, kind: str) -> None:
         self.store.close_window(self.bot_id, window['market_id'], status, at_us=at, note=note)
@@ -295,31 +320,17 @@ class PaperEngine:
                          detail=f'{window["market_id"]}:{note}')
 
     def _reconcile_settlements(self, at: int) -> None:
-        unsettled = self.store.unsettled_windows(self.bot_id)
-        if not unsettled:
+        if not hasattr(self.collector, 'get_resolution'):
             return
-        for window in unsettled:
-            market_id = window['market_id']
-            last_poll = self._last_settlement_poll.get(market_id, 0)
-            if at - last_poll < 10_000_000:
-                continue
-            self._last_settlement_poll[market_id] = at
-            payload = None
-            if hasattr(self.collector, 'get_resolution'):
-                try:
-                    payload = self.collector.get_resolution(window['condition_id'])
-                except Exception:
-                    continue
-            elif hasattr(self.collector, 'resolutions'):
-                payload = self.collector.resolutions.get(window['condition_id'])
-
-            if payload is not None:
-                classified = classify_resolution(payload, condition_id=window['condition_id'])
-                if classified.get('status') == 'RESOLVED' and classified.get('winning_outcome'):
-                    self.store.settle_window(
-                        self.bot_id, market_id, classified['winning_outcome'],
-                        resolved_at=classified.get('resolved_at') or '',
-                        tx_hash=classified.get('tx_hash') or '', at_us=at)
+        for window in self.store.unsettled_windows(self.bot_id, at_us=at):
+            if window['status'] == 'ACTIVE':
+                self._abandon(window, at, 'UNKNOWN_SETTLEMENT', 'expired before collection', 'window_expired')
+                self._reject_pending_of(window['market_id'], at)
+            try:
+                evidence = self.collector.get_resolution(window) or {}
+            except MarketDataError as exc:
+                evidence = {'error': str(exc)}
+            self.store.settle_window(self.bot_id, window['market_id'], evidence=evidence, at_us=self.now_us())
 
     def _beat(self, at: int, market_id: str | None, status: str, error: str | None) -> None:
         self.store.heartbeat(self.bot_id, self.run_id, at_us=at, market_id=market_id,

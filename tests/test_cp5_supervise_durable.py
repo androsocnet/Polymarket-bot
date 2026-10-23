@@ -23,6 +23,7 @@ class DurableSupervisorTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.journal = self.root / 'execution.jsonl'
         self.db = self.root / 'toy.sqlite3'
+        self.addCleanup(self.wait_supervisor_exit)
 
     def launch(self, code='pass', timeout=2.0, journal=None):
         return subprocess.Popen([sys.executable, str(SCRIPT), 'run', '--journal', str(journal or self.journal), '--db', str(self.db), '--boundary', '123', '--watchdog', str(timeout), '--', sys.executable, '-c', code], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -31,6 +32,51 @@ class DurableSupervisorTests(unittest.TestCase):
         if not self.journal.exists():
             return []
         return [json.loads(line) for line in self.journal.read_text().splitlines()]
+
+    def wait_supervisor_exit(self):
+        """Terminal journal event precedes process exit; temporary files may still be open."""
+        if os.name != 'nt' or not self.journal.exists():
+            return
+        import ctypes
+        from ctypes import wintypes
+        try:
+            prepared = json.loads(self.journal.read_text().splitlines()[0])
+        except (ValueError, IndexError):
+            return  # tests deliberately retain malformed offline evidence
+        pid = prepared.get('supervisor_pid') if isinstance(prepared, dict) else None
+        if not pid or pid == os.getpid():
+            return
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel.WaitForSingleObject.restype = wintypes.DWORD
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE only; never kill by PID
+        if not handle:
+            self.assertEqual(ctypes.get_last_error(), 87)  # process already exited
+            return
+        try:
+            self.assertEqual(kernel.WaitForSingleObject(handle, 20000), 0, 'supervisor did not exit')
+        finally:
+            kernel.CloseHandle(handle)
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows journal cleanup race')
+    def test_terminal_record_is_not_process_exit(self):
+        done = self.root / 'supervisor-exited'
+        code = ("import os,time; from pathlib import Path; "
+                f"p=Path({str(self.journal)!r}); "
+                "f=p.open('w'); f.write('{\"event\":\"PREPARED\",\"supervisor_pid\":'+str(os.getpid())+'}\\n'); "
+                "f.flush(); time.sleep(.25); "
+                f"Path({str(done)!r}).touch(); f.close()")
+        process = subprocess.Popen([sys.executable, '-c', code])
+        try:
+            self.wait_event('PREPARED')
+            self.wait_supervisor_exit()
+            self.assertTrue(done.exists())
+            self.journal.unlink()
+        finally:
+            process.wait(timeout=10)
 
     def wait_event(self, event):
         end = time.monotonic() + 8
@@ -280,6 +326,14 @@ class DurableSupervisorTests(unittest.TestCase):
 
     def test_round2_decoder_recursion_retains_streams(self):
         import hashlib
+        # Python 3.14+ C json module handles deeper nesting without RecursionError;
+        # skip if current version doesn't trigger it for this input.
+        try:
+            json.loads(b'['*20000+b'0'+b']'*20000)
+        except RecursionError:
+            pass
+        else:
+            self.skipTest('json C module handles 20000-deep nesting without RecursionError')
         nested = b'['*20000+b'0'+b']'*20000+b'\n'
         stdout = nested+b'trailing-stdout\n'
         stderr = b'trailing-stderr\n'

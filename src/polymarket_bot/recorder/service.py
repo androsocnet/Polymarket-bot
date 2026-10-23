@@ -761,9 +761,7 @@ class Recorder:
             return
         if self.revalidate:
             try:
-                candidate = self._control(lambda: acquire_market(self.gamma, self.public,
-                    clock=self.clock, deadline=deadline_ns / 1_000_000_000,
-                    use_fast_path=self.config.use_fast_path))
+                candidate = self._control(lambda: self._acquire(deadline_ns / 1_000_000_000))
             except MarketDataError as exc:
                 if not self._clock_ready_after_io("ANCHOR_EXPIRED_DURING_REVALIDATION"):
                     return
@@ -781,8 +779,13 @@ class Recorder:
         previous = self.revision
         last = previous.last_refresh_attempt_us or previous.observed_us
         if previous.market.market_id not in self.invalidated and self._now() >= last + 60_000_000:
-            candidate = self._control(lambda: refresh_revision(previous, self.gamma, self.public,
-                clock=self.clock, deadline=deadline_ns / 1_000_000_000))
+            if self.config.selected_market_id is not None:
+                candidate = self._control(lambda: self._acquire(deadline_ns / 1_000_000_000))
+                if _identity(candidate) != _identity(previous):
+                    raise MarketDataError('identity_conflict', 'Selected market identity changed.')
+            else:
+                candidate = self._control(lambda: refresh_revision(previous, self.gamma, self.public,
+                    clock=self.clock, deadline=deadline_ns / 1_000_000_000))
             if not self._clock_ready_after_io("ANCHOR_EXPIRED_DURING_METADATA"):
                 return
             if not self._save_revision(candidate):
@@ -848,6 +851,8 @@ class Recorder:
                 nominal_target_ns=self._nominal_target_ns(boundary) if self.clock.usable() else None))
 
     def _prepare_next(self, deadline_ns: int) -> None:
+        if getattr(getattr(self, 'config', None), 'selected_market_id', None) is not None:
+            return
         if self.revision is None or not self.clock.usable():
             self._prepared = None
             return
@@ -939,6 +944,8 @@ class Recorder:
             self._preparation_phase = (owner, 'ARMED')
 
     def _activate_prepared(self) -> bool:
+        if getattr(getattr(self, 'config', None), 'selected_market_id', None) is not None:
+            return False
         prepared = getattr(self, '_prepared', None)
         if prepared is None or prepared['armed_ns'] is None:
             return False
@@ -1244,11 +1251,22 @@ class Recorder:
             self.store.finish_discovery_gap(self.discovery_gap_id, run_id=self.run_id, ended_us=observed_us)
             self.discovery_gap_id = None
 
+    def _acquire(self, deadline):
+        if self.config.selected_market_id is not None:
+            from .metadata import acquire_selected_market
+            return acquire_selected_market(self.gamma, self.public, clock=self.clock, deadline=deadline,
+                event_id=self.config.selected_event_id, market_id=self.config.selected_market_id)
+        return acquire_market(self.gamma, self.public, clock=self.clock, deadline=deadline,
+                              use_fast_path=self.config.use_fast_path)
+
     def _record(self, config, *, should_stop):
         self.config = config
         self.revalidate = False
         self._prepared = self._preparation_phase = self._armed_opening = None
         previous_wall_us, self.known_markets = self.store.restart_context()
+        if config.selected_market_id is not None and (not self.store.created_new or
+                self.store._one('SELECT run_id FROM recording_runs LIMIT 1')):
+            raise MarketDataError('selected_database_not_fresh', 'Selected mode requires a fresh database.')
         self.invalidated = {row["market_id"] for row in self.known_markets if row["lifecycle"] == "INVALIDATED"}
         self.store.recover_interrupted(wall_us=self.wall_us())
         self.public.max_attempts = min(self.public.max_attempts, config.max_attempts)
@@ -1307,10 +1325,11 @@ class Recorder:
             if self.revision is None:
                 started_us = self._now()
                 try:
-                    candidate = self._control(lambda: acquire_market(self.gamma, self.public,
-                        clock=self.clock, deadline=min(self.public.monotonic()+10, self.run_deadline_ns/1_000_000_000),
-                        use_fast_path=config.use_fast_path))
+                    candidate = self._control(lambda: self._acquire(
+                        min(self.public.monotonic()+10, self.run_deadline_ns/1_000_000_000)))
                 except MarketDataError as exc:
+                    if config.selected_market_id is not None:
+                        raise
                     self._clock_ready_after_io("ANCHOR_EXPIRED_DURING_DISCOVERY")
                     if self.discovery_gap_id is None:
                         self._start_discovery_gap(started_us, reason=exc.code, unknown_market=True)
@@ -1352,6 +1371,9 @@ class Recorder:
             self.miss_reason = "PROCESSING_OVERRUN" if self.revision.capture_ready else "METADATA_NOT_READY"
             if now >= end_us:
                 self.store.expire_market(market.market_id, observed_us=now)
+                if config.selected_market_id is not None:
+                    self._shutdown('STOPPED', 'SELECTED_MARKET_EXPIRED')
+                    return RunResult(self.run_id, 'STOPPED', 0, self.finalized, 'SELECTED_MARKET_EXPIRED')
                 self._start_discovery_gap(end_us, reason="ROLLOVER", prior_market_id=market.market_id)
                 self.revision = None
                 self.miss_reason = "BEFORE_START"
@@ -1419,9 +1441,12 @@ class Recorder:
                 if self.offline_reference.live is None and not self._reference_submit(row, reference_deadline_ns):
                     current_reference_result = 'BUSY'
             previous = self.public.on_attempt
-            self.public.on_attempt = None
+            # ponytail: buffer until finalization/unwind; crash audit needs write-ahead persistence.
+            attempts = []
+            self.public.on_attempt = attempts.append
             self._book_identity = dict(market_id=market.market_id, slot_id=slot_id,
                 slot_index=target.index, target_ns=target_ns, leg='PAIRED')
+            finalized_before = self.finalized
             try:
                 if timing is not None:
                     timing('DISPATCH_READY', slot_id=slot_id, slot_index=target.index, target_ns=target_ns)
@@ -1430,27 +1455,47 @@ class Recorder:
                     deadline=min(self.run_deadline_ns, self.clock.deadline_ns(min(target.scheduled_us+2_000_000, end_us)))/1_000_000_000,
                     receipt_server_us=lambda moment: project(round(moment*1_000_000_000)),
                     uncertainty_us=self.clock.anchor.uncertainty_us)
+                ended_ns = self.monotonic_ns()
+                if hasattr(self, '_research_evidence'):
+                    self._persist_book_attempts(books, market_id=market.market_id, slot_id=slot_id,
+                        slot_index=target.index, target_ns=target_ns,
+                        up_token=market.up.token_id, down_token=market.down.token_id)
+                reference = disabled_reference(market.market_id, target.scheduled_us,
+                    learned_wall_us=self.wall_us(), learned_server_us=project(ended_ns))
+                if self.approximate_worker is not None:
+                    from dataclasses import replace
+                    reference = replace(reference, status='UNAVAILABLE', reason='APPROXIMATE_REFERENCE')
+                if self.reference_worker is not None:
+                    from dataclasses import replace
+                    reference = replace(reference, status='UNAVAILABLE',
+                        reason='REFERENCE_BUSY' if current_reference_result == 'BUSY' else 'REFERENCE_PENDING')
+                self.store.finalize_slot(slot_id, SlotCommit(market.market_id, target, self.run_id,
+                    self.anchor_id, self.revision_id, books, reference, started_ns, ended_ns),
+                    committed_wall_us=self.wall_us())
+                self.finalized += 1
+            except (_StopRequested, KeyboardInterrupt) as exc:
+                if self.store._one('SELECT status FROM sample_slots WHERE slot_id=?', (slot_id,))['status'] != 'IN_PROGRESS':
+                    self.finalized = finalized_before + 1
+                    raise  # Already committed evidence must not be downgraded on a late interrupt.
+                from .models import OutcomeResult, PairedBooks
+                reason = 'STOP_REQUESTED' if isinstance(exc, _StopRequested) else 'KEYBOARD_INTERRUPT'
+                ended_ns = self.monotonic_ns()
+                interrupted = PairedBooks(*(OutcomeResult(label, token, market.condition_id,
+                    'INTERRUPTED', None, None, 'interrupted_before_commit', {}, {})
+                    for label, token in (('UP', market.up.token_id), ('DOWN', market.down.token_id))),
+                    tuple(attempts))
+                reference = disabled_reference(market.market_id, target.scheduled_us,
+                    learned_wall_us=self.wall_us(), learned_server_us=project(ended_ns))
+                if self.approximate_worker is not None or self.reference_worker is not None:
+                    from dataclasses import replace
+                    reference = replace(reference, status='UNAVAILABLE')
+                self.store.finalize_slot(slot_id, SlotCommit(market.market_id, target, self.run_id,
+                    self.anchor_id, self.revision_id, interrupted, reference, started_ns, ended_ns),
+                    committed_wall_us=self.wall_us(), interrupted_reason=reason)
+                raise
             finally:
                 self._book_guard = None
                 self.public.on_attempt = previous
-            ended_ns = self.monotonic_ns()
-            if hasattr(self, '_research_evidence'):
-                self._persist_book_attempts(books, market_id=market.market_id, slot_id=slot_id,
-                    slot_index=target.index, target_ns=target_ns,
-                    up_token=market.up.token_id, down_token=market.down.token_id)
-            reference = disabled_reference(market.market_id, target.scheduled_us,
-                learned_wall_us=self.wall_us(), learned_server_us=project(ended_ns))
-            if self.approximate_worker is not None:
-                from dataclasses import replace
-                reference = replace(reference, status='UNAVAILABLE', reason='APPROXIMATE_REFERENCE')
-            if self.reference_worker is not None:
-                from dataclasses import replace
-                reference = replace(reference, status='UNAVAILABLE',
-                    reason='REFERENCE_BUSY' if current_reference_result == 'BUSY' else 'REFERENCE_PENDING')
-            self.store.finalize_slot(slot_id, SlotCommit(market.market_id, target, self.run_id,
-                self.anchor_id, self.revision_id, books, reference, started_ns, ended_ns),
-                committed_wall_us=self.wall_us())
-            self.finalized += 1
             if timing is not None:
                 timing('FINALIZATION_END', slot_id=slot_id, slot_index=target.index,
                     target_ns=target_ns, capture_end_ns=ended_ns)

@@ -10,7 +10,7 @@ import sqlite3
 SCHEMA = 'mvp-v1'
 ARITHMETIC = Context(prec=512, rounding=ROUND_HALF_EVEN)
 ZERO = Decimal(0)
-WINDOW_STATUSES = ('ACTIVE', 'CLOSED', 'ABORTED', 'UNKNOWN_SETTLEMENT')
+WINDOW_STATUSES = ('ACTIVE', 'CLOSED', 'ABORTED', 'UNKNOWN_SETTLEMENT', 'SETTLED')
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS runs(
@@ -128,7 +128,18 @@ CREATE TABLE IF NOT EXISTS settlements(
     resolved_at TEXT,
     tx_hash TEXT,
     settled_us INTEGER NOT NULL,
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    position_count INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY(bot_id, market_id));
+CREATE TABLE IF NOT EXISTS resolution_attempts(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    bot_id TEXT NOT NULL,
+    market_id TEXT NOT NULL,
+    at_us INTEGER NOT NULL,
+    next_us INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    diagnostic TEXT NOT NULL,
+    evidence_json TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS orders_status ON orders(bot_id, status);
 CREATE INDEX IF NOT EXISTS observations_market ON observations(bot_id, market_id, slot_index);
 CREATE INDEX IF NOT EXISTS decisions_market ON decisions(bot_id, market_id, slot_index);
@@ -163,18 +174,25 @@ class MvpStore:
         conn.execute('PRAGMA busy_timeout=10000')
         conn.execute('PRAGMA foreign_keys=ON')
         conn.executescript(_SCHEMA_SQL)
-        # ponytail: migrate windows table check constraint for SETTLED status if existing DB has old schema
-        sql_row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='windows'").fetchone()
-        if sql_row and 'SETTLED' not in sql_row[0]:
-            conn.execute("PRAGMA foreign_keys=OFF")
-            conn.execute("CREATE TABLE windows_new(bot_id TEXT NOT NULL, market_id TEXT NOT NULL, run_id TEXT NOT NULL, "
-                         "condition_id TEXT NOT NULL, event_id TEXT NOT NULL, start_us INTEGER NOT NULL, end_us INTEGER NOT NULL, "
-                         "status TEXT NOT NULL CHECK(status IN ('ACTIVE','CLOSED','ABORTED','UNKNOWN_SETTLEMENT','SETTLED')), "
-                         "note TEXT NOT NULL DEFAULT '', updated_us INTEGER NOT NULL, PRIMARY KEY(bot_id, market_id))")
-            conn.execute("INSERT INTO windows_new SELECT * FROM windows")
-            conn.execute("DROP TABLE windows")
-            conn.execute("ALTER TABLE windows_new RENAME TO windows")
-            conn.execute("PRAGMA foreign_keys=ON")
+        try:
+            conn.execute('BEGIN IMMEDIATE')
+            sql = conn.execute("SELECT sql FROM sqlite_master WHERE name='windows'").fetchone()[0]
+            if "'SETTLED'" not in sql:
+                conn.execute(sql.replace('CREATE TABLE windows', 'CREATE TABLE windows_new', 1)
+                             .replace("'UNKNOWN_SETTLEMENT')", "'UNKNOWN_SETTLEMENT','SETTLED')"))
+                conn.execute('INSERT INTO windows_new SELECT * FROM windows')
+                conn.execute('DROP TABLE windows')
+                conn.execute('ALTER TABLE windows_new RENAME TO windows')
+            columns = {r[1] for r in conn.execute('PRAGMA table_info(settlements)')}
+            if 'evidence_json' not in columns:
+                conn.execute("ALTER TABLE settlements ADD COLUMN evidence_json TEXT NOT NULL DEFAULT '{}'")
+            if 'position_count' not in columns:
+                conn.execute('ALTER TABLE settlements ADD COLUMN position_count INTEGER')
+            conn.execute('COMMIT')
+        except BaseException:
+            conn.execute('ROLLBACK')
+            conn.close()
+            raise
         return cls(path, conn)
 
     def close(self) -> None:
@@ -355,6 +373,10 @@ class MvpStore:
                 for market_id, outcome, quantity, cost_basis in rows if _d(quantity) > 0]
 
     def _cash_in(self, conn, bot_id: str) -> Decimal:
+        with localcontext(ARITHMETIC):
+            return self._cash_sum(conn, bot_id)
+
+    def _cash_sum(self, conn, bot_id: str) -> Decimal:
         row = conn.execute('SELECT initial_cash FROM accounts WHERE bot_id=?', (bot_id,)).fetchone()
         cash = ZERO if row is None else _d(row[0])
         for side, status, notional, fee in conn.execute(
@@ -374,10 +396,14 @@ class MvpStore:
         return self._cash_in(self._conn, bot_id)
 
     def realized(self, bot_id: str, *, since_us: int | None = None) -> Decimal:
+        with localcontext(ARITHMETIC):
+            return self._realized_sum(bot_id, since_us=since_us)
+
+    def _realized_sum(self, bot_id: str, *, since_us: int | None) -> Decimal:
         sql = ("SELECT realized FROM orders WHERE bot_id=? AND side='SELL' AND status IN ('FILLED','PARTIAL')")
         args = [bot_id]
         if since_us is not None:
-            sql += ' AND created_us>=?'
+            sql += ' AND updated_us>=?'
             args.append(since_us)
         order_realized = sum((_d(r[0]) for r in self._conn.execute(sql, args)), ZERO)
         settle_sql = "SELECT realized_pnl FROM settlements WHERE bot_id=? AND status='RESOLVED'"
@@ -388,23 +414,26 @@ class MvpStore:
         settled_realized = sum((_d(r[0]) for r in self._conn.execute(settle_sql, settle_args)), ZERO)
         return order_realized + settled_realized
 
-    def unsettled_windows(self, bot_id: str) -> list[dict]:
+    def unsettled_windows(self, bot_id: str, *, at_us: int) -> list[dict]:
         cur = self._conn.execute(
-            "SELECT bot_id, market_id, run_id, condition_id, event_id, start_us, end_us, status, note, updated_us "
-            "FROM windows WHERE bot_id=? AND status='UNKNOWN_SETTLEMENT' ORDER BY start_us", (bot_id,))
+            "SELECT w.* FROM windows w WHERE w.bot_id=? AND w.status!='SETTLED' AND w.end_us<=? "
+            "AND NOT EXISTS (SELECT 1 FROM resolution_attempts a WHERE a.bot_id=w.bot_id "
+            "AND a.market_id=w.market_id AND a.next_us>?) ORDER BY w.start_us LIMIT 1",
+            (bot_id, at_us, at_us))
         cols = [c[0] for c in cur.description]
         return [_row(r, cols) for r in cur.fetchall()]
 
     def settlements(self, bot_id: str) -> list[dict]:
         cur = self._conn.execute(
             "SELECT bot_id, market_id, condition_id, status, winning_outcome, payout_total, realized_pnl, "
-            "resolved_at, tx_hash, settled_us FROM settlements WHERE bot_id=? ORDER BY settled_us", (bot_id,))
+            "resolved_at, tx_hash, settled_us, evidence_json, position_count FROM settlements "
+            "WHERE bot_id=? ORDER BY settled_us", (bot_id,))
         cols = [c[0] for c in cur.description]
         return [_row(r, cols) for r in cur.fetchall()]
 
-    def settle_window(self, bot_id: str, market_id: str, winning_outcome: str | None, *,
-                      resolved_at: str = '', tx_hash: str = '', at_us: int) -> dict:
-        with self.transaction() as conn:
+    def settle_window(self, bot_id: str, market_id: str, *, evidence: dict, at_us: int) -> dict:
+        from .settlement import verify_evidence
+        with self.transaction() as conn, localcontext(ARITHMETIC):
             existing = conn.execute(
                 "SELECT status, winning_outcome, payout_total, realized_pnl FROM settlements "
                 "WHERE bot_id=? AND market_id=?", (bot_id, market_id)).fetchone()
@@ -416,18 +445,33 @@ class MvpStore:
                     'realized_pnl': _d(existing[3]),
                     'already_settled': True,
                 }
-            win = conn.execute("SELECT condition_id, status FROM windows WHERE bot_id=? AND market_id=?",
-                               (bot_id, market_id)).fetchone()
-            if win is None:
+            window = self.window(bot_id, market_id)
+            if window is None:
                 raise ValueError(f'window {market_id} not found')
-            condition_id, win_status = win
-            if winning_outcome not in ('UP', 'DOWN'):
-                return {'status': 'UNKNOWN_SETTLEMENT', 'winning_outcome': None,
-                        'payout_total': ZERO, 'realized_pnl': ZERO, 'already_settled': False}
-
-            pos_rows = conn.execute(
-                "SELECT outcome, quantity, cost_basis FROM positions WHERE bot_id=? AND market_id=? "
-                "AND CAST(quantity AS REAL) > 0", (bot_id, market_id)).fetchall()
+            identities = conn.execute(
+                'SELECT DISTINCT outcome, token_id FROM observations WHERE bot_id=? AND market_id=?',
+                (bot_id, market_id)).fetchall()
+            tokens = dict(identities) if len(identities) == 2 else {}
+            classified = verify_evidence(evidence, window=window, tokens=tokens, at_us=at_us)
+            if window['status'] == 'ACTIVE':
+                classified = dict(status='UNKNOWN_SETTLEMENT', diagnostic='active window')
+            orders = conn.execute('SELECT outcome, token_id FROM orders WHERE bot_id=? AND market_id=?',
+                                  (bot_id, market_id)).fetchall()
+            if any(tokens.get(outcome) != token for outcome, token in orders):
+                classified = dict(status='UNKNOWN_SETTLEMENT', diagnostic='order token mismatch')
+            attempts = conn.execute('SELECT COUNT(*) FROM resolution_attempts WHERE bot_id=? AND market_id=?',
+                                    (bot_id, market_id)).fetchone()[0]
+            conn.execute('INSERT INTO resolution_attempts(bot_id,market_id,at_us,next_us,status,diagnostic,evidence_json) '
+                         'VALUES(?,?,?,?,?,?,?)',
+                         (bot_id, market_id, at_us, at_us + min(300, 10 * 2 ** min(attempts, 5)) * 1_000_000,
+                          classified['status'], classified.get('diagnostic', ''), json.dumps(evidence, sort_keys=True)))
+            if classified['status'] != 'RESOLVED':
+                return dict(status='UNKNOWN_SETTLEMENT', winning_outcome=None,
+                            payout_total=ZERO, realized_pnl=ZERO, already_settled=False)
+            winning_outcome = classified['winning_outcome']
+            pos_rows = [r for r in conn.execute(
+                'SELECT outcome, quantity, cost_basis FROM positions WHERE bot_id=? AND market_id=?',
+                (bot_id, market_id)) if _d(r[1]) > 0]
             total_payout = ZERO
             total_pnl = ZERO
             for outcome, qty_str, basis_str in pos_rows:
@@ -446,14 +490,21 @@ class MvpStore:
                          (f'SETTLED_{winning_outcome}', at_us, bot_id, market_id))
             conn.execute(
                 "INSERT INTO settlements(bot_id, market_id, condition_id, status, winning_outcome, "
-                "payout_total, realized_pnl, resolved_at, tx_hash, settled_us) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?)",
-                (bot_id, market_id, condition_id, 'RESOLVED', winning_outcome,
-                 str(total_payout), str(total_pnl), resolved_at, tx_hash, at_us))
+                "payout_total, realized_pnl, resolved_at, tx_hash, settled_us, evidence_json, position_count) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (bot_id, market_id, window['condition_id'], 'RESOLVED', winning_outcome,
+                 str(total_payout), str(total_pnl), classified['resolved_at'], classified['tx_hash'], at_us,
+                 json.dumps(evidence, sort_keys=True), len(pos_rows)))
             conn.execute(
                 "INSERT INTO events(bot_id, run_id, at_us, kind, detail) VALUES(?,?,?,?,?)",
-                (bot_id, '', at_us, 'window_settled',
+                (bot_id, window['run_id'], at_us, 'window_settled',
                  f'{market_id}:{winning_outcome}:payout={total_payout}:pnl={total_pnl}'))
+            self.reconcile(bot_id)
+            positions = self.open_positions(bot_id)
+            self.equity(bot_id, window['run_id'], at_us=at_us, market_id=market_id,
+                        cash=self.cash(bot_id), exposure=sum((p['cost_basis'] for p in positions), ZERO),
+                        realized=self.realized(bot_id), unrealized=None if positions else ZERO,
+                        missing_marks=len(positions))
             return {
                 'status': 'RESOLVED',
                 'winning_outcome': winning_outcome,
@@ -461,6 +512,13 @@ class MvpStore:
                 'realized_pnl': total_pnl,
                 'already_settled': False,
             }
+
+    def reconcile(self, bot_id: str) -> None:
+        with localcontext(ARITHMETIC):
+            initial = self._conn.execute('SELECT initial_cash FROM accounts WHERE bot_id=?', (bot_id,)).fetchone()
+            basis = sum((p['cost_basis'] for p in self.open_positions(bot_id)), ZERO)
+            if initial is None or self.cash(bot_id) + basis != _d(initial[0]) + self.realized(bot_id):
+                raise sqlite3.IntegrityError('paper ledger reconciliation failed')
 
     def trade_count(self, bot_id: str, market_id: str) -> int:
         row = self._conn.execute(
@@ -485,7 +543,8 @@ class MvpStore:
         Price-time walks visible depth; a short book leaves a terminal PARTIAL (the remainder is
         abandoned, never retried) and an empty book is a terminal REJECTED with no position change.
         """
-        with self.transaction() as conn:
+        with self.transaction() as conn, localcontext(ARITHMETIC):
+            self.reconcile(bot_id)
             row = conn.execute("SELECT order_id FROM orders WHERE bot_id=? AND status='PENDING' "
                                'ORDER BY created_us, order_id LIMIT 1', (bot_id,)).fetchone()
             if row is None:
@@ -493,6 +552,10 @@ class MvpStore:
             order = self._order_from_row(conn.execute('SELECT * FROM orders WHERE order_id=?',
                                                       (row[0],)).fetchone())
             book = books.get(order['outcome'])
+            window = self.window(bot_id, order['market_id'])
+            if book is not None and (book.token_id != order['token_id'] or window is None
+                                     or book.condition_id != window['condition_id']):
+                raise sqlite3.IntegrityError('execution book identity mismatch')
             quantity = order['quantity']
             cash = self._cash_in(conn, bot_id)
             position = conn.execute('SELECT quantity, cost_basis FROM positions WHERE bot_id=? AND '
@@ -546,6 +609,7 @@ class MvpStore:
                          'updated_us=? WHERE order_id=?',
                          (status, reason, str(filled), str(notional), str(fee), str(realized), at_us,
                           order['order_id']))
+            self.reconcile(bot_id)
             return {'order_id': order['order_id'], 'status': status, 'reason': reason,
                     'filled': filled, 'notional': notional, 'fee': fee, 'realized': realized}
 

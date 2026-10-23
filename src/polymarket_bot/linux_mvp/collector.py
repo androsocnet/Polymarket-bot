@@ -42,10 +42,10 @@ class LiveCollector:
     def collect(self):
         return collect_snapshot(self.gamma, self.clob, monotonic=self.monotonic)
 
-    def get_resolution(self, condition_id: str, *, deadline: float | None = None) -> dict | None:
+    def get_resolution(self, window: dict, *, deadline: float | None = None) -> dict:
         from .settlement import fetch_resolution
         dl = deadline if deadline is not None else (self.monotonic() + 5.0)
-        return fetch_resolution(self.gamma.public, condition_id, deadline=dl)
+        return fetch_resolution(self.gamma.get, window, deadline=dl)
 
     def close(self) -> None:
         if self._owns_client:

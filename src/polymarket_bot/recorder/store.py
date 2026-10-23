@@ -159,6 +159,7 @@ class RecorderStore:
         self._write_failed = False
         self._read_only = False
         self._closed = False
+        self.created_new = False
 
     @classmethod
     def read_only(cls, path: Path) -> "RecorderStore":
@@ -182,9 +183,9 @@ class RecorderStore:
             raise RecorderStoreError("storage_failure", "Cannot read existing recorder database.") from exc
 
     @classmethod
-    def open(cls, path: Path) -> "RecorderStore":
-        """Open a v1 database for BOOK_ONLY mode (accepts existing v1 or v2)."""
-        return cls._open(path, approximate=False)
+    def open(cls, path: Path, *, require_new: bool = False) -> "RecorderStore":
+        """Open BOOK_ONLY storage; optionally claim a fresh path under writer ownership."""
+        return cls._open(path, approximate=False, require_new=require_new)
 
     @classmethod
     def open_approximate(cls, path: Path) -> "RecorderStore":
@@ -192,7 +193,7 @@ class RecorderStore:
         return cls._open(path, approximate=True)
 
     @classmethod
-    def _open(cls, path: Path, *, approximate: bool) -> "RecorderStore":
+    def _open(cls, path: Path, *, approximate: bool, require_new: bool = False) -> "RecorderStore":
         canonical = Path(os.path.normcase(str(Path(path).resolve())))
         lock_file = None
         connection = None
@@ -214,10 +215,16 @@ class RecorderStore:
 
             v2_script = _load_v2_schema()
             v1_script = _load_v1_schema()
-            is_new = not canonical.exists()
-            # Claim a new file without truncating a path created by another actor.
+            is_new = require_new or not canonical.exists()
+            # Claim under writer ownership; O_EXCL also rejects a raced-in empty database.
             if is_new:
-                descriptor = os.open(canonical, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                try:
+                    descriptor = os.open(canonical, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                except FileExistsError:
+                    if require_new:
+                        raise RecorderStoreError('selected_database_not_fresh',
+                            'Selected mode requires a fresh database path.') from None
+                    raise
                 os.close(descriptor)
             connection = sqlite3.connect(canonical.as_uri() + "?mode=rw", uri=True, timeout=0)
             connection.execute("PRAGMA foreign_keys=ON")
@@ -232,7 +239,9 @@ class RecorderStore:
                 cls._verify_existing(connection, v2_script, approximate=approximate)
                 connection.execute("PRAGMA journal_mode=DELETE")
                 connection.execute("PRAGMA synchronous=FULL")
-            return cls(canonical, lock_file, connection)
+            store = cls(canonical, lock_file, connection)
+            store.created_new = is_new
+            return store
         except Exception as exc:
             if connection is not None:
                 connection.close()
@@ -1093,7 +1102,8 @@ and (fetch.attempt.path == '/ws/v1' or association.target_us <= fetch.received_s
             values[column] = _decimal(getattr(book, field)) if valid else None
         return values
 
-    def finalize_slot(self, slot_id: int, commit: SlotCommit, *, committed_wall_us: int) -> None:
+    def finalize_slot(self, slot_id: int, commit: SlotCommit, *, committed_wall_us: int,
+                      interrupted_reason: str | None = None) -> None:
         self._check_writer()
         _integer(slot_id, "slot_id", minimum=1)
         _integer(committed_wall_us, "committed_wall_us")
@@ -1103,7 +1113,7 @@ and (fetch.attempt.path == '/ws/v1' or association.target_us <= fetch.received_s
             scheduled_us=commit.target.scheduled_us, run_id=commit.run_id, anchor_id=commit.anchor_id,
             metadata_revision_id=commit.metadata_revision_id, start_mono_ns=commit.started_mono_ns)
         _require(slot is not None and self._equal(slot, identity)
-                 and slot["status"] in ("IN_PROGRESS", "COMPLETE", "PARTIAL", "FAILED"),
+                 and slot["status"] in ("IN_PROGRESS", "COMPLETE", "PARTIAL", "FAILED", "INTERRUPTED"),
                  "Slot finalization conflicts with its reservation or terminal identity.")
         self._run(commit.run_id, running=slot["status"] == "IN_PROGRESS")
         self._revision(commit.market_id, commit.metadata_revision_id)
@@ -1135,10 +1145,17 @@ and (fetch.attempt.path == '/ws/v1' or association.target_us <= fetch.received_s
         association = asdict(reference) | dict(slot_id=slot_id, feed_id=CHAINLINK_FEED_ID, available_live=0)
         association.pop("report_hash")
         valid_count = sum(result.status == "VALID" for result in (commit.books.up, commit.books.down))
+        if interrupted_reason is not None:
+            _require(interrupted_reason in ('STOP_REQUESTED', 'KEYBOARD_INTERRUPT') and all(
+                result.status == 'INTERRUPTED' and result.book is None and result.attempt_index is None
+                for result in (commit.books.up, commit.books.down)),
+                'Interrupted finalization cannot contain usable snapshots.')
         terminal = dict(status=("FAILED", "PARTIAL", "COMPLETE")[valid_count],
             finished_server_us=self._server_us(anchor, commit.ended_mono_ns), committed_wall_us=committed_wall_us,
             end_mono_ns=commit.ended_mono_ns, reason="BOOKS_CAPTURED" if valid_count else "NO_VALID_BOOKS",
             quality_json="{}", reference_status="REFERENCE_INCOMPLETE")
+        if interrupted_reason is not None:
+            terminal.update(status='INTERRUPTED', reason=interrupted_reason)
         with self._transaction():
             if slot["status"] != "IN_PROGRESS":
                 self._verify_duplicate(slot, terminal, attempts, books, association)

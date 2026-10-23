@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from collections import Counter
 from contextlib import closing
-from decimal import Decimal
+from decimal import Decimal, localcontext
+from .store import ARITHMETIC
 import sqlite3
 import time
 from pathlib import Path
@@ -38,6 +39,11 @@ def _connect(path: Path) -> sqlite3.Connection:
 
 
 def build_report(db_path: Path, *, run_id: str | None = None, now_us: int | None = None) -> dict:
+    with localcontext(ARITHMETIC):
+        return _build_report(db_path, run_id=run_id, now_us=now_us)
+
+
+def _build_report(db_path: Path, *, run_id: str | None, now_us: int | None) -> dict:
     generated = time.time_ns() // 1000 if now_us is None else now_us
     with closing(_connect(db_path)) as conn:
         if run_id is None:
@@ -48,7 +54,9 @@ def build_report(db_path: Path, *, run_id: str | None = None, now_us: int | None
                                'WHERE run_id=?', (run_id,)).fetchone()
         if run is None:
             raise ValueError('no matching run recorded')
+        conn.execute('BEGIN')
         run_id, bot_id, started_us, mode, initial_cash = run
+        initial_cash = conn.execute('SELECT initial_cash FROM accounts WHERE bot_id=?', (bot_id,)).fetchone()[0]
         run_count = conn.execute('SELECT COUNT(*) FROM runs WHERE bot_id=?', (bot_id,)).fetchone()[0]
 
         windows = conn.execute('SELECT market_id, status, start_us, end_us FROM windows '
@@ -59,14 +67,15 @@ def build_report(db_path: Path, *, run_id: str | None = None, now_us: int | None
                               'FROM orders WHERE bot_id=?', (bot_id,)).fetchall()
         positions_rows = conn.execute('SELECT market_id, outcome, quantity, cost_basis FROM positions '
                                       'WHERE bot_id=?', (bot_id,)).fetchall()
-        equity_rows = conn.execute('SELECT cash, exposure, unrealized, missing_marks FROM equity '
+        equity_rows = conn.execute('SELECT cash, exposure, unrealized, missing_marks, at_us FROM equity '
                                    'WHERE bot_id=? ORDER BY id', (bot_id,)).fetchall()
-        try:
+        columns = {r[1] for r in conn.execute('PRAGMA table_info(settlements)')}
+        settlements_rows = []
+        if columns:
+            count = 'position_count' if 'position_count' in columns else 'NULL'
             settlements_rows = conn.execute(
-                'SELECT market_id, status, winning_outcome, payout_total, realized_pnl, resolved_at, tx_hash '
-                'FROM settlements WHERE bot_id=?', (bot_id,)).fetchall()
-        except sqlite3.OperationalError:
-            settlements_rows = []
+                'SELECT market_id, status, winning_outcome, payout_total, realized_pnl, resolved_at, tx_hash, ' + count +
+                ' FROM settlements WHERE bot_id=?', (bot_id,)).fetchall()
 
     actions = Counter(row[1] for row in decisions)
     decision_reasons = Counter(row[2] for row in decisions)
@@ -79,10 +88,11 @@ def build_report(db_path: Path, *, run_id: str | None = None, now_us: int | None
     total_realized = order_realized + settled_realized
     settled_wins = sum(1 for row in settlements_rows if row[1] == 'RESOLVED' and _d(row[4]) > ZERO)
     settled_losses = sum(1 for row in settlements_rows if row[1] == 'RESOLVED' and _d(row[4]) < ZERO)
-    verified_settled_trades = sum(1 for row in settlements_rows if row[1] == 'RESOLVED')
+    verified_settled_trades = (None if any(row[7] is None for row in settlements_rows) else
+                              sum(row[7] for row in settlements_rows if row[1] == 'RESOLVED'))
     win_rate = (
         (Decimal(settled_wins) / Decimal(verified_settled_trades)).quantize(Decimal('0.0001'))
-        if verified_settled_trades > 0 else None
+        if verified_settled_trades else None
     )
     rejection_reasons = Counter(row[7] for row in orders if row[1] == 'REJECTED')
     open_positions = []
@@ -99,7 +109,7 @@ def build_report(db_path: Path, *, run_id: str | None = None, now_us: int | None
                 'window_status': window_status_map.get(market_id, 'UNKNOWN'),
             }
             open_positions.append(pos_dict)
-            if window_status_map.get(market_id) in ('ACTIVE', 'UNKNOWN_SETTLEMENT', 'ABORTED', None):
+            if window_status_map.get(market_id) != 'SETTLED':
                 unresolved_positions.append(pos_dict)
     per_window = []
     for market_id, status, start_us, end_us in windows:
@@ -118,9 +128,16 @@ def build_report(db_path: Path, *, run_id: str | None = None, now_us: int | None
             'realized': str(sum((_d(row[6]) for row in owned), ZERO) + window_settled_pnl),
         })
 
+    cash = _d(initial_cash)
+    for row in orders:
+        if row[1] in ('FILLED', 'PARTIAL'):
+            cash += (-_d(row[4]) - _d(row[5])) if row[2] == 'BUY' else (_d(row[4]) - _d(row[5]))
+    cash += sum((_d(row[3]) for row in settlements_rows if row[1] == 'RESOLVED'), ZERO)
+    basis = sum((_d(p['cost_basis']) for p in open_positions), ZERO)
+    reconciled = cash + basis == _d(initial_cash) + total_realized
     last_equity = equity_rows[-1] if equity_rows else None
     net_points = [(_d(cash) + _d(exposure) + _d(unrealized))
-                  for cash, exposure, unrealized, _ in equity_rows if unrealized not in (None, '')]
+                  for cash, exposure, unrealized, _, at_us in equity_rows if unrealized not in (None, '')]
     peak = max(net_points) if net_points else None
     last_net = None
     if last_equity is not None and last_equity[2] not in (None, ''):
@@ -128,6 +145,18 @@ def build_report(db_path: Path, *, run_id: str | None = None, now_us: int | None
     drawdown = None if peak is None or last_net is None else max(ZERO, peak - last_net)
     last_unrealized = None if last_equity is None else (
         None if last_equity[2] in (None, '') else _d(last_equity[2]))
+    if not open_positions:
+        last_unrealized, last_net = ZERO, cash
+    elif (last_equity is None or _d(last_equity[0]) != cash or _d(last_equity[1]) != basis
+          or not 0 <= generated - last_equity[4] <= 5_000_000):
+        last_unrealized, last_net = None, None
+    drawdown = None if peak is None or last_net is None else max(ZERO, peak - last_net)
+    if not open_positions:
+        net_points.append(cash)
+    running_peak, maximum_drawdown = _d(initial_cash), ZERO
+    for point in net_points:
+        running_peak = max(running_peak, point)
+        maximum_drawdown = max(maximum_drawdown, running_peak - point)
 
     return {
         'schema': SCHEMA,
@@ -156,6 +185,9 @@ def build_report(db_path: Path, *, run_id: str | None = None, now_us: int | None
             'realized_pnl': str(total_realized),
             'unrealized_pnl': None if last_unrealized is None else str(last_unrealized),
             'drawdown': None if drawdown is None else str(drawdown),
+            'max_drawdown': str(maximum_drawdown),
+            'max_drawdown_complete': False,  # sampled marks cannot prove intra-cycle extrema
+            'drawdown_coverage': 'SAMPLED_MARKS_ONLY',
             'verified_settled_trades': verified_settled_trades,
             'verified_wins': settled_wins,
             'verified_losses': settled_losses,
@@ -163,14 +195,16 @@ def build_report(db_path: Path, *, run_id: str | None = None, now_us: int | None
         },
         'account': {
             'initial_cash': str(_d(initial_cash)),
-            'cash': None if last_equity is None else str(_d(last_equity[0])),
-            'exposure': None if last_equity is None else str(_d(last_equity[1])),
+            'cash': str(cash),
+            'exposure': str(basis),
+            'reconciled': reconciled,
             'realized': str(total_realized),
             'unrealized': None if last_unrealized is None else str(last_unrealized),
             'net_value': None if last_net is None else str(last_net),
         },
         'equity': {
             'points': len(equity_rows),
+            'mark_at_us': None if last_equity is None else last_equity[4],
             'peak_net': None if peak is None else str(peak),
             'last_net': None if last_net is None else str(last_net),
             'drawdown': None if drawdown is None else str(drawdown),

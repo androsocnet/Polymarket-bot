@@ -106,7 +106,8 @@ class AdversarialPaperTradingTests(unittest.TestCase):
         early_snap = snapshot(slot=0, start=START, market=early_market)
         eng_early = self.engine([early_snap])
         res_early = self.step(eng_early)
-        self.assertEqual(res_early.status, 'OUT_OF_WINDOW')
+        self.assertEqual(res_early.status, 'FAILED_STOP')
+        self.assertEqual(res_early.reason, 'IDENTITY_CONFLICT')
         self.assertEqual(self.store.orders(BOT), [])
 
     def test_duplicate_slot_replay_is_strictly_idempotent(self):
@@ -199,6 +200,10 @@ class AdversarialPaperTradingTests(unittest.TestCase):
 
     def test_fee_calculations_at_boundary_values(self):
         """Fee calculation is exact at zero and non-zero bps; cash deductions balance."""
+        # Execution requires persisted market identity, even for store-only fee tests.
+        self.store.ensure_window(BOT, RUN, market_id=MARKET_ID, condition_id=CONDITION,
+                                 event_id='2001', start_us=us(START), end_us=us(START) + 900_000_000,
+                                 at_us=us(START))
         # 1. Zero fee test
         zero_fee_settings = replace(self.settings, fee_bps=Decimal('0'))
         self.store.queue_order('ord-fee0', BOT, RUN, MARKET_ID, '111111', 'UP', 'BUY',

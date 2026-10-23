@@ -67,8 +67,8 @@ class Collector:
         self.resolutions = dict(resolutions or {})
         self.calls = 0
 
-    def get_resolution(self, condition_id: str, *, deadline: float | None = None):
-        return self.resolutions.get(condition_id)
+    def get_resolution(self, window: dict, *, deadline: float | None = None):
+        return self.resolutions.get(window['condition_id'])
 
     def collect(self):
         self.calls += 1

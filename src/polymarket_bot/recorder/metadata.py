@@ -36,7 +36,7 @@ def _index(market: dict, label: str) -> int:
 def _validate_clob(config: object, market: MarketDescriptor) -> dict:
     if not isinstance(config, dict):
         raise MarketDataError("invalid_metadata", "CLOB market configuration must be an object.")
-    for field in ("condition_id", "conditionId"):
+    for field in ("condition_id", "conditionId", "c"):
         if field in config and config[field] != market.condition_id:
             raise MarketDataError("identity_conflict", "CLOB configuration condition differs from Gamma.")
     if "t" in config:
@@ -96,6 +96,44 @@ def _revision(market: MarketDescriptor, source: str, raw: bytes, public, clock, 
                           raw, config_read.raw_body,
                           clock.server_us_at(clock.monotonic_ns()), config, source,
                           market.warnings + numeric_warnings, market.pricing_ready and not numeric_warnings)
+
+
+def acquire_selected_market(gamma, public, *, clock, deadline: float,
+                            event_id: str, market_id: str) -> MarketRevision:
+    """Validate exact public identities; no enumeration, inferred event or fallback."""
+    from .models import RunConfig
+    from polymarket_bot.market_data.parsing import _time
+    RunConfig(selected_event_id=event_id, selected_market_id=market_id)
+    if gamma.get is not public:
+        raise ValueError('Selected metadata must share PublicGet.')
+    if not clock.usable():
+        raise MarketDataError('invalid_clock', 'Selected acquisition requires calibrated time.')
+    event_read = public.get_json('gamma', '/events/'+event_id, deadline=deadline)
+    detail_read = public.get_json('gamma', '/markets/'+market_id, deadline=deadline)
+    event, detail = load_numeric_json(event_read.raw_body), load_numeric_json(detail_read.raw_body)
+    if (not isinstance(event, dict) or event.get('id') != event_id or
+            not isinstance(detail, dict) or detail.get('id') != market_id):
+        raise MarketDataError('identity_conflict', 'Selected response identity differs.')
+    if not isinstance(event.get('markets'), list):
+        raise MarketDataError('invalid_metadata', 'Selected event requires explicit market membership.')
+    embedded = _selected_market(event_read.raw_body, market_id)
+    # Shared identity evidence must agree; no fabricated event envelope.
+    for key in ('id', 'conditionId', 'eventStartTime', 'endDate', 'clobTokenIds', 'outcomes'):
+        if key not in embedded or embedded[key] != detail.get(key):
+            raise MarketDataError('identity_conflict', 'Event market and detail disagree.')
+    start = _time(detail.get('eventStartTime'), 'eventStartTime')
+    now = clock.now()
+    market = parse_market(event, detail, now=now, expected_start=start if start > now else None)
+    if market is None:
+        raise MarketDataError('invalid_metadata', 'Selected market family/window is unavailable.')
+    revision = _revision(market, 'selected', detail_read.raw_body, public, clock, deadline)
+    if (not revision.capture_ready or not isinstance(revision.config.get('t'), list) or
+            not any(key in revision.config for key in ('condition_id', 'conditionId', 'c')) or
+            not revision.clob_config_raw or not clock.usable() or public.monotonic() >= deadline):
+        raise MarketDataError('invalid_metadata', 'Selected metadata/config evidence incomplete.')
+    # Event bytes persist separately in request audit; revision also retains exact event content.
+    market = replace(market, metadata=dict(market.metadata, selected_event_raw=event_read.raw_body.decode('utf-8')))
+    return replace(revision, market=market)
 
 
 def acquire_market(gamma, public, *, clock, deadline: float, use_fast_path: bool) -> MarketRevision:
