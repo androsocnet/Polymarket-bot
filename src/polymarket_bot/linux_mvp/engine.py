@@ -154,12 +154,14 @@ class PaperEngine:
     # -- decisions -----------------------------------------------------------
     def _decide(self, market, snapshot, slot_index, slot_id, fresh, stale_reason, at):
         positions = self.store.positions(self.bot_id, market.market_id)
-        exposure = sum((position['cost_basis'] for position in positions.values()), ZERO)
+        open_positions = self.store.open_positions(self.bot_id)
+        total_exposure = sum((p['cost_basis'] for p in open_positions), ZERO)
         owned = next((outcome for outcome, position in positions.items() if position['quantity'] > 0), None)
+        other_open = any(p['market_id'] != market.market_id for p in open_positions)
         cash = self.store.cash(self.bot_id)
         decision = dict(bot_id=self.bot_id, run_id=self.run_id, market_id=market.market_id,
                         slot_index=slot_index, slot_id=slot_id, action='HOLD', reason='HOLD',
-                        signal='HOLD', momentum=None, mid_up=None, cash=cash, exposure=exposure,
+                        signal='HOLD', momentum=None, mid_up=None, cash=cash, exposure=total_exposure,
                         inputs={}, at_us=at)
         order = None
 
@@ -197,6 +199,8 @@ class PaperEngine:
                     decision['action'] = 'SELL'
                     order = dict(outcome=owned, side='SELL', quantity=positions[owned]['quantity'],
                                  reason=decision['reason'])
+            elif other_open:
+                decision['reason'] = 'POSITION_LIMIT'
             elif signal != 'HOLD':
                 quantity = ((self.settings.max_order / (1 + self.settings.fee_bps / 10000))
                             / Decimal('0.01')).to_integral_value(rounding=ROUND_FLOOR) * Decimal('0.01')
@@ -207,7 +211,7 @@ class PaperEngine:
                     decision['reason'] = 'ZERO_QUANTITY'
                 elif reserve > cash:
                     decision['reason'] = 'INSUFFICIENT_CASH_RESERVE'
-                elif exposure + reserve > self.settings.max_exposure:
+                elif total_exposure + reserve > self.settings.max_exposure:
                     decision['reason'] = 'EXPOSURE_LIMIT'
                 else:
                     decision['action'] = 'BUY ' + signal

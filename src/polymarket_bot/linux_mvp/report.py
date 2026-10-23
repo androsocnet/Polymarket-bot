@@ -84,7 +84,7 @@ def build_report(db_path: Path, *, run_id: str | None = None, now_us: int | None
                 'window_status': window_status_map.get(market_id, 'UNKNOWN'),
             }
             open_positions.append(pos_dict)
-            if window_status_map.get(market_id) in ('ACTIVE', 'UNKNOWN_SETTLEMENT', None):
+            if window_status_map.get(market_id) in ('ACTIVE', 'UNKNOWN_SETTLEMENT', 'ABORTED', None):
                 unresolved_positions.append(pos_dict)
     per_window = []
     for market_id, status, start_us, end_us in windows:

@@ -246,6 +246,35 @@ class AdversarialPaperTradingTests(unittest.TestCase):
         self.assertEqual(eng.collector.calls, 0)
         self.assertEqual(self.store.order('pend-stop')['status'], 'PENDING')
 
+    def test_rollover_with_open_position_blocks_new_entry_in_successor(self):
+        """Open position from an earlier window must block opening a second position in new market."""
+        market_b = descriptor(market_id='1002', start=NEXT, condition='0x' + 'cd' * 32,
+                              up='333333', down='444444')
+        # 1. Warmup and enter position in 1001
+        samples = [
+            rising(0),
+            rising(1),
+            rising(2),
+            rising(3),  # fills BUY UP in 1001
+            rising(0, start=NEXT, market=market_b),  # rollover to 1002
+            rising(1, start=NEXT, market=market_b),
+            rising(2, start=NEXT, market=market_b),  # would trigger BUY UP in 1002 if isolated
+        ]
+        eng = self.engine(samples)
+        for _ in range(7):
+            self.step(eng)
+
+        # In 1002 at slot 2, decision must NOT be BUY UP; must be blocked by position/exposure limit
+        dec_1002 = self.store.decisions_for_market(BOT, '1002')
+        slot2_decision = next(d for d in dec_1002 if d['slot_index'] == 2)
+        self.assertEqual(slot2_decision['action'], 'HOLD')
+        self.assertIn(slot2_decision['reason'], ('POSITION_LIMIT', 'EXPOSURE_LIMIT'))
+
+        # Confirm strictly at most 1 open position across entire account
+        open_positions = self.store.open_positions(BOT)
+        self.assertEqual(len(open_positions), 1)
+        self.assertEqual(open_positions[0]['market_id'], MARKET_ID)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -106,9 +106,11 @@ SQL
 ```
 
 Expected during normal operation: two book rows per slot, up to 450 distinct slots per 15-minute
-window, `ACTIVE` for the current window, `UNKNOWN_SETTLEMENT` for the previous one at rollover, and
-**zero** decisions/orders/equity rows. A stale heartbeat means the service is not running; a growing
-`events` table with `data_error` means public data or the network is failing.
+window, `ACTIVE` for the current window, `UNKNOWN_SETTLEMENT` for the previous one at rollover.
+(In Phase 1 ingest mode, decisions/orders/equity rows were zero; in Phase 2A paper trading mode,
+paper decisions, simulated orders, and equity marks are recorded). A stale heartbeat means the
+service is not running; a growing `events` table with `data_error` means public data or the
+network is failing.
 
 ## 6. Emergency stop and resume
 
