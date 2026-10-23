@@ -24,7 +24,8 @@ Explicitly **not** included: strategy decisions, paper fills, Telegram, dashboar
 ## 2. Host prerequisites
 
 - Ubuntu 24.04 LTS (Python 3.12) with systemd 249+; Ubuntu 22.04 needs a Python 3.12 interpreter.
-- Outbound HTTPS to `gamma-api.polymarket.com` and `clob.polymarket.com` only.
+- Outbound HTTPS to `gamma-api.polymarket.com` and `clob.polymarket.com` only; Ubuntu/PyPI archives
+  are additionally reachable during installation.
 - `rsync`, `python3-venv`, `sqlite3`, and root once for installation.
 - No credentials, wallet, or API key is needed or accepted. `MODE` must be exactly `PAPER_ONLY`.
 

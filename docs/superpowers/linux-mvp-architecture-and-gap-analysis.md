@@ -114,11 +114,10 @@ deterministic id, `PENDING|FILLED|PARTIAL|REJECTED`), `positions` (fee-inclusive
 
 ## 4. Reuse and preservation of CP5/CP6
 
-Reused byte-identical to the accepted CP5 worktree sources: `market_data` public read stack
-(including the accepted numeric `/events/{id}` allowlist extension), `paper.py` arithmetic,
-`strategy.py` offline replay, `full_window.py` assessor, recorder modules, and their tests. The
-isolated branch carries the accepted (previously uncommitted) sources from the CP5 worktree; no
-accepted file was edited by Phase 1.
+Reused byte-identical to the accepted CP5 worktree sources in this development worktree; the
+Phase 1B deployment package does **not** ship CP5/CP6 `paper.py`, `strategy.py`, `full_window.py`,
+recorder modules, or historical evidence. `market_data` includes the accepted numeric
+`/events/{id}` allowlist extension. No accepted file was edited by Phase 1.
 
 Verified hashes (SHA-256, unchanged):
 
