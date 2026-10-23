@@ -15,7 +15,7 @@ EnvironmentFile=/etc/polymarket-btc/paper.env
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONPATH=/opt/polymarket-btc/src
 Environment=MODE=PAPER_ONLY
-ExecStart=/opt/polymarket-btc/.venv/bin/python -m polymarket_bot.linux_mvp ingest
+ExecStart=/opt/polymarket-btc/.venv/bin/python -m polymarket_bot.linux_mvp run
 Restart=on-failure
 RestartPreventExitStatus=75
 RestartSec=5

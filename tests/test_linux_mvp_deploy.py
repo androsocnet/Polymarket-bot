@@ -34,7 +34,7 @@ class DeploymentTests(unittest.TestCase):
             'User=polymarket', 'Group=polymarket', 'WorkingDirectory=/opt/polymarket-btc',
             'EnvironmentFile=/etc/polymarket-btc/paper.env', 'Environment=MODE=PAPER_ONLY',
             'Environment=PYTHONPATH=/opt/polymarket-btc/src',
-            'ExecStart=/opt/polymarket-btc/.venv/bin/python -m polymarket_bot.linux_mvp ingest',
+            'ExecStart=/opt/polymarket-btc/.venv/bin/python -m polymarket_bot.linux_mvp run',
             'Restart=on-failure', 'RestartPreventExitStatus=75', 'RestartSec=5',
             'KillSignal=SIGTERM', 'TimeoutStopSec=30',
             'StateDirectory=polymarket-btc', 'ReadWritePaths=/var/lib/polymarket-btc',

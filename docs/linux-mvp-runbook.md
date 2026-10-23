@@ -1,9 +1,10 @@
-# Linux MVP Phase 1 runbook — PAPER_ONLY ingest pipeline
+# Linux MVP runbook — PAPER_ONLY service
 
-Scope: an unattended, restart-safe **public-data ingest** service for BTC 15-minute markets on
-Ubuntu. It discovers the current market, stores both top-of-book observations, and records window
-rollover. It places **no orders**, holds no keys, makes no decisions, and never infers settlement.
-The paper engine remains in the tree but is dormant until Phase 2.
+Scope: an unattended, restart-safe **PAPER_ONLY** service for BTC 15-minute markets on
+Ubuntu. In Phase 1 it ran in ingest-only mode; in Phase 2A it executes the autonomous paper-trading
+loop (`run`), generating momentum signals, simulating fills against recorded depth, and recording
+decisions, orders, positions, and equity marks. It places **no orders** (simulated paper fills only),
+holds no keys, has no wallet access, and never infers settlement.
 
 This runbook does not claim that Linux resource enforcement has passed. The unit file is statically
 tested on Windows; the host checks in §10 are a separate acceptance gate.
