@@ -8,6 +8,7 @@ import time
 
 from ..market_data.models import MarketDataError
 from .config import Settings
+from .settlement import classify_resolution
 from .store import ZERO, MvpStore
 
 UP, DOWN = 'UP', 'DOWN'
@@ -45,6 +46,7 @@ class PaperEngine:
         self.consecutive_errors = 0
         self.cycles = 0
         self._loss_event_day = None
+        self._last_settlement_poll = {}
 
     # -- cycle ---------------------------------------------------------------
     def step(self) -> StepResult:
@@ -71,6 +73,8 @@ class PaperEngine:
                 self._loss_event_day = day
             self._beat(at, heartbeat.get('market_id'), 'RISK_STOPPED', 'DAILY_LOSS_LIMIT')
             return StepResult('RISK_STOPPED', reason='DAILY_LOSS_LIMIT')
+
+        self._reconcile_settlements(at)
 
         try:
             snapshot = self.collector.collect()
@@ -289,6 +293,33 @@ class PaperEngine:
         self.store.close_window(self.bot_id, window['market_id'], status, at_us=at, note=note)
         self.store.event(self.bot_id, self.run_id, at_us=at, kind=kind,
                          detail=f'{window["market_id"]}:{note}')
+
+    def _reconcile_settlements(self, at: int) -> None:
+        unsettled = self.store.unsettled_windows(self.bot_id)
+        if not unsettled:
+            return
+        for window in unsettled:
+            market_id = window['market_id']
+            last_poll = self._last_settlement_poll.get(market_id, 0)
+            if at - last_poll < 10_000_000:
+                continue
+            self._last_settlement_poll[market_id] = at
+            payload = None
+            if hasattr(self.collector, 'get_resolution'):
+                try:
+                    payload = self.collector.get_resolution(window['condition_id'])
+                except Exception:
+                    continue
+            elif hasattr(self.collector, 'resolutions'):
+                payload = self.collector.resolutions.get(window['condition_id'])
+
+            if payload is not None:
+                classified = classify_resolution(payload, condition_id=window['condition_id'])
+                if classified.get('status') == 'RESOLVED' and classified.get('winning_outcome'):
+                    self.store.settle_window(
+                        self.bot_id, market_id, classified['winning_outcome'],
+                        resolved_at=classified.get('resolved_at') or '',
+                        tx_hash=classified.get('tx_hash') or '', at_us=at)
 
     def _beat(self, at: int, market_id: str | None, status: str, error: str | None) -> None:
         self.store.heartbeat(self.bot_id, self.run_id, at_us=at, market_id=market_id,

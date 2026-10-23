@@ -62,9 +62,13 @@ def rising(slot, *, start=START, market=None, step='0.02', base='0.30'):
 class Collector:
     """Deterministic queue; an Exception instance is raised instead of returned."""
 
-    def __init__(self, samples):
+    def __init__(self, samples, resolutions=None):
         self.samples = list(samples)
+        self.resolutions = dict(resolutions or {})
         self.calls = 0
+
+    def get_resolution(self, condition_id: str, *, deadline: float | None = None):
+        return self.resolutions.get(condition_id)
 
     def collect(self):
         self.calls += 1

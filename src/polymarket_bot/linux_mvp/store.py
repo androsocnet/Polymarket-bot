@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS windows(
     event_id TEXT NOT NULL,
     start_us INTEGER NOT NULL,
     end_us INTEGER NOT NULL,
-    status TEXT NOT NULL CHECK(status IN ('ACTIVE','CLOSED','ABORTED','UNKNOWN_SETTLEMENT')),
+    status TEXT NOT NULL CHECK(status IN ('ACTIVE','CLOSED','ABORTED','UNKNOWN_SETTLEMENT','SETTLED')),
     note TEXT NOT NULL DEFAULT '',
     updated_us INTEGER NOT NULL,
     PRIMARY KEY(bot_id, market_id));
@@ -117,6 +117,18 @@ CREATE TABLE IF NOT EXISTS heartbeat(
     status TEXT NOT NULL,
     cycles INTEGER NOT NULL,
     last_error TEXT);
+CREATE TABLE IF NOT EXISTS settlements(
+    bot_id TEXT NOT NULL,
+    market_id TEXT NOT NULL,
+    condition_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    winning_outcome TEXT,
+    payout_total TEXT NOT NULL DEFAULT '0',
+    realized_pnl TEXT NOT NULL DEFAULT '0',
+    resolved_at TEXT,
+    tx_hash TEXT,
+    settled_us INTEGER NOT NULL,
+    PRIMARY KEY(bot_id, market_id));
 CREATE INDEX IF NOT EXISTS orders_status ON orders(bot_id, status);
 CREATE INDEX IF NOT EXISTS observations_market ON observations(bot_id, market_id, slot_index);
 CREATE INDEX IF NOT EXISTS decisions_market ON decisions(bot_id, market_id, slot_index);
@@ -151,6 +163,18 @@ class MvpStore:
         conn.execute('PRAGMA busy_timeout=10000')
         conn.execute('PRAGMA foreign_keys=ON')
         conn.executescript(_SCHEMA_SQL)
+        # ponytail: migrate windows table check constraint for SETTLED status if existing DB has old schema
+        sql_row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='windows'").fetchone()
+        if sql_row and 'SETTLED' not in sql_row[0]:
+            conn.execute("PRAGMA foreign_keys=OFF")
+            conn.execute("CREATE TABLE windows_new(bot_id TEXT NOT NULL, market_id TEXT NOT NULL, run_id TEXT NOT NULL, "
+                         "condition_id TEXT NOT NULL, event_id TEXT NOT NULL, start_us INTEGER NOT NULL, end_us INTEGER NOT NULL, "
+                         "status TEXT NOT NULL CHECK(status IN ('ACTIVE','CLOSED','ABORTED','UNKNOWN_SETTLEMENT','SETTLED')), "
+                         "note TEXT NOT NULL DEFAULT '', updated_us INTEGER NOT NULL, PRIMARY KEY(bot_id, market_id))")
+            conn.execute("INSERT INTO windows_new SELECT * FROM windows")
+            conn.execute("DROP TABLE windows")
+            conn.execute("ALTER TABLE windows_new RENAME TO windows")
+            conn.execute("PRAGMA foreign_keys=ON")
         return cls(path, conn)
 
     def close(self) -> None:
@@ -340,6 +364,10 @@ class MvpStore:
                 cash -= _d(notional) + _d(fee)
             else:
                 cash += _d(notional) - _d(fee)
+        settled_payouts = conn.execute(
+            "SELECT payout_total FROM settlements WHERE bot_id=? AND status='RESOLVED'", (bot_id,)).fetchall()
+        for payout_row in settled_payouts:
+            cash += _d(payout_row[0])
         return cash
 
     def cash(self, bot_id: str) -> Decimal:
@@ -351,7 +379,88 @@ class MvpStore:
         if since_us is not None:
             sql += ' AND created_us>=?'
             args.append(since_us)
-        return sum((_d(r[0]) for r in self._conn.execute(sql, args)), ZERO)
+        order_realized = sum((_d(r[0]) for r in self._conn.execute(sql, args)), ZERO)
+        settle_sql = "SELECT realized_pnl FROM settlements WHERE bot_id=? AND status='RESOLVED'"
+        settle_args = [bot_id]
+        if since_us is not None:
+            settle_sql += ' AND settled_us>=?'
+            settle_args.append(since_us)
+        settled_realized = sum((_d(r[0]) for r in self._conn.execute(settle_sql, settle_args)), ZERO)
+        return order_realized + settled_realized
+
+    def unsettled_windows(self, bot_id: str) -> list[dict]:
+        cur = self._conn.execute(
+            "SELECT bot_id, market_id, run_id, condition_id, event_id, start_us, end_us, status, note, updated_us "
+            "FROM windows WHERE bot_id=? AND status='UNKNOWN_SETTLEMENT' ORDER BY start_us", (bot_id,))
+        cols = [c[0] for c in cur.description]
+        return [_row(r, cols) for r in cur.fetchall()]
+
+    def settlements(self, bot_id: str) -> list[dict]:
+        cur = self._conn.execute(
+            "SELECT bot_id, market_id, condition_id, status, winning_outcome, payout_total, realized_pnl, "
+            "resolved_at, tx_hash, settled_us FROM settlements WHERE bot_id=? ORDER BY settled_us", (bot_id,))
+        cols = [c[0] for c in cur.description]
+        return [_row(r, cols) for r in cur.fetchall()]
+
+    def settle_window(self, bot_id: str, market_id: str, winning_outcome: str | None, *,
+                      resolved_at: str = '', tx_hash: str = '', at_us: int) -> dict:
+        with self.transaction() as conn:
+            existing = conn.execute(
+                "SELECT status, winning_outcome, payout_total, realized_pnl FROM settlements "
+                "WHERE bot_id=? AND market_id=?", (bot_id, market_id)).fetchone()
+            if existing is not None:
+                return {
+                    'status': existing[0],
+                    'winning_outcome': existing[1],
+                    'payout_total': _d(existing[2]),
+                    'realized_pnl': _d(existing[3]),
+                    'already_settled': True,
+                }
+            win = conn.execute("SELECT condition_id, status FROM windows WHERE bot_id=? AND market_id=?",
+                               (bot_id, market_id)).fetchone()
+            if win is None:
+                raise ValueError(f'window {market_id} not found')
+            condition_id, win_status = win
+            if winning_outcome not in ('UP', 'DOWN'):
+                return {'status': 'UNKNOWN_SETTLEMENT', 'winning_outcome': None,
+                        'payout_total': ZERO, 'realized_pnl': ZERO, 'already_settled': False}
+
+            pos_rows = conn.execute(
+                "SELECT outcome, quantity, cost_basis FROM positions WHERE bot_id=? AND market_id=? "
+                "AND CAST(quantity AS REAL) > 0", (bot_id, market_id)).fetchall()
+            total_payout = ZERO
+            total_pnl = ZERO
+            for outcome, qty_str, basis_str in pos_rows:
+                qty = _d(qty_str)
+                basis = _d(basis_str)
+                payout = qty * Decimal('1.00') if outcome == winning_outcome else ZERO
+                pnl = payout - basis
+                total_payout += payout
+                total_pnl += pnl
+                conn.execute("UPDATE positions SET quantity='0', cost_basis='0' "
+                             "WHERE bot_id=? AND market_id=? AND outcome=?",
+                             (bot_id, market_id, outcome))
+
+            conn.execute("UPDATE windows SET status='SETTLED', note=?, updated_us=? "
+                         "WHERE bot_id=? AND market_id=?",
+                         (f'SETTLED_{winning_outcome}', at_us, bot_id, market_id))
+            conn.execute(
+                "INSERT INTO settlements(bot_id, market_id, condition_id, status, winning_outcome, "
+                "payout_total, realized_pnl, resolved_at, tx_hash, settled_us) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (bot_id, market_id, condition_id, 'RESOLVED', winning_outcome,
+                 str(total_payout), str(total_pnl), resolved_at, tx_hash, at_us))
+            conn.execute(
+                "INSERT INTO events(bot_id, run_id, at_us, kind, detail) VALUES(?,?,?,?,?)",
+                (bot_id, '', at_us, 'window_settled',
+                 f'{market_id}:{winning_outcome}:payout={total_payout}:pnl={total_pnl}'))
+            return {
+                'status': 'RESOLVED',
+                'winning_outcome': winning_outcome,
+                'payout_total': total_payout,
+                'realized_pnl': total_pnl,
+                'already_settled': False,
+            }
 
     def trade_count(self, bot_id: str, market_id: str) -> int:
         row = self._conn.execute(

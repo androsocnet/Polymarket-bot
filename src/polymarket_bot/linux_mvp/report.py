@@ -61,6 +61,12 @@ def build_report(db_path: Path, *, run_id: str | None = None, now_us: int | None
                                       'WHERE bot_id=?', (bot_id,)).fetchall()
         equity_rows = conn.execute('SELECT cash, exposure, unrealized, missing_marks FROM equity '
                                    'WHERE bot_id=? ORDER BY id', (bot_id,)).fetchall()
+        try:
+            settlements_rows = conn.execute(
+                'SELECT market_id, status, winning_outcome, payout_total, realized_pnl, resolved_at, tx_hash '
+                'FROM settlements WHERE bot_id=?', (bot_id,)).fetchall()
+        except sqlite3.OperationalError:
+            settlements_rows = []
 
     actions = Counter(row[1] for row in decisions)
     decision_reasons = Counter(row[2] for row in decisions)
@@ -68,7 +74,16 @@ def build_report(db_path: Path, *, run_id: str | None = None, now_us: int | None
     sides = Counter(row[2] for row in orders)
     fees = sum((_d(row[5]) for row in orders if row[1] in ('FILLED', 'PARTIAL')), ZERO)
     filled_notional = sum((_d(row[4]) for row in orders if row[1] in ('FILLED', 'PARTIAL')), ZERO)
-    realized = sum((_d(row[6]) for row in orders if row[1] in ('FILLED', 'PARTIAL')), ZERO)
+    order_realized = sum((_d(row[6]) for row in orders if row[1] in ('FILLED', 'PARTIAL')), ZERO)
+    settled_realized = sum((_d(row[4]) for row in settlements_rows if row[1] == 'RESOLVED'), ZERO)
+    total_realized = order_realized + settled_realized
+    settled_wins = sum(1 for row in settlements_rows if row[1] == 'RESOLVED' and _d(row[4]) > ZERO)
+    settled_losses = sum(1 for row in settlements_rows if row[1] == 'RESOLVED' and _d(row[4]) < ZERO)
+    verified_settled_trades = sum(1 for row in settlements_rows if row[1] == 'RESOLVED')
+    win_rate = (
+        (Decimal(settled_wins) / Decimal(verified_settled_trades)).quantize(Decimal('0.0001'))
+        if verified_settled_trades > 0 else None
+    )
     rejection_reasons = Counter(row[7] for row in orders if row[1] == 'REJECTED')
     open_positions = []
     unresolved_positions = []
@@ -90,6 +105,7 @@ def build_report(db_path: Path, *, run_id: str | None = None, now_us: int | None
     for market_id, status, start_us, end_us in windows:
         owned = [row for row in orders if row[0] == market_id]
         window_decisions = [row for row in decisions if row[0] == market_id]
+        window_settled_pnl = sum((_d(row[4]) for row in settlements_rows if row[0] == market_id and row[1] == 'RESOLVED'), ZERO)
         per_window.append({
             'market_id': market_id,
             'status': status,
@@ -99,7 +115,7 @@ def build_report(db_path: Path, *, run_id: str | None = None, now_us: int | None
             'buys': sum(1 for row in owned if row[2] == 'BUY' and row[1] in ('FILLED', 'PARTIAL')),
             'sells': sum(1 for row in owned if row[2] == 'SELL' and row[1] in ('FILLED', 'PARTIAL')),
             'rejected': sum(1 for row in owned if row[1] == 'REJECTED'),
-            'realized': str(sum((_d(row[6]) for row in owned), ZERO)),
+            'realized': str(sum((_d(row[6]) for row in owned), ZERO) + window_settled_pnl),
         })
 
     last_equity = equity_rows[-1] if equity_rows else None
@@ -128,7 +144,7 @@ def build_report(db_path: Path, *, run_id: str | None = None, now_us: int | None
                       'by_reason': dict(decision_reasons)},
         'orders': {'total': len(orders), 'by_status': dict(statuses), 'by_side': dict(sides),
                    'fees': str(fees), 'filled_notional': str(filled_notional),
-                   'realized': str(realized)},
+                   'realized': str(order_realized)},
         'rejections': dict(rejection_reasons),
         'positions': {
             'open': len(open_positions),
@@ -137,17 +153,19 @@ def build_report(db_path: Path, *, run_id: str | None = None, now_us: int | None
             'items': open_positions,
         },
         'performance': {
-            'realized_pnl': str(realized),
+            'realized_pnl': str(total_realized),
             'unrealized_pnl': None if last_unrealized is None else str(last_unrealized),
             'drawdown': None if drawdown is None else str(drawdown),
-            'verified_settled_trades': 0,
-            'win_rate_verified_settled': None,
+            'verified_settled_trades': verified_settled_trades,
+            'verified_wins': settled_wins,
+            'verified_losses': settled_losses,
+            'win_rate_verified_settled': None if win_rate is None else str(win_rate),
         },
         'account': {
             'initial_cash': str(_d(initial_cash)),
             'cash': None if last_equity is None else str(_d(last_equity[0])),
             'exposure': None if last_equity is None else str(_d(last_equity[1])),
-            'realized': str(realized),
+            'realized': str(total_realized),
             'unrealized': None if last_unrealized is None else str(last_unrealized),
             'net_value': None if last_net is None else str(last_net),
         },
