@@ -175,3 +175,38 @@ databases under `data/`. A socket guard prevents live connections. See the
 for the evidence and activation rules. The earlier
 [snapshot design](docs/superpowers/specs/2026-10-10-read-only-market-data-design.md)
 remains relevant to `src/main.py`.
+
+## Branch status and VPS setup
+
+The `linux-mvp` branch contains the Phase 1 ingest service and dormant Phase 2
+paper engine. `MODE` is hard-locked to `PAPER_ONLY` — `config.py` raises
+`ConfigError` for any other value, and the deploy unit sets
+`Environment=MODE=PAPER_ONLY`. No wallet keys, Polymarket auth, or order path are
+present or activatable.
+
+### Ubuntu VPS deployment (read-only soak host)
+
+```bash
+# 1. Clone (this branch is private; no credentials are stored in-repo).
+git clone https://github.com/androsocnet/Polymarket-bot.git
+cd Polymarket-bot
+git checkout linux-mvp
+
+# 2. Create system user and environment.
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin polymarket
+sudo install -d -o polymarket -g polymarket /var/lib/polymarket-btc/state
+
+# 3. Populate /etc/polymarket-btc/paper.env from deploy/polymarket-btc.env.example
+#    (no secrets — PAPER_ONLY only).
+
+# 4. Install and verify (does NOT auto-start).
+sudo bash deploy/install.sh
+
+# 5. Start the PAPER_ONLY ingest service.
+sudo systemctl enable --now polymarket-btc-paper
+sudo systemctl status polymarket-btc-paper
+```
+
+The journal observer, heartbeat, and 24-hour soak timer are documented for
+troubleshooting, not automated repair. The observer exit code and heartbeat
+PIDs are expected to change only on operator-initiated restart.
