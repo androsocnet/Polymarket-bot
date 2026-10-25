@@ -60,10 +60,12 @@ def main():
     assert run('systemctl', 'is-enabled', INFRA_UNIT, check=False) == 'disabled', f"service {INFRA_UNIT} not disabled"
     print(f"  Service {INFRA_UNIT} inactive + disabled: OK")
 
-    # Infrastructure test does NOT use STOP sentinel
+    # STOP sentinel from previous trading run. Infrastructure test is ingest-only;
+    # observer checks for it before starting service, so remove it.
     stop_path = Path('/var/lib/polymarket-btc/state/STOP')
     if stop_path.exists():
-        print(f"  WARNING: STOP sentinel exists at {stop_path} - infrastructure test ignores it")
+        stop_path.unlink()
+        print(f"  Cleared STOP sentinel from previous trading run")
 
     print("\n--- CONFIGURING RUNTIME BOUND ---")
     override = Path('/etc/systemd/system') / f'{INFRA_UNIT}.d' / 'override.conf'
@@ -81,7 +83,7 @@ def main():
     spec2 = importlib.util.spec_from_file_location('pv', '/opt/polymarket-btc/deploy/paper-validation.py')
     module = importlib.util.module_from_spec(spec2)
     spec2.loader.exec_module(module)
-    identity = module.code_hash()
+    identity = module.code_hash(INFRA_UNIT)
     print(f"\n--- CODE HASH ---  {identity}")
 
     if require_approval:
@@ -101,13 +103,23 @@ def main():
     }
     (EVIDENCE_ROOT / f'infrastructure-{args.phase}-launch-{suffix}.json').write_text(json.dumps(launch, indent=2))
 
+    # Convert WSL host heartbeat path to Windows path for PowerShell script
+    hb_wsl = str(host_heartbeat)
+    if hb_wsl.startswith('/mnt/c/'):
+        hb_win = hb_wsl.replace('/mnt/c/', 'C:\\').replace('/', '\\')
+    else:
+        hb_win = hb_wsl
+
     print("\n--- STARTING HOST HEARTBEAT ---")
     hb_unit = f'{PREFIX}-infra-{args.phase}-heartbeat-{suffix}'
+    # Heartbeat PowerShell script only accepts ValidateSet(360,3600,86400).
+    # Use the smallest value >= seconds + 30s buffer that satisfies the set.
+    hb_seconds = 360 if seconds <= 360 else (3600 if seconds <= 3600 else 86400)
     hb_cmd = [
         'powershell.exe', '-NoProfile', '-NonInteractive',
         '-ExecutionPolicy', 'Bypass',
         '-File', PS_SCRIPT,
-        str(host_heartbeat), str(seconds + 120)
+        hb_win, str(hb_seconds)
     ]
     run('systemd-run', '--unit', hb_unit, '--property', 'Restart=no',
         '--property', 'Type=simple', '--', *hb_cmd)
@@ -133,6 +145,7 @@ def main():
         '--seconds', str(seconds),
         '--output', str(evidence_dir),
         '--host-heartbeat', str(host_heartbeat),
+        '--unit', INFRA_UNIT,
     ]
     if args.integration_approval:
         obs_cmd.extend(['--integration-approval', str(args.integration_approval)])
