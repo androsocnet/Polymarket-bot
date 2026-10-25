@@ -173,6 +173,14 @@ class ContinuityTests(unittest.TestCase):
         monitor().validate_duration('integration', 3600)
         monitor().validate_duration('soak', 86400)
 
+    def test_pilot_phase_duration(self):
+        monitor().validate_duration('pilot', 180)
+        for seconds in [0, 179, 181, 3600, 86400]:
+            with self.assertRaises(ValueError):
+                monitor().validate_duration('pilot', seconds)
+        with self.assertRaises(ValueError):
+            monitor().validate_duration('pilot', 86400)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -14,8 +14,8 @@ STATE = Path('/var/lib/polymarket-btc')
 
 
 def validate_duration(phase, seconds):
-    if (phase, seconds) not in [('integration', 3600), ('soak', 86400)]:
-        raise ValueError('integration must be 3600 seconds; soak must be 86400 seconds')
+    if (phase, seconds) not in [('integration', 3600), ('pilot', 180), ('soak', 86400)]:
+        raise ValueError('integration must be 3600 seconds; pilot must be 180 seconds; soak must be 86400 seconds')
 
 
 def require_integration_acceptance(phase, approval):
@@ -133,7 +133,7 @@ def code_hash():
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('phase', choices=['integration', 'soak'])
+    parser.add_argument('phase', choices=['integration', 'pilot', 'soak'])
     parser.add_argument('--seconds', type=int, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--host-heartbeat', type=Path, required=True)
