@@ -52,10 +52,10 @@ class ContinuityTests(unittest.TestCase):
         module = monitor()
         with mock.patch.object(module.Path, 'touch', side_effect=PermissionError('disk')):
             with mock.patch.object(module, 'command', return_value='ActiveState=inactive\\nMainPID=0\\n') as run:
-                errors = module.stop_service(Path('sentinel'))
+                errors = module.stop_service(module.DEFAULT_UNIT, Path('sentinel'))
         self.assertTrue(errors)
-        self.assertIn(mock.call('systemctl', 'stop', module.UNIT), run.call_args_list)
-        self.assertIn(mock.call('systemctl', 'show', module.UNIT, '--property=ActiveState,MainPID'), run.call_args_list)
+        self.assertIn(mock.call('systemctl', 'stop', module.DEFAULT_UNIT), run.call_args_list)
+        self.assertIn(mock.call('systemctl', 'show', module.DEFAULT_UNIT, '--property=ActiveState,MainPID'), run.call_args_list)
 
     def test_soak_cannot_run_before_explicit_integration_acceptance(self):
         with self.assertRaises(ValueError):
@@ -89,6 +89,11 @@ class ContinuityTests(unittest.TestCase):
             if path.name == 'memory.events':
                 return 'oom 0\noom_kill 0\nmax 0\n'
             raise AssertionError(str(path))
+        def path_exists(path):
+            p = str(path)
+            if p.endswith('/state/STOP') or p.endswith('\\state\\STOP'):
+                return False
+            return True
         def command(*args):
             if args[:2] == ('systemctl', 'start'):
                 active[0] = True
@@ -99,7 +104,7 @@ class ContinuityTests(unittest.TestCase):
             if args[0] == 'busctl':
                 return 't 3720000000'
             return ''
-        def properties():
+        def properties(unit):
             return dict(ActiveState='active' if active[0] else 'inactive', MainPID='123',
                         InvocationID='invocation', NRestarts='0', ControlGroup='/test')
         def backup(path):
@@ -115,6 +120,7 @@ class ContinuityTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(module.sys if hasattr(module, 'sys') else __import__('sys'), 'argv',
                 ['paper-validation.py', 'integration', '--seconds', '3600', '--output', str(output), '--host-heartbeat', str(Path(folder) / 'host.json')]))
             stack.enter_context(mock.patch.object(module.Path, 'read_text', read))
+            stack.enter_context(mock.patch.object(module.Path, 'exists', path_exists))
             stack.enter_context(mock.patch.object(module, 'clock', side_effect=lambda: dict(wall=now[0], mono=now[0], boot='guest')))
             stack.enter_context(mock.patch.object(module.time, 'time', side_effect=lambda: now[0]))
             stack.enter_context(mock.patch.object(module.time, 'monotonic', side_effect=lambda: now[0]))
@@ -150,21 +156,21 @@ class ContinuityTests(unittest.TestCase):
             with self.subTest(bound=bound), mock.patch.object(module, 'command', side_effect=[
                     'Restart=no\n', 't ' + str(bound * 1_000_000)]):
                 with self.assertRaises(RuntimeError):
-                    module.require_runtime_bound(3600)
+                    module.require_runtime_bound(module.DEFAULT_UNIT, 3600)
         with mock.patch.object(module, 'command', side_effect=['Restart=no\n', 't 3720000000']):
-            module.require_runtime_bound(3600)
+            module.require_runtime_bound(module.DEFAULT_UNIT, 3600)
 
     def test_approval_hash_excludes_only_phase_runtime_but_records_full_unit(self):
         from unittest import mock
         module = monitor()
         unit = '[Service]\nRestart=no\nRuntimeMaxSec=3720\nMemoryMax=512M\n'
         with mock.patch.object(module, 'command', return_value=unit), mock.patch.object(module.Path, 'read_bytes', return_value=b'config'):
-            integration = module.code_hash()
+            integration = module.code_hash(module.DEFAULT_UNIT)
         with mock.patch.object(module, 'command', return_value=unit.replace('3720', '86520')), mock.patch.object(module.Path, 'read_bytes', return_value=b'config'):
-            self.assertEqual(module.code_hash(), integration)
+            self.assertEqual(module.code_hash(module.DEFAULT_UNIT), integration)
         for changed in [unit.replace('512M', '1G'), unit.replace('Restart=no', 'Restart=always')]:
             with mock.patch.object(module, 'command', return_value=changed), mock.patch.object(module.Path, 'read_bytes', return_value=b'config'):
-                self.assertNotEqual(module.code_hash(), integration)
+                self.assertNotEqual(module.code_hash(module.DEFAULT_UNIT), integration)
 
     def test_phase_duration_cannot_be_unbounded(self):
         for seconds in [0, 3601, 86401]:

@@ -9,8 +9,13 @@ import sqlite3
 import subprocess
 import time
 
-UNIT = 'polymarket-btc-paper.service'
+DEFAULT_UNIT = 'polymarket-btc-paper.service'
 STATE = Path('/var/lib/polymarket-btc')
+
+
+def bus_path(unit: str) -> str:
+    """Convert systemd unit name to D-Bus object path."""
+    return '/org/freedesktop/systemd1/unit/' + unit.replace('-', '_2d').replace('.', '_2e')
 
 
 def validate_duration(phase, seconds):
@@ -50,34 +55,33 @@ def command(*args):
     return subprocess.run(args, check=True, capture_output=True, text=True, timeout=45).stdout
 
 
-def require_runtime_bound(seconds):
-    restart = command('systemctl', 'show', UNIT, '--property=Restart').strip()
+def require_runtime_bound(unit, seconds):
+    restart = command('systemctl', 'show', unit, '--property=Restart').strip()
     raw = command('busctl', 'get-property', 'org.freedesktop.systemd1',
-                  '/org/freedesktop/systemd1/unit/polymarket_2dbtc_2dpaper_2eservice',
-                  'org.freedesktop.systemd1.Service', 'RuntimeMaxUSec').split()
+                  bus_path(unit), 'org.freedesktop.systemd1.Service', 'RuntimeMaxUSec').split()
     if restart != 'Restart=no' or len(raw) != 2 or raw[0] != 't':
         raise RuntimeError('independent systemd runtime bound/restart policy missing')
     if not (seconds + 30) * 1_000_000 <= int(raw[1]) <= (seconds + 120) * 1_000_000:
         raise RuntimeError('systemd runtime must allow requested window plus 30–120 seconds')
 
 
-def properties():
-    return dict(line.split('=', 1) for line in command('systemctl', 'show', UNIT,
+def properties(unit):
+    return dict(line.split('=', 1) for line in command('systemctl', 'show', unit,
         '--property=ActiveState,MainPID,InvocationID,NRestarts,MemoryCurrent,MemoryPeak,MemoryMax,CPUUsageNSec,CPUQuotaPerSecUSec,ControlGroup').splitlines())
 
 
-def stop_service(stop_path):
+def stop_service(unit, stop_path):
     errors = []
     try:
         stop_path.touch()
     except OSError as exc:
         errors.append('sentinel: ' + str(exc))
     try:
-        command('systemctl', 'stop', UNIT)
+        command('systemctl', 'stop', unit)
     except (OSError, subprocess.SubprocessError) as exc:
         errors.append('stop: ' + str(exc))
     try:
-        terminal = command('systemctl', 'show', UNIT, '--property=ActiveState,MainPID')
+        terminal = command('systemctl', 'show', unit, '--property=ActiveState,MainPID')
         if set(terminal.splitlines()) != {'ActiveState=inactive', 'MainPID=0'}:
             errors.append('service not confirmed inactive: ' + terminal)
     except (OSError, subprocess.SubprocessError) as exc:
@@ -116,7 +120,7 @@ def clock():
                 boot=Path('/proc/sys/kernel/random/boot_id').read_text().strip())
 
 
-def code_hash():
+def code_hash(unit):
     digest = hashlib.sha256()
     root = Path('/opt/polymarket-btc')
     for folder in ['src/polymarket_bot/linux_mvp', 'src/polymarket_bot/market_data', 'deploy']:
@@ -125,8 +129,8 @@ def code_hash():
             digest.update(path.read_bytes())
     digest.update(Path('/etc/polymarket-btc/paper.env').read_bytes())
     # Phase-specific bound is checked independently; every other unit byte stays approved.
-    unit = command('systemctl', 'cat', UNIT)
-    digest.update('\n'.join(line for line in unit.splitlines()
+    unit_output = command('systemctl', 'cat', unit)
+    digest.update('\n'.join(line for line in unit_output.splitlines()
                             if not line.strip().startswith('RuntimeMaxSec=')).encode())
     return digest.hexdigest()
 
@@ -138,6 +142,7 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--host-heartbeat', type=Path, required=True)
     parser.add_argument('--integration-approval', type=Path)
+    parser.add_argument('--unit', type=str, default=DEFAULT_UNIT, help='systemd unit to observe')
     args = parser.parse_args()
     validate_duration(args.phase, args.seconds)
     approval = json.loads(args.integration_approval.read_text()) if args.integration_approval else None
@@ -152,10 +157,10 @@ def main():
     stop_path = None
     service_started = False
     try:
-        unit = command('systemctl', 'cat', UNIT)
-        (args.output / 'unit.txt').write_text(unit)
-        result['unit_sha256'] = hashlib.sha256(unit.encode()).hexdigest()
-        identity = code_hash()
+        unit_output = command('systemctl', 'cat', args.unit)
+        (args.output / 'unit.txt').write_text(unit_output)
+        result['unit_sha256'] = hashlib.sha256(unit_output.encode()).hexdigest()
+        identity = code_hash(args.unit)
         result['code_config_sha256'] = identity
         if args.phase == 'soak' and approval.get('code_config_sha256') != identity:
             raise RuntimeError('integration code/config differs')
@@ -166,16 +171,16 @@ def main():
         stop_path = Path(env['MVP_STATE_DIR']) / 'STOP'
         if stop_path.exists():
             raise RuntimeError('STOP exists; explicit operator cleanup required')
-        if properties()['ActiveState'] != 'inactive':
+        if properties(args.unit)['ActiveState'] != 'inactive':
             raise RuntimeError('service already running')
-        require_runtime_bound(args.seconds)
+        require_runtime_bound(args.unit, args.seconds)
         if host_error(host_previous, host_previous, time.time()):
             raise RuntimeError('host continuity unavailable')
         write_json(args.output / 'manifest.json', result)
         backup(args.output / 'before.sqlite')
         service_started = True  # submitted start can succeed even when client times out
-        command('systemctl', 'start', UNIT)
-        initial_service = properties()
+        command('systemctl', 'start', args.unit)
+        initial_service = properties(args.unit)
         if initial_service['ActiveState'] != 'active' or int(initial_service['MainPID']) <= 0:
             raise RuntimeError('service failed to start')
         baseline = previous = clock()
@@ -191,7 +196,7 @@ def main():
             error = host_error(host_previous, host, current['wall'])
             if error:
                 invalid.append(error)
-            service = properties()
+            service = properties(args.unit)
             if (service['ActiveState'] != 'active' or service['MainPID'] != initial_service['MainPID']
                     or service['InvocationID'] != initial_service['InvocationID']
                     or service['NRestarts'] != initial_service['NRestarts']):
@@ -230,10 +235,10 @@ def main():
         invalid.append(type(exc).__name__ + ': ' + str(exc))
     finally:
         if service_started:
-            invalid.extend(stop_service(stop_path))
+            invalid.extend(stop_service(args.unit, stop_path))
         for name, capture in [
             ('backup', lambda: backup(args.output / 'after.sqlite')),
-            ('journal', lambda: (args.output / 'journal.log').write_text(command('journalctl', '-u', UNIT,
+            ('journal', lambda: (args.output / 'journal.log').write_text(command('journalctl', '-u', args.unit,
                 '--since=@' + str(int(setup['wall'])), '--no-pager', '-o', 'short-iso-precise'))),
         ]:
             try:
