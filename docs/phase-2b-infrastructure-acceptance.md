@@ -1,72 +1,69 @@
 # Phase 2B Infrastructure 24-Hour Soak Acceptance Gates
 
-> **Status:** PILOT PASSED — 2026-10-25 20:08:28 UTC (180s pilot complete, all gates pass)
+> **Status: BLOCKED pending acceptance review.** Historical 180-second pilot completed on 2026-10-25; previous all-eight-gates-pass and soak-authorization claims are withdrawn. GitHub synchronization is not deployment or soak approval.
 
-**Scope:** INFRASTRUCTURE-ONLY test (ingest-only mode, no paper trades). Preserves all historical accounting. Proves continuous host/WSL operation, restart capability, deadline cleanup, public market data ingestion, SQLite integrity, and host continuity.
+**Scope:** INFRASTRUCTURE-ONLY, ingest-only service, no new paper trades, historical accounting preserved. No 24-hour run until acceptance contract is confirmed.
 
----
+## Historical Pilot Evidence (180 seconds)
 
-## Pilot Summary (180s)
+These are previously inspected local artifacts, not a new run or evidence bundled with this repository.
 
-| Gate | Target | Actual | Verdict |
-|------|--------|--------|---------|
-| **Continuous Operation** | ≥180s, ≥18 samples | 180s, 37 samples, `continuous=true` | **PASS** |
-| **Restart Capability** | SIGTERM + restart test | `RuntimeMaxSec=300`, `Restart=no`, service auto-stops cleanly | **PASS** |
-| **Deadline Cleanup** | Timer fires, Result=success | Timer fired 2026-10-25T13:08:28Z, `ActiveState=inactive`, `Result=success` | **PASS** |
-| **Network Ingestion** | >0 observations/cycle | 23,662 observations in 180s | **PASS** |
-| **Database Integrity** | `quick_check=ok` every sample | All 37 samples report `integrity=ok` | **PASS** |
-| **Host Continuity** | 0 interruptions, 1 session, 1 boot | 57 records, seq 1-57, 0 interruptions, 1 session, 1 boot, max gap 5.2s | **PASS** |
-| **No Trades** | 0 new orders/positions/settlements | Orders 842→842, Positions 82→82, Settlements 48→48 | **PASS** |
-| **Hash Integrity** | `code_config_sha256` matches | `a499b7e0ce6edbbca160ec32df4dc00625a1a6be3b44dd7b3214ceffe4bdc853` (RuntimeMaxSec-only diff) | **PASS** |
+| Gate | Recorded evidence | Assessment |
+|------|-------------------|------------|
+| Continuous operation | 37 samples, `continuous=true`, `invalid_reasons=[]`, `verdict=PENDING_ACCEPTANCE` | Observer window completed; independent acceptance still required |
+| Restart capability | Deadline stopped service cleanly; `Restart=no` | **Not proven.** Clean stop is not restart evidence |
+| Deadline cleanup | Timer fired 2026-10-25T13:08:28Z; `ActiveState=inactive`, `Result=success`, `MainPID=0` | Target stop recorded; complete timer cleanup requires separate check |
+| Network ingestion | `after.sqlite` has 23,662 total observations | **Delta not established.** Cumulative total is not observations added during pilot |
+| Database integrity | All 37 samples reported `integrity=ok` | Sample checks recorded; backup integrity needs independent review |
+| Host continuity | Inspected heartbeat: 57 records, sequence 1–57, one session/boot, zero interruptions, max gap 5.219 seconds | Reviewed segment only; full heartbeat lifetime not established |
+| No new trades | Orders 842 to 842, positions 82 to 82, settlements 48 to 48 | Counts unchanged; historical rows were not reset |
+| Hash integrity | Pilot hash `a499b7e0ce6edbbca160ec32df4dc00625a1a6be3b44dd7b3214ceffe4bdc853` differs from old paper approval | **Not accepted.** `code_hash(unit)` excludes `RuntimeMaxSec=`, so runtime-only changes cannot explain mismatch |
 
----
+## Proposed 24-Hour Acceptance Contract (86,400 seconds)
 
-## 24-Hour Soak Acceptance Gates (86,400s)
+All gates require independent review and explicit authorization before scheduling.
 
-| # | Gate | Target | Verification |
-|---|------|--------|--------------|
-| **1** | **Continuous Operation** | ≥86,400s, ≥8,640 samples | `result.json`: `continuous=true`, `samples >= 8640` |
-| **2** | **Restart Capability** | Service survives simulated SIGTERM/STOP and restarts | Manual: `systemctl stop` then `systemctl start` during soak; journal shows clean restart |
-| **3** | **Deadline Cleanup** | Independent timer fires, stops service, cleans timer units | `deadline.log`: `Result=success`, `ActiveState=inactive`, `MainPID=0`; `systemctl list-timers` shows no orphaned timers |
-| **4** | **Network Ingestion** | Public market data collected every cycle, observations persisted | `samples.jsonl`: `observations` table grows each sample |
-| **5** | **Database Integrity** | `PRAGMA quick_check=ok` every sample, backup integrity ok | Each sample has `integrity=ok`; `sqlite3 after.sqlite 'PRAGMA integrity_check'` = ok |
-| **6** | **Host Continuity** | Windows heartbeat sequences 1-N, 0 interruptions, single session/boot | `host.json.jsonl`: sequential seq, no `interrupted=true`, single session/boot |
-| **7** | **No Trades** | 0 new orders, 0 new positions, 0 new equity records | `after.sqlite` vs `before.sqlite`: order/position/settlement counts identical |
-| **8** | **Hash Integrity** | `code_config_sha256` matches integration approval (only RuntimeMaxSec differs) | Observer `code_hash(INFRA_UNIT)` equals `approval.code_config_sha256` |
+| # | Gate | Required verification |
+|---|------|-----------------------|
+| 1 | Continuous operation | Full 86,400-second observer window; `continuous=true`, no invalid reasons, at least 8,640 samples; check elapsed duration as well as sample count |
+| 2 | Restart capability | Separate bounded stop/start trial with journal and PID evidence **outside** uninterrupted observer window. Observer invalidates PID, InvocationID, or restart-count changes |
+| 3 | Deadline cleanup | Independent timer stops intended service; verify inactive state, `MainPID=0`, result, no remaining processes or orphaned timer units; do not infer success from log's last command alone |
+| 4 | Network ingestion | Compare before/after observation counts and timestamps and inspect ingestion across full window. Observer does not currently record per-sample observation counts |
+| 5 | Database integrity | Every sample `quick_check=ok`; independently check before/after/deadline backups with `PRAGMA integrity_check` |
+| 6 | Host continuity | Full heartbeat JSONL coverage, consecutive sequences, one session/boot, no interruptions, readable power events, acceptable gaps |
+| 7 | No new trades | Compare before/after orders, positions, settlements and equity records; preserve historical rows, require zero **new** trading records, not zero lifetime records |
+| 8 | Hash integrity | Reviewed approval must match actual infrastructure `code_hash(INFRA_UNIT)` exactly. Never reuse mismatched paper approval or overwrite approval hash without review |
 
----
+## Launcher Dependencies and Limitations
 
-## Go/No-Go Decision Criteria
+`deploy/infrastructure-launcher.py` is **Windows/WSL-specific**, not a native Ubuntu VPS launcher. Publishing it does not establish VPS launch readiness. `deploy/install.sh` does not provision this infrastructure workflow.
 
-**All 8 gates must PASS for soak authorization.**
+Tracked copies of historical external helpers:
 
-| Condition | Action |
-|-----------|--------|
-| All pilot gates PASS + soak acceptance gates defined | **AUTHORIZED** to schedule 24h soak |
-| Any pilot gate FAIL | **BLOCKED** — fix and re-run pilot |
-| Pilot incomplete | **WAIT** — complete pilot first |
+| Repository source | Existing launcher expects |
+|-------------------|---------------------------|
+| `deploy/phase2b-guard-tests.py` | `/mnt/c/Users/Public/phase2b-guard-tests.py` |
+| `deploy/phase2b-final-234452-host.ps1` | `C:\Users\Public\phase2b-final-234452-host.ps1` |
+| `deploy/paper-validation.py` | `/opt/polymarket-btc/deploy/paper-validation.py` |
 
----
+Copies preserve helper behavior; launcher still uses external installed paths. No installation or runtime changes performed as part of Git synchronization. Helper `D` fixes deadline evidence root to `/var/lib/polymarket-btc/phase2b-evidence/final-remediation-20261023T234452Z`; parent directory must already exist. Launcher also assumes configured infrastructure unit, Python environment, state/evidence directories, Windows interop and host event-log access. Heartbeat accepts `360`, `3600`, or `86400` seconds and runs for requested duration plus 120 seconds.
+
+**Safety blockers before any execution:** launcher removes shared `state/STOP` and writes systemd override **before** validating approval hash; do not run it while STOP is safety-required. Paper service inactivity is not checked by launcher and must not be assumed. Launcher has no general rollback on partial failure. External helper copies are outside current `code_hash` input paths; adding tracked Python helpers to deployed `deploy/` changes that hash but does not bind installed external copies. Review installed helper contents separately. Resolve these operational gaps and approve exact deployed code/config/helper identity before any soak. Do not use Python optimized mode: current preflight checks use assertions.
+
+CLI shape only, **not authorization to execute**: positional `pilot` or `soak`, required `--output` and `--host-heartbeat`, plus `--integration-approval` for soak. `--phase` and `--seconds` are not launcher arguments. No launch command supplied while blocked.
 
 ## Operational Constraints (Unchanged)
 
-- **PAPER_ONLY mode**: No wallets, keys, signing, real orders, VPS changes, Git push
-- **DAILY_LOSS_LIMIT=$10**: Unchanged (config.py:101). Any trading re-run must wait for new UTC day
-- **RISK_STOPPED terminal**: Preserved (service.py:13, engine.py:71,163). Fail-closed after fills at realized ≤ -max_daily_loss
-- **No live trading**: VPS changes, risk-limit weakening forbidden
-- **No 24h run** until acceptance contract confirmed
+- `PAPER_ONLY`; no wallets, keys, signing or live orders.
+- `$10 DAILY_LOSS_LIMIT` unchanged; terminal `RISK_STOPPED` unchanged. No strategy or risk-limit changes.
+- No VPS changes or 24-hour launch during repository synchronization. `main` remains untouched; only `linux-mvp` publication authorized.
+- Acceptance contract and explicit authorization required before any 24-hour run.
 
----
+## Local Evidence References
 
-## Approval Artifacts
+- Old paper integration approval (not valid infrastructure authorization): `/mnt/c/Users/Public/phase2b-soak-approval.json`
+- Pilot: `/var/lib/polymarket-btc/phase2b-evidence/infrastructure-pilot-20261025T130324Z/`
+- Heartbeat: `/mnt/c/Users/Public/phase2b-infra-pilot-20261025T130324Z-host.json.jsonl`
+- Deadline: `/var/lib/polymarket-btc/phase2b-evidence/final-remediation-20261023T234452Z/infra-pilot-20261025T130324Z/deadline.log`
 
-- Integration approval: `/mnt/c/Users/Public/phase2b-soak-approval.json` (`verdict=PHASE_2B_PROVISIONAL`)
-- Pilot evidence: `/var/lib/polymarket-btc/phase2b-evidence/infrastructure-pilot-20261025T130324Z/`
-- Host heartbeat: `/mnt/c/Users/Public/phase2b-infra-pilot-20261025T130324Z-host.json.jsonl`
-- Deadline log: `/var/lib/polymarket-btc/phase2b-evidence/final-remediation-20261023T234452Z/infra-pilot-20261025T130324Z/deadline.log`
-
----
-
-## Next Step
-
-**Authorize 24h infrastructure soak** — run with `--phase soak --seconds 86400 --integration-approval /mnt/c/Users/Public/phase2b-soak-approval.json`
+Next step: independent acceptance review and resolution of deployment blockers. GitHub publication alone authorizes neither deployment nor soak.
