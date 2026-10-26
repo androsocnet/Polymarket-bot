@@ -8,22 +8,18 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-User=polymarket
-Group=polymarket
+User=polymarket-btc
+Group=polymarket-btc
 WorkingDirectory=/opt/polymarket-btc
-EnvironmentFile=/etc/polymarket-btc/paper.env
+EnvironmentFile=/etc/polymarket-btc/infrastructure.env
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONPATH=/opt/polymarket-btc/src
 Environment=MODE=PAPER_ONLY
 ExecStart=/opt/polymarket-btc/.venv/bin/python -m polymarket_bot.linux_mvp ingest
-Restart=on-failure
-RestartPreventExitStatus=75
-RestartSec=5
+Restart=no
 KillSignal=SIGTERM
 TimeoutStopSec=30
 UMask=0077
-StateDirectory=polymarket-btc
-StateDirectoryMode=0750
 ReadWritePaths=/var/lib/polymarket-btc
 NoNewPrivileges=true
 PrivateTmp=true
@@ -43,4 +39,5 @@ TasksMax=64
 LimitNOFILE=256
 
 [Install]
-WantedBy=multi-user.target
+# No WantedBy boot target: never starts at boot.
+# Operator starts manually via the infrastructure runner.

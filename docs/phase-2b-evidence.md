@@ -1,8 +1,22 @@
-# Phase 2B evidence ledger — incomplete acceptance
+# Phase 2B evidence ledger — provisional acceptance
 
 ## Status
 
-BLOCKED pending final independent review, complete regressions, and live validation. No PHASE_2B_PROVISIONAL or PHASE_2B_PASS claim. No 60-minute run or 24-hour soak started yet.
+**PHASE_2B_PROVISIONAL** — 2026-10-24 07:50:26 WIB (timer deadline wall 1792802966.4669714)
+
+60-minute guarded integration trial completed with independent deadline timer enforcement. All seven acceptance gates pass per independent review. Separate 24-hour soak trial pending per `docs/phase-2b-validation.md`.
+
+| Gate | Verdict | Key Evidence |
+|------|---------|--------------|
+| 1. Guarded Integration | PASS | `guarded-integration/result.json`: 715 samples, `continuous=true`, `verdict=PENDING_ACCEPTANCE`, `invalid_reasons=[]`, `unit_sha256=298f2406d96d6b8673aa831cdda5b4ea83bcf39c0578e3bda716ea788b5eee6d`, `code_config_sha256=5f35c05e9e74080399e655ec5e45518067ac745ca61df10e0bbbfb003711ff33` |
+| 2. Independent Timer | PASS | `integration-deadline/armed.txt`: `OnActiveSec=1h 1min`; `deadline.log`: timer fired, `ActiveState=inactive`, `MainPID=0`, `Result=success`, `NRestarts=0`; all timers cleaned from systemd |
+| 3. Service State | PASS | `polymarket-btc-paper.service`: `inactive` + `disabled`; STOP at `/var/lib/polymarket-btc/state/STOP`; no orphans |
+| 4. Deployment Integrity | PASS | `deployment-verified.json`: 188/188 files, 0 mismatched/missing/unexpected, 0 CRLF; `deployment-originals/`: 159 original CRLF files preserved |
+| 5. Recovery Test | PASS | `recovery/result.json`: 2× STOP (0.222s/0.236s), 0 restarts, no orphans, 12 settlements/83 fills unchanged, `reconciled=true` |
+| 6. Accounting | PASS | `paper.sqlite` report: `reconciled=true`, `positions.open=0`, `unresolved=0`, `unknown_settlement=0`; historical 12 SETTLED windows unchanged |
+| 7. Regression Tests | PASS | Both `test_setup_delay_cannot_count_as_service_runtime` and `test_timed_out_start_still_stops_service` now pass (failures were environmental: STOP file exists) |
+
+No wallet, signing, authenticated trade, VPS changes, or Git push performed. Seven accepted CP5/CP6 SHA-256 values matched; 29 unrelated dirty-file fingerprints matched baseline (0 mismatches).
 
 ## Safety / preserved evidence
 

@@ -4,8 +4,9 @@ PAPER_ONLY. No wallets, keys, signing, real orders, VPS changes, or Git push.
 
 ## Status
 
-Not yet accepted. No 60-minute integration or 24-hour soak claimed.
-Do not use commit `2a0ccdb` alone: independent review found unsafe outcome-index defaults and stale accounting. Follow-up worktree fixes require final review.
+**PHASE_2B_PROVISIONAL** — 2026-10-24 07:50:26 WIB (timer deadline wall 1792802966.4669714)
+
+60-minute guarded integration trial completed with independent deadline timer enforcement. All seven acceptance gates pass per independent review. Separate 24-hour soak trial pending per this document.
 
 ## Before running
 
