@@ -102,6 +102,13 @@ class InfrastructureArtifactTests(unittest.TestCase):
         self.assertNotIn('curl ', lowered)
         self.assertNotIn('curl$', lowered)
 
+    def test_installer_allows_paper_coexistence(self):
+        """Installer must not block existing paper.env; only infra conflicts."""
+        # Broad glob *paper* would match paper.env and block coexistence.
+        self.assertNotIn('*paper*', self.installer)
+        # Must check for infrastructure-specific conflict only.
+        self.assertIn('infrastructure.env', self.installer)
+
     def test_installer_shell_syntax_ok(self):
         import subprocess
         result = subprocess.run(['bash', '-n', str(REPO_DEPLOY / 'install-infrastructure.sh')],

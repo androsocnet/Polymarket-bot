@@ -17,9 +17,10 @@ if [[ "${EUID}" -ne 0 ]]; then
     exit 1
 fi
 
-# Refuse to overwrite existing paper configuration.
-if ls "${CONF_DIR}"/*paper* >/dev/null 2>&1; then
-    echo "existing paper configuration in ${CONF_DIR}; infrastructure uses infrastructure.env. Aborting." >&2
+# Refuse to overwrite existing infrastructure configuration only.
+# Existing paper configuration is left untouched and coexists freely.
+if [[ -e "${CONF_DIR}/infrastructure.env" ]]; then
+    echo "existing infrastructure configuration at ${CONF_DIR}/infrastructure.env. Review or remove before reinstalling. Aborting." >&2
     exit 1
 fi
 
