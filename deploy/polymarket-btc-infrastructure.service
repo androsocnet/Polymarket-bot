@@ -13,14 +13,16 @@ Group=polymarket-btc
 WorkingDirectory=/opt/polymarket-btc
 EnvironmentFile=/etc/polymarket-btc/infrastructure.env
 Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONPATH=/opt/polymarket-btc/src
 Environment=MODE=PAPER_ONLY
 ExecStart=/opt/polymarket-btc/.venv/bin/python -m polymarket_bot.linux_mvp ingest
 Restart=no
 KillSignal=SIGTERM
+KillMode=control-group
 TimeoutStopSec=30
 UMask=0077
-ReadWritePaths=/var/lib/polymarket-btc
+ReadWritePaths=/var/lib/polymarket-btc-infrastructure/data
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

@@ -31,7 +31,7 @@ data = {'session': sid, 'boot': boot, 'sequence': seq, 'wall': wall,
 print(json.dumps(data, sort_keys=True))
 " "$seq" "$wall" "$mono" "$boottime" "$interrupted" "$BOOT_ID" "$SESSION_ID" > "$tmp"
     mv -f "$tmp" "$OUTPUT_PATH"
-    cat "$tmp" >> "${OUTPUT_PATH}.jsonl"
+    cat "$OUTPUT_PATH" >> "${OUTPUT_PATH}.jsonl"
 }
 
 while true; do

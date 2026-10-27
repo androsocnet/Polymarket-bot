@@ -57,8 +57,9 @@ class InfrastructureArtifactTests(unittest.TestCase):
 
     # --- runner is SSH-independent and survives disconnects ---
     def test_runner_submits_detached_systemd_jobs(self):
-        for token in ('systemd-run', '--unit', '--remain-after-exit=no'):
-            self.assertIn(token, self.runner)
+        # Runner delegates native detached launch; command shape covered behaviorally.
+        self.assertIn('infrastructure-trial.py', self.runner)
+        self.assertIn('launch', self.runner)
 
     def test_runner_does_not_hold_ssh_session(self):
         lowered = self.runner.lower()
@@ -130,14 +131,14 @@ class InfrastructureArtifactTests(unittest.TestCase):
         for token in ('User=polymarket-btc', 'Group=polymarket-btc',
                       'NoNewPrivileges=true', 'ProtectSystem=strict',
                       'MemoryMax=512M', 'CPUQuota=50%', 'TasksMax=64',
-                      'ReadWritePaths=/var/lib/polymarket-btc',
+                      'ReadWritePaths=/var/lib/polymarket-btc-infrastructure/data',
                       'EnvironmentFile=/etc/polymarket-btc/infrastructure.env'):
             self.assertIn(token, self.unit)
 
     # --- env example is isolated and secret-free ---
     def test_env_example_isolated_paths(self):
-        self.assertIn('MVP_DB_PATH=/var/lib/polymarket-btc/infrastructure.sqlite', self.env)
-        self.assertIn('MVP_STATE_DIR=/var/lib/polymarket-btc/infrastructure/state', self.env)
+        self.assertIn('MVP_DB_PATH=/var/lib/polymarket-btc-infrastructure/data/infrastructure.sqlite', self.env)
+        self.assertIn('MVP_STATE_DIR=/var/lib/polymarket-btc-infrastructure/data/state', self.env)
         self.assertIn('MODE=PAPER_ONLY', self.env)
 
     def test_env_no_secrets(self):
