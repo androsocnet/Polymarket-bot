@@ -39,10 +39,10 @@ class ReplayIntegrationTests(unittest.TestCase):
         )
         report = engine.run(
             snapshots=adapter.snapshots,
+            paper_recording=adapter.paper_recording,
             excluded=adapter.excluded,
             opportunities=adapter.opportunities,
-            settlement_evidence=adapter.settlement_evidence,
-            settlement_result=adapter.settlement_result
+            settlement_evidence=adapter.settlement_evidence
         )
 
         self.assertIsInstance(report, BacktestReport)

@@ -64,6 +64,22 @@ class ReplayCliTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertEqual((out_dir / 'sentinel').read_text(), 'untouched')
 
+    def test_cli_variant_executes_cleanly(self):
+        """C2 regression: variant evaluation never escapes as an uncaught TypeError."""
+        err = io.StringIO()
+        out_dir = self.db_path.parent / 'replay-variant-result'
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            code = main([
+                '--db', str(self.db_path),
+                '--run-id', self.run_id,
+                '--market-id', '1001',
+                '--output-dir', str(out_dir),
+                '--variant', 'entry_cap_0.5',
+            ])
+        self.assertEqual(code, 0)
+        self.assertNotIn('Traceback', err.getvalue(), 'no stack trace on variant evaluation')
+        self.assertTrue((out_dir / 'report.json').exists())
+
 
 if __name__ == '__main__':
     unittest.main()

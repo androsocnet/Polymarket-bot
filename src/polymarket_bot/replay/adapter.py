@@ -7,20 +7,31 @@ from __future__ import annotations
 
 from contextlib import closing
 from dataclasses import dataclass
-from decimal import Decimal
+from datetime import datetime, timedelta, timezone
+import json
 from pathlib import Path
 import sqlite3
 from typing import Any
 
-from polymarket_bot.market_data.clob import parse_book
-from polymarket_bot.market_data.http import JsonRead
 from polymarket_bot.market_data.models import (
-    BookLevel, BookObservation, MarketDataError, MarketDescriptor,
-    MarketSnapshot, OutcomeBook, TokenOutcome
+    BookObservation, MarketDataError, MarketDescriptor,
+    MarketSnapshot, TokenOutcome
 )
 from polymarket_bot.paper import load_recording as load_paper_recording
 from polymarket_bot.recorder.store import decode_evidence
 from polymarket_bot.linux_mvp.settlement import verify_evidence
+
+EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _epoch_us(moment: datetime) -> int:
+    delta = moment - EPOCH
+    return (delta.days * 86400 + delta.seconds) * 1_000_000 + delta.microseconds
+
+
+def _epoch_datetime(us: int) -> datetime:
+    from datetime import timedelta
+    return EPOCH + timedelta(microseconds=us)
 
 
 @dataclass(frozen=True)
@@ -40,6 +51,7 @@ class MarketWindow:
     settlement_result: dict | None   # Result from verify_evidence
     horizon_ns: int
     horizon_us: int
+    paper_recording: Any = None      # validated paper.Recording (real clocks; engine source of truth)
 
 
 class ReplayAdapter:
@@ -60,14 +72,15 @@ class ReplayAdapter:
         self._opportunities: tuple[dict, ...] = ()
         self._settlement_evidence: dict | None = None
         self._settlement_result: dict | None = None
+        self._paper_recording: Any = None
 
     def load(self) -> 'ReplayAdapter':
         """Load and validate all evidence. Idempotent; fails closed on any error."""
         if self._loaded:
             return self
-        self._snapshots, self._excluded, self._opportunities, self._settlement_evidence, self._settlement_result = (
-            load_replay_recording(self.db, self.run_id, self.market_id, max_age_us=self.max_age_us)
-        )
+        result = load_replay_recording(self.db, self.run_id, self.market_id, max_age_us=self.max_age_us)
+        (self._snapshots, self._excluded, self._opportunities,
+         self._settlement_evidence, self._settlement_result, self._paper_recording) = result
         self._loaded = True
         return self
 
@@ -102,6 +115,13 @@ class ReplayAdapter:
         return self._settlement_result
 
     @property
+    def paper_recording(self):
+        """The validated paper.Recording: real anchor clocks feed the replay engine."""
+        if not self._loaded:
+            self.load()
+        return self._paper_recording
+
+    @property
     def db_sha256(self) -> str:
         from hashlib import sha256
         return sha256(self.db.read_bytes()).hexdigest()
@@ -113,10 +133,15 @@ def load_replay_recording(
     market_id: str,
     *,
     max_age_us: int = 5_000_000
-) -> tuple[tuple[MarketSnapshot, ...], tuple[dict, ...], tuple[dict, ...], dict | None, dict | None]:
+) -> tuple[tuple[MarketSnapshot, ...], tuple[dict, ...], tuple[dict, ...], dict | None, dict | None, Any]:
     """Load one market window from CP5 recorder DB for replay.
 
-    Returns: (validated_snapshots, excluded_records, opportunities, settlement_evidence, settlement_result)
+    Returns: (validated_snapshots, excluded_records, opportunities,
+              settlement_evidence, settlement_result, paper_recording)
+
+    The paper recording is the single source of truth for replay clocks: it
+    carries the anchor-verified receipt/source times that causality and the
+    staleness gate depend on. MarketSnapshots are kept for fingerprinting.
     """
     db = Path(db).resolve(strict=True)
 
@@ -124,46 +149,63 @@ def load_replay_recording(
     from polymarket_bot.strategy import load_strategy_recording
     paper_recording = load_strategy_recording(db, run_id, market_id)
 
+    market_row = _load_market_row(db, paper_recording.market_id)
+    descriptor = _market_descriptor(paper_recording, market_row)
+
     # Pair UP/DOWN paper snapshots into MarketSnapshots
-    snapshots = _pair_paper_snapshots(paper_recording)
+    snapshots = _pair_paper_snapshots(paper_recording, descriptor)
 
     # Load settlement evidence for this market
-    settlement_evidence, settlement_result = _load_settlement_evidence(db, market_id)
+    settlement_evidence, settlement_result = _load_settlement_evidence(db, market_row)
 
-    return snapshots, paper_recording.excluded, paper_recording.opportunities, settlement_evidence, settlement_result
+    return (snapshots, paper_recording.excluded, paper_recording.opportunities,
+            settlement_evidence, settlement_result, paper_recording)
 
 
 def load_all_windows(
     db: Path,
     *,
     max_age_us: int = 5_000_000
-) -> list[MarketWindow]:
-    """Load all completed market windows from a CP5 recording run for chronological replay."""
+) -> tuple[list[MarketWindow], list[dict]]:
+    """Load all completed market windows from a CP5 recording run for chronological replay.
+
+    Returns: (windows sorted by window_start_us, skipped diagnostics).
+    Data completeness failures are reported, never silently swallowed.
+    """
     db = Path(db).resolve(strict=True)
-    
-    windows = []
+
+    windows: list[MarketWindow] = []
+    skipped: list[dict] = []
+    seen_markets: set[str] = set()
     with closing(sqlite3.connect(db.as_uri() + '?mode=ro', uri=True)) as conn:
         conn.row_factory = sqlite3.Row
         conn.execute('PRAGMA query_only=ON')
-        
-        # Find all STOPPED/COMPLETED runs
+
         runs = conn.execute(
-            "SELECT run_id FROM recording_runs WHERE state IN ('STOPPED', 'FAILED', 'INTERRUPTED') AND ended_wall_us IS NOT NULL"
+            "SELECT run_id FROM recording_runs WHERE ended_wall_us IS NOT NULL "
+            "ORDER BY started_wall_us, run_id"
         ).fetchall()
-        
+
         for run in runs:
             run_id = run['run_id']
             markets = conn.execute(
-                "SELECT * FROM markets WHERE lifecycle IN ('EXPIRED', 'CURRENT', 'INVALIDATED')"
+                """SELECT m.* FROM markets m
+                   JOIN market_revisions r ON r.market_id = m.market_id
+                   WHERE r.run_id = ? AND m.lifecycle IN ('EXPIRED', 'INVALIDATED')
+                   ORDER BY m.market_id""",
+                (run_id,)
             ).fetchall()
-            
+
             for market in markets:
                 market_id = market['market_id']
+                if market_id in seen_markets:
+                    continue  # one window per market: the earliest completed recording run wins
                 try:
-                    snapshots, excluded, opportunities, settlement_evidence, settlement_result = load_replay_recording(
-                        db, run_id, market_id, max_age_us=max_age_us
-                    )
-                    if snapshots:  # Only include windows with valid data
+                    (snapshots, excluded, opportunities, settlement_evidence,
+                     settlement_result, paper_recording) = load_replay_recording(
+                        db, run_id, market_id, max_age_us=max_age_us)
+                    if snapshots:
+                        seen_markets.add(market_id)
                         windows.append(MarketWindow(
                             market_id=market_id,
                             condition_id=market['condition_id'],
@@ -177,38 +219,66 @@ def load_all_windows(
                             opportunities=opportunities,
                             settlement_evidence=settlement_evidence,
                             settlement_result=settlement_result,
-                            horizon_ns=max(s.available_ns for s in snapshots) if snapshots else 0,
-                            horizon_us=int((max(s.available_ns for s in snapshots) if snapshots else 0) / 1000)
+                            horizon_ns=paper_recording.horizon_ns,
+                            horizon_us=paper_recording.horizon_us,
+                            paper_recording=paper_recording
                         ))
-                except (ValueError, TypeError, KeyError, MarketDataError):
-                    # Skip windows that fail to load
-                    continue
-    
+                    else:
+                        skipped.append(dict(market_id=market_id, run_id=run_id,
+                                            reason='no validated snapshots'))
+                except (ValueError, TypeError, KeyError, MarketDataError) as exc:
+                    skipped.append(dict(market_id=market_id, run_id=run_id, reason=str(exc)))
+
     # Sort chronologically by window_start_us
-    windows.sort(key=lambda w: w.window_start_us)
-    return windows
+    windows.sort(key=lambda w: (w.window_start_us, w.market_id))
+    return windows, skipped
 
 
-def _pair_paper_snapshots(paper_recording) -> tuple[MarketSnapshot, ...]:
+def _load_market_row(db: Path, market_id: str) -> dict:
+    with closing(sqlite3.connect(db.as_uri() + '?mode=ro', uri=True)) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute('PRAGMA query_only=ON')
+        row = conn.execute("SELECT * FROM markets WHERE market_id = ?", (market_id,)).fetchone()
+    if row is None:
+        raise ValueError(f'market row missing for {market_id}')
+    return dict(row)
+
+
+def _market_descriptor(paper_recording, row: dict) -> MarketDescriptor:
+    """Real persisted identity: window bounds and metadata come from the markets row."""
+    tokens = paper_recording.tokens
+    return MarketDescriptor(
+        event_id=row['event_id'],
+        event_slug=row['slug'],
+        event_title=row['question'],
+        market_id=paper_recording.market_id,
+        slug=row['slug'],
+        question=row['question'],
+        condition_id=paper_recording.condition_id,
+        window_start=_epoch_datetime(row['window_start_us']),
+        window_end=_epoch_datetime(row['window_end_us']),
+        active=True,
+        closed=False,
+        accepting_orders=True,
+        enable_order_book=True,
+        up=TokenOutcome('Up', tokens['UP']),
+        down=TokenOutcome('Down', tokens['DOWN']),
+        metadata={},
+        warnings=()
+    )
+
+
+def _pair_paper_snapshots(paper_recording, descriptor: MarketDescriptor | None = None) -> tuple[MarketSnapshot, ...]:
     """Pair UP/DOWN paper Snapshots into MarketSnapshot tuples by slot.
 
     paper.py produces one Snapshot per outcome per slot. MarketSnapshot
-    requires both up and down BookObservations paired.
+    requires both up and down BookObservations paired. Timestamps stay real:
+    book source is the only recorded source moment.
     """
-    from datetime import datetime, timezone
-
     # Group by slot_id
     groups: dict[int, dict[str, Any]] = {}
     for s in paper_recording.snapshots:
         groups.setdefault(s.slot_id, {})[s.outcome] = s
-
-    # Build market descriptor from paper recording metadata
-    tokens = paper_recording.tokens
-    up_token = tokens.get('UP', '')
-    down_token = tokens.get('DOWN', '')
-
-    # Use horizon for window bounds approximation
-    condition_id = paper_recording.condition_id
 
     snapshots: list[MarketSnapshot] = []
     for slot_id in sorted(groups):
@@ -225,25 +295,7 @@ def _pair_paper_snapshots(paper_recording) -> tuple[MarketSnapshot, ...]:
         source_at = up.book.source_at
         validated_at = source_at  # Use source as validated for replay
 
-        market = MarketDescriptor(
-            event_id=paper_recording.market_id,
-            event_slug='',
-            event_title='',
-            market_id=paper_recording.market_id,
-            slug='',
-            question='',
-            condition_id=condition_id,
-            window_start=source_at,
-            window_end=source_at,
-            active=True,
-            closed=False,
-            accepting_orders=True,
-            enable_order_book=True,
-            up=TokenOutcome('Up', up_token),
-            down=TokenOutcome('Down', down_token),
-            metadata={},
-            warnings=()
-        )
+        market = descriptor if descriptor is not None else _fallback_descriptor(paper_recording, source_at)
 
         snapshots.append(MarketSnapshot(
             market=market,
@@ -260,6 +312,29 @@ def _pair_paper_snapshots(paper_recording) -> tuple[MarketSnapshot, ...]:
     return tuple(snapshots)
 
 
+def _fallback_descriptor(paper_recording, source_at) -> MarketDescriptor:
+    tokens = paper_recording.tokens
+    return MarketDescriptor(
+        event_id=paper_recording.market_id,
+        event_slug='',
+        event_title='',
+        market_id=paper_recording.market_id,
+        slug='',
+        question='',
+        condition_id=paper_recording.condition_id,
+        window_start=source_at,
+        window_end=source_at,
+        active=True,
+        closed=False,
+        accepting_orders=True,
+        enable_order_book=True,
+        up=TokenOutcome('Up', tokens['UP']),
+        down=TokenOutcome('Down', tokens['DOWN']),
+        metadata={},
+        warnings=()
+    )
+
+
 def _make_observation(paper_snap):
     """Create a BookObservation from a paper.py Snapshot."""
     book = paper_snap.book
@@ -273,45 +348,93 @@ def _make_observation(paper_snap):
     )
 
 
-def _load_settlement_evidence(db: Path, market_id: str) -> tuple[dict | None, dict | None]:
-    """Load settlement evidence from resolution_observations table."""
+def _load_settlement_evidence(db: Path, market_row: dict) -> tuple[dict | None, dict | None]:
+    """Load and verify settlement evidence exactly as the live verifier shapes it.
+
+    Builds evidence from the correct sources:
+      - gamma_raw: the market's Gamma revision payload (market_revisions.gamma_raw_z),
+        which carries id/conditionId/outcomes/clobTokenIds/endDate/slug/closed.
+      - resolution_raw: the data-api envelope from resolution_observations.raw_resolution_z,
+        filtered to this condition (the recorder batches up to 20 conditions per response).
+      - window: projected to the {start_us, end_us} keys verify_evidence reads.
+      - at_us: the real learning time (learned_server_us, falling back to learned_wall_us).
+    Failures stay honest: the verifier returns UNKNOWN_SETTLEMENT with a diagnostic.
+    """
+    market_id = market_row['market_id']
     with closing(sqlite3.connect(db.as_uri() + '?mode=ro', uri=True)) as conn:
         conn.row_factory = sqlite3.Row
         conn.execute('PRAGMA query_only=ON')
-        
-        # Get the latest RESOLVED_DIRECTIONAL observation for this market
-        row = conn.execute(
-            """SELECT * FROM resolution_observations 
+
+        observation = conn.execute(
+            """SELECT * FROM resolution_observations
                WHERE market_id = ? AND classification = 'RESOLVED_DIRECTIONAL'
                ORDER BY learned_wall_us DESC LIMIT 1""",
             (market_id,)
         ).fetchone()
-        
-        if row is None:
+        if observation is None:
             return None, None
-        
-        evidence = {
-            'gamma_raw': decode_evidence(row['raw_resolution_z'], row['raw_size_bytes'], row['codec_version']),
-            'resolution_raw': row['payouts_raw_json']
-        }
-        
-        # Get window info for verification
-        window_row = conn.execute(
-            "SELECT * FROM markets WHERE market_id = ?", (market_id,)
+
+        revision = conn.execute(
+            """SELECT gamma_raw_z, raw_sizes_json, codec_version FROM market_revisions
+               WHERE market_id = ? ORDER BY revision_id DESC LIMIT 1""",
+            (market_id,)
         ).fetchone()
-        
-        if window_row is None:
-            return evidence, None
-        
-        window = dict(window_row)
-        tokens = {
-            'UP': window['up_token_id'],
-            'DOWN': window['down_token_id']
-        }
-        
-        # Verify the evidence
-        result = verify_evidence(evidence, window=window, tokens=tokens, at_us=window['window_end_us'])
-        return evidence, result
+        if revision is None:
+            return None, None
+
+    try:
+        sizes = _raw_sizes(revision['raw_sizes_json'])
+        gamma_raw = decode_evidence(
+            revision['gamma_raw_z'], sizes['gamma'], revision['codec_version']).decode('utf-8')
+        envelope = _decode_json_bytes(
+            decode_evidence(observation['raw_resolution_z'],
+                            observation['raw_size_bytes'], observation['codec_version']))
+        rows = [row for row in envelope.get('data', [])
+                if isinstance(row, dict) and row.get('condition_id') == market_row['condition_id']]
+        at_us = observation['learned_server_us']
+        if at_us is None:
+            at_us = observation['learned_wall_us']
+    except (KeyError, ValueError, TypeError):
+        return None, None
+    if not rows or at_us is None:
+        return None, None
+
+    evidence = {
+        'gamma_raw': gamma_raw,
+        'resolution_raw': _encode_json({'data': rows}),
+        'market_id': market_row['market_id'],
+        'condition_id': market_row['condition_id'],
+        'window_start_us': market_row['window_start_us'],
+        'window_end_us': market_row['window_end_us'],
+        'at_us': int(at_us),
+    }
+    window = {
+        'market_id': evidence['market_id'],
+        'condition_id': evidence['condition_id'],
+        'start_us': evidence['window_start_us'],
+        'end_us': evidence['window_end_us'],
+    }
+    tokens = {'UP': market_row['up_token_id'], 'DOWN': market_row['down_token_id']}
+    result = verify_evidence(evidence, window=window, tokens=tokens, at_us=int(at_us))
+    return evidence, result
+
+
+def _raw_sizes(text: str) -> dict:
+    value = json.loads(text)
+    if not isinstance(value, dict):
+        raise ValueError('invalid raw sizes')
+    return value
+
+
+def _decode_json_bytes(raw: bytes) -> dict:
+    value = json.loads(raw.decode('utf-8'))
+    if not isinstance(value, dict):
+        raise ValueError('invalid envelope')
+    return value
+
+
+def _encode_json(value: dict) -> str:
+    return json.dumps(value, sort_keys=True, separators=(',', ':'))
 
 
 def load_replay_recording_from_paper(
@@ -322,36 +445,22 @@ def load_replay_recording_from_paper(
     settlement_result: dict | None = None
 ) -> MarketWindow:
     """Create MarketWindow from paper.py Recording + MarketDescriptor + settlement."""
-    snapshots = _pair_paper_snapshots(paper_recording)
-
-    # Fix market descriptor on each snapshot
-    fixed_snapshots = []
-    for s in snapshots:
-        fixed_snapshots.append(MarketSnapshot(
-            market=market_descriptor,
-            discovery_source=s.discovery_source,
-            up=s.up,
-            down=s.down,
-            collection_started_at=s.collection_started_at,
-            collection_finished_at=s.collection_finished_at,
-            validated_at=s.validated_at,
-            time_round_trip_seconds=s.time_round_trip_seconds,
-            rolled_over=s.rolled_over
-        ))
+    snapshots = _pair_paper_snapshots(paper_recording, market_descriptor)
 
     return MarketWindow(
         market_id=paper_recording.market_id,
         condition_id=paper_recording.condition_id,
         event_id=market_descriptor.event_id,
-        window_start_us=int(market_descriptor.window_start.timestamp() * 1_000_000),
-        window_end_us=int(market_descriptor.window_end.timestamp() * 1_000_000),
+        window_start_us=_epoch_us(market_descriptor.window_start),
+        window_end_us=_epoch_us(market_descriptor.window_end),
         up_token_id=paper_recording.tokens['UP'],
         down_token_id=paper_recording.tokens['DOWN'],
-        snapshots=tuple(fixed_snapshots),
+        snapshots=snapshots,
         excluded=paper_recording.excluded,
         opportunities=paper_recording.opportunities,
         settlement_evidence=settlement_evidence,
         settlement_result=settlement_result,
         horizon_ns=paper_recording.horizon_ns,
-        horizon_us=paper_recording.horizon_us
+        horizon_us=paper_recording.horizon_us,
+        paper_recording=paper_recording
     )

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from decimal import Decimal
 from typing import Any
 
 
@@ -124,15 +123,26 @@ def get_variant(name: str) -> Variant:
 
 
 def evaluate_variants(
-    windows: list,
+    windows,
     variants: list[Variant],
     *,
-    train_only: bool = True
+    train_only: bool = True,
+    split=None,
 ) -> list[dict]:
     """Evaluate strategy variants across windows.
 
-    Safety: defaults to train_only=True to ensure holdout test split is never touched.
+    Safety: defaults to train_only=True, which requires a chronological split
+    and refuses (fails closed) any window that is not inside the train split.
+    Pass train_only=False explicitly for holdout evaluation.
     """
+    if train_only:
+        if split is None:
+            raise ValueError('split is required when train_only=True')
+        train_ids = {w['market_id'] for w in split.train}
+        for w in windows:
+            if w.market_id not in train_ids:
+                raise ValueError(f'window outside train split: {w.market_id}')
+
     results = []
     from .engine import run_replay
 
@@ -146,10 +156,10 @@ def evaluate_variants(
         for w in windows:
             report = run_replay(
                 snapshots=w.snapshots,
+                paper_recording=w.paper_recording,
                 excluded=w.excluded,
                 opportunities=w.opportunities,
                 settlement_evidence=w.settlement_evidence,
-                settlement_result=w.settlement_result,
                 **params
             )
             reports.append(report)

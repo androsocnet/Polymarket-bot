@@ -4,14 +4,15 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Context, Decimal, ROUND_FLOOR, localcontext
-from hashlib import sha256
-from typing import Any
 
+from polymarket_bot.linux_mvp.settlement import verify_evidence
 from polymarket_bot.market_data.models import MarketSnapshot
 from polymarket_bot.paper import (
     ARITHMETIC, ZERO, _fresh, _number, _proof, _require, _text, simulate
 )
 from polymarket_bot.replay.report import BacktestReport, compute_config_hash, compute_source_fingerprint
+
+EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
 class ReplayEngine:
@@ -25,36 +26,38 @@ class ReplayEngine:
 
         Config keys: initial_cash, max_order, max_exposure, fee_bps, threshold,
         lookback, holding_period, delay_us, max_wait_us, max_age_us,
-        max_positions, max_trades_per_window, max_daily_loss, sample_seconds.
+        max_positions, max_trades_per_window, max_daily_loss, max_entry_price,
+        min_remaining_seconds, require_reversal_confirmation, depth_scale.
         """
         self.config = config
 
     def run(
         self,
         snapshots: tuple[MarketSnapshot, ...],
-        excluded: tuple[dict, ...],
-        opportunities: tuple[dict, ...],
-        settlement_evidence: dict | None,
-        settlement_result: dict | None,
+        *,
+        paper_recording,
+        excluded: tuple[dict, ...] | None = None,
+        opportunities: tuple[dict, ...] | None = None,
+        settlement_evidence: dict | None = None,
     ) -> BacktestReport:
         """Run replay and return BacktestReport."""
         return run_replay(
             snapshots=snapshots,
+            paper_recording=paper_recording,
             excluded=excluded,
             opportunities=opportunities,
             settlement_evidence=settlement_evidence,
-            settlement_result=settlement_result,
             **self.config
         )
 
 
 def run_replay(
     snapshots: tuple[MarketSnapshot, ...],
-    excluded: tuple[dict, ...],
-    opportunities: tuple[dict, ...],
-    settlement_evidence: dict | None,
-    settlement_result: dict | None,
     *,
+    paper_recording,
+    excluded: tuple[dict, ...] | None = None,
+    opportunities: tuple[dict, ...] | None = None,
+    settlement_evidence: dict | None = None,
     initial_cash: str = '100',
     max_order: str = '10',
     max_exposure: str = '10',
@@ -68,14 +71,34 @@ def run_replay(
     max_positions: int = 1,
     max_trades_per_window: int = 6,
     max_daily_loss: str = '10',
-    sample_seconds: int = 2,
+    max_entry_price: str | None = None,
+    min_remaining_seconds: int = 0,
+    require_reversal_confirmation: bool = False,
+    depth_scale: str | float = '1.0',
 ) -> BacktestReport:
     """Run full replay and produce BacktestReport.
 
-    Wraps the baseline strategy logic with settlement integration and full metrics.
-    Uses opportunity timing (start_ns, available_ns) for causal chronological replay.
+    Strategy decisions run on the validated paper recording directly, so every
+    real anchor-verified receipt/source clock (and therefore staleness, fills,
+    fees and settlement) inherits the live engine's semantics — nothing is
+    re-derived or fabricated.
     """
-    # Build config for determinism
+    if paper_recording is None:
+        raise ValueError('paper_recording (validated load_strategy_recording result) is required')
+    if not snapshots:
+        raise ValueError('snapshots (MarketSnapshot pairs for fingerprinting) are required')
+    recording = paper_recording
+    if excluded is None:
+        excluded = recording.excluded
+    if opportunities is None:
+        opportunities = recording.opportunities
+
+    scale = _number(str(depth_scale), 'depth_scale')
+    _require(scale > 0, 'invalid depth_scale')
+    if scale != Decimal(1):
+        recording = _scale_books(recording, scale)
+
+    # Build config for determinism (fully hashes every parameter the engine accepts)
     config = {
         'initial_cash': initial_cash,
         'max_order': max_order,
@@ -90,27 +113,29 @@ def run_replay(
         'max_positions': max_positions,
         'max_trades_per_window': max_trades_per_window,
         'max_daily_loss': max_daily_loss,
-        'sample_seconds': sample_seconds,
+        'max_entry_price': max_entry_price,
+        'min_remaining_seconds': min_remaining_seconds,
+        'require_reversal_confirmation': require_reversal_confirmation,
+        'depth_scale': str(depth_scale),
     }
     config_hash = compute_config_hash(config)
     source_fingerprint = compute_source_fingerprint(snapshots, opportunities, excluded)
 
-    # Build paper.Recording from adapter data
-    recording = _build_recording(snapshots, excluded, opportunities)
+    window_end_us = _epoch_us(snapshots[0].market.window_end)
 
     # Run the replay strategy
     with localcontext(ARITHMETIC):
         strategy_result = _run_replay_strategy(
             recording, config, max_positions, lookback, holding_period,
-            delay_us, max_age_us, max_wait_us
+            delay_us, max_age_us, max_wait_us, window_end_us
         )
 
-    # Apply settlement if evidence available
+    # Apply settlement if evidence available; the engine re-verifies evidence
+    # against the replay's own identity before honoring any resolution.
     settlement = None
-    if settlement_evidence is not None and settlement_result is not None:
-        settlement = _apply_settlement(
-            strategy_result, settlement_result, recording, initial_cash, fee_bps
-        )
+    if settlement_evidence is not None:
+        verified = _verify_settlement(recording, settlement_evidence)
+        settlement = _apply_settlement(strategy_result, verified)
 
     # Build BacktestReport
     report = _build_backtest_report(
@@ -119,104 +144,26 @@ def run_replay(
     return report
 
 
-def _build_recording(
-    snapshots: tuple[MarketSnapshot, ...],
-    excluded: tuple[dict, ...],
-    opportunities: tuple[dict, ...],
-) -> Any:
-    """Build paper.Recording from adapter data.
+def _epoch_us(moment: datetime) -> int:
+    delta = moment - EPOCH
+    return (delta.days * 86400 + delta.seconds) * 1_000_000 + delta.microseconds
 
-    Uses opportunities for timing (start_ns, available_ns) and MarketSnapshots for books.
-    """
-    from polymarket_bot.paper import Recording, Snapshot
 
-    if snapshots:
-        up_token = snapshots[0].up.outcome.token_id
-        down_token = snapshots[0].down.outcome.token_id
-        condition_id = snapshots[0].market.condition_id
-        market_id = snapshots[0].market.market_id
-    else:
-        up_token = '0x' + '11' * 32
-        down_token = '0x' + '22' * 32
-        condition_id = '0x' + '00' * 32
-        market_id = '1001'
-
-    tokens = {'UP': up_token, 'DOWN': down_token}
-
-    # Build per-outcome paper Snapshots from opportunities + MarketSnapshot books
-    # MarketSnapshots are ordered by slot; opportunities have per-outcome timing
-    # Match: opportunities with reason=None and valid slot are the "revealed" snapshots
-    
-    # Index MarketSnapshots by slot_index for book lookup
-    ms_by_idx = {i: ms for i, ms in enumerate(snapshots)}
-    
-    # Collect paper snapshots for valid opportunities (reason=None)
-    valid_opps_by_slot = {}  # slot_index -> {outcome: opportunity}
-    for opp in opportunities:
-        if opp.get('reason') is None:
-            slot_index = opp['slot_index']
-            outcome = opp['outcome']
-            valid_opps_by_slot.setdefault(slot_index, {})[outcome] = opp
-    
-    paper_snapshots = []
-    slot_count = 0
-    for slot_index in sorted(valid_opps_by_slot):
-        opps = valid_opps_by_slot[slot_index]
-        if set(opps.keys()) != {'UP', 'DOWN'}:
-            continue
-        
-        ms = ms_by_idx.get(slot_count)
-        slot_count += 1
-        if ms is None:
-            continue
-        
-        for outcome in ('UP', 'DOWN'):
-            opp = opps[outcome]
-            obs = ms.up if outcome == 'UP' else ms.down
-            book = obs.book
-            
-            # source_us from book source timestamp
-            source_us = int(float(book.source_timestamp_raw) * 1_000_000)
-            # receipt_us = source_us + 100_000 (typical response lag in paper tests)
-            receipt_us = source_us + 100_000
-            
-            snap = Snapshot(
-                slot_id=opp['slot_id'],
-                slot_index=opp['slot_index'],
-                outcome=outcome,
-                request_id=opp['slot_id'],
-                start_ns=opp['start_ns'],
-                available_ns=opp['available_ns'],
-                receipt_us=receipt_us,
-                source_us=source_us,
-                uncertainty_us=1_000_000,
-                raw_sha256=sha256(book.source_timestamp_raw.encode()).hexdigest()[:64],
-                book=book,
-                receipt_ns=opp['available_ns']
-            )
-            paper_snapshots.append(snap)
-
-    paper_snapshots = tuple(paper_snapshots)
-    
-    # Horizon = max available_ns
-    horizon_ns = max(s.available_ns for s in paper_snapshots) if paper_snapshots else 0
-    horizon_us = horizon_ns // 1000 if horizon_ns else 0
-    
-    # db_sha256 placeholder (no DB access in replay)
-    db_sha256 = sha256(b'replay').hexdigest()
-
-    return Recording(
-        run_id='replay',
-        market_id=market_id,
-        condition_id=condition_id,
-        tokens=tokens,
-        db_sha256=db_sha256,
-        snapshots=paper_snapshots,
-        excluded=excluded,
-        horizon_ns=horizon_ns,
-        horizon_us=horizon_us,
-        opportunities=opportunities
+def _scale_books(recording, scale: Decimal):
+    """Hypothetical liquidity sensitivity: scale every recorded book level size."""
+    def scale_book(book):
+        if book.bid_size is not None and book.ask_size is not None:
+            bids = tuple(replace(level, size=level.size * scale) for level in book.bids)
+            asks = tuple(replace(level, size=level.size * scale) for level in book.asks)
+            return replace(book, bids=bids, asks=asks,
+                           bid_size=book.bid_size * scale, ask_size=book.ask_size * scale)
+        return book
+    from polymarket_bot.paper import Snapshot
+    scaled = tuple(
+        replace(snapshot, book=scale_book(snapshot.book))
+        for snapshot in recording.snapshots if isinstance(snapshot, Snapshot)
     )
+    return replace(recording, snapshots=scaled)
 
 
 def _run_replay_strategy(
@@ -228,6 +175,7 @@ def _run_replay_strategy(
     delay_us: int,
     max_age_us: int,
     max_wait_us: int,
+    window_end_us: int | None,
 ) -> dict:
     """Run the core replay strategy logic (adapted from strategy._run)."""
     # Convert config values to Decimal for numeric comparisons
@@ -243,6 +191,22 @@ def _run_replay_strategy(
                                  ('delay_us', delay_us, 0), ('max_age_us', max_age_us, 1)]:
         _require(type(value) is int and value >= minimum, 'invalid ' + name)
     _require(type(max_positions) is int and max_positions in (0, 1), 'max_positions must be 0 or 1')
+
+    # Review-remediated risk/variant parameters (all fail closed on bad values)
+    max_entry = config.get('max_entry_price')
+    if max_entry is not None:
+        max_entry = _number(max_entry, 'max_entry_price')
+        _require(Decimal('0') < max_entry <= Decimal('1'), 'invalid max_entry_price')
+    min_remaining = config.get('min_remaining_seconds', 0)
+    _require(type(min_remaining) is int and min_remaining >= 0, 'invalid min_remaining_seconds')
+    if min_remaining > 0 and window_end_us is None:
+        raise ValueError('min_remaining_seconds requires a real window end')
+    confirmation_required = config.get('require_reversal_confirmation', False)
+    _require(isinstance(confirmation_required, bool), 'invalid require_reversal_confirmation')
+    max_trades = config.get('max_trades_per_window', 6)
+    _require(type(max_trades) is int and max_trades >= 0, 'invalid max_trades_per_window')
+    max_daily_loss = _number(config.get('max_daily_loss', '10'), 'max_daily_loss')
+    _require(max_daily_loss >= 0, 'invalid max_daily_loss')
 
     options = dict(
         initial_cash=_text(settings['initial_cash']),
@@ -273,6 +237,8 @@ def _run_replay_strategy(
 
     empty = replace(recording, snapshots=(), opportunities=(), excluded=())
     state = simulate(empty, [], **options)
+
+    confirm_signal, confirm_count = None, 0
 
     for now in times:
         revealed = tuple(s for s in recording.snapshots if s.available_ns <= now)
@@ -335,6 +301,16 @@ def _run_replay_strategy(
                 for s in pair.values()
             )
 
+            # Real epoch decision time from the recorded anchor clocks.
+            decision_us = max(s.receipt_us + (now - s.receipt_ns) // 1000 for s in pair.values())
+
+            executed_buys = sum(
+                1 for t in state['ledger']
+                if t.get('side') == 'BUY' and t.get('status') in ('FILLED', 'PARTIAL')
+                and Decimal(t.get('filled_quantity', '0')) > 0
+            )
+            daily_realized = _day_realized_usd(state['ledger'], decision_us)
+
             if pair['UP'].slot_index <= last_index:
                 d['reason'] = 'OUT_OF_ORDER_PAIR'
             elif not fresh:
@@ -375,7 +351,20 @@ def _run_replay_strategy(
                 if pending is not None:
                     d['reason'] = 'PENDING_EXECUTION'
                 elif owned:
-                    if held_age >= holding_period or d['signal'] not in ('HOLD', owned):
+                    if confirmation_required and held_age < holding_period and d['signal'] not in ('HOLD', owned):
+                        if confirm_signal == d['signal']:
+                            confirm_count += 1
+                        else:
+                            confirm_signal, confirm_count = d['signal'], 1
+                        if confirm_count < 2:
+                            d['reason'] = 'REVERSAL_UNCONFIRMED'
+                        else:
+                            confirm_signal, confirm_count = None, 0
+                            d['action'] = 'SELL'
+                            d['reason'] = 'REVERSAL'
+                            outcome, side, quantity = owned, 'SELL', positions[owned]['quantity']
+                    elif held_age >= holding_period or d['signal'] not in ('HOLD', owned):
+                        confirm_signal, confirm_count = None, 0
                         d['action'] = 'SELL'
                         d['reason'] = 'HOLDING_PERIOD' if held_age >= holding_period else 'REVERSAL'
                         outcome, side, quantity = owned, 'SELL', positions[owned]['quantity']
@@ -387,17 +376,27 @@ def _run_replay_strategy(
                     ).to_integral_value(rounding=ROUND_FLOOR) * Decimal('0.01')
                     reserve = quantity * (Decimal(1) + Decimal(settings['fee_bps']) / Decimal(10000))
 
+                    entry_ask = pair[d['signal']].book.best_ask
+                    remaining_us = None if window_end_us is None else window_end_us - decision_us
                     reason = (
                         'POSITION_LIMIT' if max_positions == 0 else
                         'ZERO_QUANTITY' if quantity <= 0 else
                         'INSUFFICIENT_CASH_RESERVE' if reserve > Decimal(state['cash']) else
-                        'EXPOSURE_LIMIT' if exposure + reserve > settings['max_exposure'] else None
+                        'EXPOSURE_LIMIT' if exposure + reserve > settings['max_exposure'] else
+                        'TRADE_LIMIT' if max_trades is not None and executed_buys >= max_trades else
+                        'DAILY_LOSS_LIMIT' if daily_realized <= -max_daily_loss else
+                        'MIN_REMAINING' if (remaining_us is not None and
+                                            remaining_us < min_remaining * 1_000_000) else
+                        'ENTRY_PRICE_CAP' if max_entry is not None and
+                                               (entry_ask is None or entry_ask > max_entry) else
+                        None
                     )
                     d['reason'] = reason
 
                     if reason is None:
                         outcome, side, quantity = d['signal'], 'BUY', _text(quantity)
                         d['action'] = f'BUY {outcome}'
+                        confirm_signal, confirm_count = None, 0
 
                 if d['action'] != 'HOLD':
                     instruction = dict(
@@ -426,14 +425,60 @@ def _run_replay_strategy(
     )
 
 
+def _day_realized_usd(ledger, decision_us: int) -> Decimal:
+    """Realized P&L accumulated on the decision's UTC day (limit guard input)."""
+    day = datetime.fromtimestamp(decision_us / 1_000_000, tz=timezone.utc).date()
+    total = Decimal('0')
+    for trade in ledger:
+        if trade.get('status') not in ('FILLED', 'PARTIAL'):
+            continue
+        snap = trade.get('snapshot') or {}
+        receipt_us = snap.get('receipt_server_us')
+        if not receipt_us:
+            continue
+        try:
+            trade_day = datetime.fromtimestamp(int(receipt_us) / 1_000_000, tz=timezone.utc).date()
+        except (OSError, OverflowError, ValueError):
+            continue
+        if trade_day == day and trade.get('side') == 'SELL':
+            total += Decimal(trade.get('realized_pnl', '0') or '0')
+    return total
+
+
+def _verify_settlement(recording, evidence: dict) -> dict:
+    """Re-verify resolution evidence against the replay's own persisted identity.
+
+    Never trusts caller-provided resolution results: the replay pays out only
+    what the independent verifier accepts against this exact market.
+    """
+    try:
+        _require(evidence.get('market_id') == recording.market_id and
+                 evidence.get('condition_id') == recording.condition_id,
+                 'replay market identity mismatch')
+        window = {
+            'market_id': recording.market_id,
+            'condition_id': recording.condition_id,
+            'start_us': int(evidence['window_start_us']),
+            'end_us': int(evidence['window_end_us']),
+        }
+        return verify_evidence(evidence, window=window, tokens=recording.tokens,
+                               at_us=int(evidence['at_us']))
+    except (KeyError, TypeError, ValueError) as exc:
+        return dict(status='UNKNOWN_SETTLEMENT', winning_outcome=None, diagnostic=str(exc))
+
+
 def _apply_settlement(
     strategy_result: dict,
     settlement_result: dict,
-    recording,
-    initial_cash: str,
-    fee_bps: str
 ) -> dict:
-    """Apply settlement to the strategy result."""
+    """Apply a verify-accepted settlement to the strategy result.
+
+    Cash accounting: the execution cash already excludes committed cost basis,
+    so settled holders receive their coupon payout on top. Realized P&L folds
+    the execution run's own trade-level realized P&L together with the
+    settlement's payout-minus-cost for remaining holders, so the totals satisfy
+    final_cash + basis == initial_cash + realized_pnl.
+    """
     if settlement_result.get('status') != 'RESOLVED':
         return dict(
             status=settlement_result.get('status', 'UNKNOWN_SETTLEMENT'),
@@ -445,32 +490,35 @@ def _apply_settlement(
 
     winning = settlement_result['winning_outcome']
     execution = strategy_result['execution']
+    exec_realized = Decimal(execution.get('realized_pnl') or '0')
 
-    final_positions = execution.get('positions', {})
-    realized_pnl = Decimal('0')
-
-    for outcome, pos in final_positions.items():
+    settled, realized, cash = {}, exec_realized, Decimal(execution['cash'])
+    final_positions = {}
+    for outcome, pos in execution['positions'].items():
         qty = Decimal(pos.get('quantity', '0'))
+        cost = Decimal(pos.get('cost_basis', '0'))
+        payout = qty if outcome == winning else ZERO
         if qty > 0:
-            cost_basis = Decimal(pos.get('cost_basis', '0'))
-            if outcome == winning:
-                payout = qty * Decimal('1')
-                realized = payout - cost_basis
-            else:
-                realized = -cost_basis
-            realized_pnl += realized
-
-    cash = Decimal(execution.get('cash', initial_cash))
-    fees_paid = Decimal(execution.get('fees_paid', '0'))
-    cash += realized_pnl
+            realized += payout - cost
+            cash += payout
+            settled[outcome] = dict(payout=_text(payout), cost_basis=_text(cost),
+                                    realized_pnl=_text(payout - cost))
+            final_positions[outcome] = dict(pos, quantity='0', cost_basis='0',
+                                            average_cost=None, indicative_bid_mark=None,
+                                            mark_evidence=None, unrealized_pnl=_text(payout - cost))
+        else:
+            settled[outcome] = dict(payout='0', cost_basis=_text(cost), realized_pnl='0')
+            final_positions[outcome] = pos
 
     return dict(
         status='RESOLVED',
         winning_outcome=winning,
         resolved_at=settlement_result['resolved_at'],
         tx_hash=settlement_result['tx_hash'],
-        realized_pnl=_text(realized_pnl),
-        final_cash=_text(cash)
+        settled=settled,
+        realized_pnl=_text(realized),
+        final_cash=_text(cash),
+        positions=final_positions
     )
 
 
@@ -480,10 +528,16 @@ def _build_backtest_report(
     config_hash: str,
     source_fingerprint: str
 ) -> BacktestReport:
-    """Build the complete BacktestReport from strategy result."""
+    """Build the complete BacktestReport from strategy result.
+
+    A RESOLVED settlement is folded into the headline cash/realized/total so the
+    report never contradicts its own settlement section.
+    """
     execution = strategy_result['execution']
     decisions = strategy_result['decisions']
     ledger = execution.get('ledger', [])
+
+    resolved = bool(settlement and settlement.get('status') == 'RESOLVED')
 
     # Exit reason breakdown from SELL trades
     exit_reasons = {}
@@ -492,21 +546,36 @@ def _build_backtest_report(
             reason = trade.get('reason', 'UNKNOWN')
             exit_reasons[reason] = exit_reasons.get(reason, 0) + 1
 
-    # Daily P&L from ledger execution times
+    # Daily P&L from ledger execution times (executed trades only)
     daily_pnl = {}
     for trade in ledger:
         if trade['status'] in ('FILLED', 'PARTIAL'):
-            snap = trade.get('snapshot', {})
+            snap = trade.get('snapshot') or {}
             receipt_us = snap.get('receipt_server_us', 0)
             if receipt_us and int(receipt_us) > 0:
-                day = datetime.fromtimestamp(int(receipt_us) / 1_000_000, tz=timezone.utc).date().isoformat()
+                try:
+                    day = datetime.fromtimestamp(int(receipt_us) / 1_000_000, tz=timezone.utc).date().isoformat()
+                except (OSError, OverflowError, ValueError):
+                    continue
                 pnl = Decimal(trade.get('realized_pnl', '0') or '0')
                 daily_pnl[day] = daily_pnl.get(day, Decimal('0')) + pnl
 
     daily_pnl = {k: str(v) for k, v in sorted(daily_pnl.items())}
 
-    # Max drawdown from equity curve
-    max_drawdown = _compute_max_drawdown(execution)
+    if resolved:
+        cash = settlement['final_cash']
+        positions = settlement['positions']
+        realized_pnl = settlement['realized_pnl']
+        unrealized_pnl = '0'
+        total_pnl = settlement['realized_pnl']
+        max_drawdown = _settlement_drawdown(settlement, execution)
+    else:
+        cash = execution.get('cash', '0')
+        positions = execution.get('positions', {})
+        realized_pnl = execution.get('realized_pnl')
+        unrealized_pnl = execution.get('unrealized_pnl')
+        total_pnl = execution.get('total_pnl')
+        max_drawdown = _compute_max_drawdown(execution)
 
     # Diagnostics
     diagnostics = dict(
@@ -523,18 +592,25 @@ def _build_backtest_report(
         decisions=tuple(decisions),
         ledger=tuple(ledger),
         counts=execution.get('counts', {}),
-        cash=execution.get('cash', '0'),
+        cash=cash,
         fees_paid=execution.get('fees_paid', '0'),
-        positions=execution.get('positions', {}),
-        realized_pnl=execution.get('realized_pnl'),
-        unrealized_pnl=execution.get('unrealized_pnl'),
-        total_pnl=execution.get('total_pnl'),
+        positions=positions,
+        realized_pnl=realized_pnl,
+        unrealized_pnl=unrealized_pnl,
+        total_pnl=total_pnl,
         max_drawdown=max_drawdown,
         daily_pnl=daily_pnl,
         settlement=settlement,
         exit_reason_breakdown=exit_reasons,
         diagnostics=diagnostics
     )
+
+
+def _settlement_drawdown(settlement: dict, execution: dict) -> Decimal:
+    """Post-settlement drawdown: shortfall of final equity against initial cash."""
+    initial = Decimal(execution.get('initial_cash', '100'))
+    equity = Decimal(settlement['final_cash'])
+    return max(Decimal('0'), initial - equity)
 
 
 def _compute_max_drawdown(execution: dict) -> Decimal | None:
@@ -585,8 +661,8 @@ def _execution_delays(ledger: list) -> list[int]:
     delays = []
     for t in ledger:
         if t['status'] in ('FILLED', 'PARTIAL'):
-            snap = t.get('snapshot', {})
-            decision = t.get('decision', {})
+            snap = t.get('snapshot') or {}
+            decision = t.get('decision') or {}
             receipt = snap.get('receipt_server_us', 0)
             decision_us = decision.get('receipt_server_us', 0)
             if receipt and decision_us:

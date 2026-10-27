@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
+from decimal import InvalidOperation
 import json
 from pathlib import Path
 import sqlite3
@@ -35,6 +35,8 @@ def main(argv=None) -> int:
     parser.add_argument('--max-age-us', type=int, default=5_000_000, help='Max book age in microseconds')
     parser.add_argument('--max-wait-us', type=int, default=5_000_000, help='Max wait for fill in microseconds')
     parser.add_argument('--max-positions', type=int, default=1, help='Max simultaneous positions (0 or 1)')
+    parser.add_argument('--max-trades-per-window', type=int, default=6, help='Max executed trades per window')
+    parser.add_argument('--max-daily-loss', default='10', help='Max daily realized loss in USD')
     parser.add_argument('--variant', help='Strategy variant name to evaluate')
 
     args = parser.parse_args(argv)
@@ -59,24 +61,25 @@ def main(argv=None) -> int:
             'max_age_us': args.max_age_us,
             'max_wait_us': args.max_wait_us,
             'max_positions': args.max_positions,
+            'max_trades_per_window': args.max_trades_per_window,
+            'max_daily_loss': args.max_daily_loss,
         }
 
         if args.variant:
             variant = get_variant(args.variant)
             kwargs.update(variant.parameters)
 
-        # Load recording data
-        snapshots, excluded, opportunities, settlement_evidence, settlement_result = load_replay_recording(
-            args.db, args.run_id, args.market_id, max_age_us=args.max_age_us
-        )
+        # Load recording data (real paper recording carries the replay clocks)
+        snapshots, excluded, opportunities, settlement_evidence, settlement_result, paper_recording = (
+            load_replay_recording(args.db, args.run_id, args.market_id, max_age_us=args.max_age_us))
 
         # Run replay
         report = run_replay(
             snapshots=snapshots,
+            paper_recording=paper_recording,
             excluded=excluded,
             opportunities=opportunities,
             settlement_evidence=settlement_evidence,
-            settlement_result=settlement_result,
             **kwargs
         )
 
@@ -99,7 +102,8 @@ def main(argv=None) -> int:
         print(f'PHASE3B_REPLAY_SUCCESS {json.dumps(report.counts, sort_keys=True)}')
         return 0
 
-    except (ValueError, OSError, sqlite3.Error, MarketDataError, KeyError) as exc:
+    except (ValueError, TypeError, KeyError, InvalidOperation, OSError, AttributeError,
+            sqlite3.Error, MarketDataError) as exc:
         if created:
             for name in names:
                 (args.output_dir / name).unlink(missing_ok=True)
