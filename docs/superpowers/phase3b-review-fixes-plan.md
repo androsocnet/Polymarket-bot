@@ -30,7 +30,7 @@ All fixes confined to `src/polymarket_bot/replay/*`, `tests/replay/*`.
 - [x] tests/replay full pass (red→green evidence per fix) — 62 tests OK
 - [x] Full suite; pre-existing 9 failures (infra ×2 / recorder-live-clob ×6 / cp57 ×1) must not grow — confirmed 8 failures + 1 error, exactly the pre-existing set
 - [x] Re-review by same reviewer session with fixes applied — verdict: READY TO MERGE (session ses_e824996a4ffeFqw13U8WbNyvdH). All C1–C3/I1–I6 confirmed FIXED in code; 6 new Minor/cosmetic findings (N1–N6) and 2 carried non-blockers (M4, M8) documented as post-merge follow-ups, none merge-blocking.
-- [ ] Commit + push only after tests + re-review pass; verify SHA match
+- [x] Commit + push only after tests + re-review pass; verify SHA match — commit 07de839 pushed to origin/feat/phase3b-replay, local == remote verified
 
 ## Post-merge follow-ups (reviewer recommendations, non-blocking)
 - Wire `max_wait_us` into the replay loop or drop it from config/hash (carried M8)
