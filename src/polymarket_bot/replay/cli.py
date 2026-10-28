@@ -9,6 +9,7 @@ import sqlite3
 import sys
 
 from polymarket_bot.market_data.models import MarketDataError
+from polymarket_bot.recorder.store import EvidenceError
 from .adapter import load_replay_recording
 from .engine import run_replay
 from .report import BacktestReport
@@ -22,6 +23,8 @@ def main(argv=None) -> int:
     parser.add_argument('--run-id', required=True, help='Recording run ID')
     parser.add_argument('--market-id', required=True, help='Market ID to replay')
     parser.add_argument('--output-dir', type=Path, required=True, help='Output directory (must not exist)')
+    parser.add_argument('--legacy-scope', action='store_true', help='Opt in to recorded automatic-discovery scope for legacy market 5483041 only')
+    parser.add_argument('--expected-sha256', help='Exact source file SHA256 (required with --legacy-scope)')
 
     # Strategy configuration
     parser.add_argument('--initial-cash', default='100', help='Initial cash in USD')
@@ -69,9 +72,19 @@ def main(argv=None) -> int:
             variant = get_variant(args.variant)
             kwargs.update(variant.parameters)
 
-        # Load recording data (real paper recording carries the replay clocks)
-        snapshots, excluded, opportunities, settlement_evidence, settlement_result, paper_recording = (
-            load_replay_recording(args.db, args.run_id, args.market_id, max_age_us=args.max_age_us))
+        # Normal loader remains strict; compatibility requires both explicit options.
+        scope = None
+        if args.legacy_scope:
+            if not args.expected_sha256:
+                raise ValueError('--legacy-scope requires --expected-sha256')
+            from .legacy import load_legacy_replay_recording
+            loaded, scope = load_legacy_replay_recording(
+                args.db, args.run_id, args.market_id, expected_sha256=args.expected_sha256)
+        else:
+            if args.expected_sha256 is not None:
+                raise ValueError('--expected-sha256 requires --legacy-scope')
+            loaded = load_replay_recording(args.db, args.run_id, args.market_id, max_age_us=args.max_age_us)
+        snapshots, excluded, opportunities, settlement_evidence, settlement_result, paper_recording = loaded
 
         # Run replay
         report = run_replay(
@@ -82,6 +95,10 @@ def main(argv=None) -> int:
             settlement_evidence=settlement_evidence,
             **kwargs
         )
+
+        if scope is not None:
+            from dataclasses import replace
+            report = replace(report, diagnostics={**report.diagnostics, 'legacy_scope': scope})
 
         # Create output directory and write files
         args.output_dir.mkdir(parents=True)
@@ -103,7 +120,7 @@ def main(argv=None) -> int:
         return 0
 
     except (ValueError, TypeError, KeyError, InvalidOperation, OSError, AttributeError,
-            sqlite3.Error, MarketDataError) as exc:
+            sqlite3.Error, MarketDataError, EvidenceError) as exc:
         if created:
             for name in names:
                 (args.output_dir / name).unlink(missing_ok=True)
