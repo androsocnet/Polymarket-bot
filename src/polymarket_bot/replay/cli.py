@@ -25,6 +25,8 @@ def main(argv=None) -> int:
     parser.add_argument('--output-dir', type=Path, required=True, help='Output directory (must not exist)')
     parser.add_argument('--legacy-scope', action='store_true', help='Opt in to recorded automatic-discovery scope for legacy market 5483041 only')
     parser.add_argument('--expected-sha256', help='Exact source file SHA256 (required with --legacy-scope)')
+    parser.add_argument('--settlement-file', type=Path, help='Opt-in later settlement provenance bundle (legacy scope only)')
+    parser.add_argument('--settlement-sha256', help='Exact external settlement bundle SHA256')
 
     # Strategy configuration
     parser.add_argument('--initial-cash', default='100', help='Initial cash in USD')
@@ -74,12 +76,15 @@ def main(argv=None) -> int:
 
         # Normal loader remains strict; compatibility requires both explicit options.
         scope = None
+        if (args.settlement_file is not None or args.settlement_sha256 is not None) and not args.legacy_scope:
+            raise ValueError('--settlement-file and --settlement-sha256 require --legacy-scope')
         if args.legacy_scope:
             if not args.expected_sha256:
                 raise ValueError('--legacy-scope requires --expected-sha256')
             from .legacy import load_legacy_replay_recording
             loaded, scope = load_legacy_replay_recording(
-                args.db, args.run_id, args.market_id, expected_sha256=args.expected_sha256)
+                args.db, args.run_id, args.market_id, expected_sha256=args.expected_sha256,
+                settlement_file=args.settlement_file, settlement_sha256=args.settlement_sha256)
         else:
             if args.expected_sha256 is not None:
                 raise ValueError('--expected-sha256 requires --legacy-scope')

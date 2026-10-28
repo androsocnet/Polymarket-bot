@@ -5,6 +5,7 @@ and strict parity tests. Runtime loaders and persisted selection intent stay int
 """
 from collections import Counter
 from contextlib import closing
+from datetime import datetime, timezone
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -150,9 +151,65 @@ def _settlement(conn, market, revision_ids):
     return evidence, verify_evidence(evidence, window=window, tokens=tokens, at_us=at_us)
 
 
-def load_legacy_replay_recording(db, run_id, market_id, *, expected_sha256):
+def _external_settlement(path, expected_sha256, market, source_sha256, recorded, recorded_sha256):
+    """Later knowledge only. Pins attest file identity, not independent on-chain finality."""
+    raw = Path(path).read_bytes()
+    _require(sha256(raw).hexdigest() == expected_sha256, 'settlement bundle SHA256 mismatch')
+    try:
+        def unique(pairs):
+            result = {}
+            for key, value in pairs:
+                _require(key not in result, 'duplicate settlement bundle key')
+                result[key] = value
+            return result
+
+        bundle = json.loads(raw, object_pairs_hook=unique)
+        _require(isinstance(bundle, dict) and bundle['schema'] == 'phase3b-external-settlement-v1',
+                 'settlement bundle schema mismatch')
+        for key, expected in dict(market_id=MARKET_ID, run_id=RUN_ID,
+                                  condition_id=market['condition_id'], source_sha256=source_sha256,
+                                  window_start_us=market['window_start_us'],
+                                  window_end_us=market['window_end_us']).items():
+            _require(bundle[key] == expected, 'settlement bundle identity mismatch: ' + key)
+        sources = bundle['sources']
+        at_us = market['window_end_us']
+        now_us = _timestamp_us(datetime.now(timezone.utc).isoformat())
+        for name, url in (
+                ('gamma', 'https://gamma-api.polymarket.com' + '/markets/' + MARKET_ID),
+                ('data_api', 'https://data-api.polymarket.com' + '/v2/resolutions?condition=' + market['condition_id'])):
+            source = sources[name]
+            _require(source['method'] == 'GET' and source['url'] == source['final_url'] == url and
+                     source['http_status'] == 200, 'settlement source provenance mismatch')
+            body = source['raw'].encode('utf-8')
+            _require(len(body) == source['size_bytes'] and sha256(body).hexdigest() == source['sha256'],
+                     'settlement source raw hash/size mismatch')
+            start, end = _timestamp_us(source['started_utc']), _timestamp_us(source['retrieved_utc'])
+            _require(market['window_end_us'] <= start <= end <= now_us, 'settlement retrieval time mismatch')
+            at_us = max(at_us, end)
+        # Existing loader already proves recorded request/run/raw coupling. Do not replace that gate.
+        _require(recorded is not None and sources['data_api']['sha256'] == recorded_sha256,
+                 'settlement differs from recorded resolution')
+        evidence = dict(recorded, gamma_raw=sources['gamma']['raw'],
+                        resolution_raw=sources['data_api']['raw'], at_us=at_us)
+        window = dict(market_id=MARKET_ID, condition_id=market['condition_id'],
+                      start_us=market['window_start_us'], end_us=market['window_end_us'])
+        tokens = {'UP': market['up_token_id'], 'DOWN': market['down_token_id']}
+        result = verify_evidence(evidence, window=window, tokens=tokens, at_us=at_us)
+        _require(result['status'] == 'RESOLVED', 'external settlement rejected: ' + str(result.get('diagnostic')))
+        return evidence, result, dict(bundle_sha256=expected_sha256, at_us=at_us,
+                                      availability='LATER_SETTLEMENT_ONLY',
+                                      sources={name: {k: sources[name][k] for k in ('url', 'retrieved_utc', 'sha256')}
+                                               for name in ('gamma', 'data_api')})
+    except (KeyError, TypeError, AttributeError, UnicodeError, RecursionError) as exc:
+        raise ValueError('malformed settlement bundle') from exc
+
+
+def load_legacy_replay_recording(db, run_id, market_id, *, expected_sha256,
+                                 settlement_file=None, settlement_sha256=None):
     """Return (adapter six-tuple, scope diagnostics); never rewrite run selection."""
     _require((run_id, market_id) == (RUN_ID, MARKET_ID), 'unsupported legacy scope')
+    _require((settlement_file is None) == (settlement_sha256 is None),
+             'settlement file and SHA256 required together')
     db = Path(db).resolve(strict=True)
     _require(db.is_file(), 'database must be file')
     _require(not any(Path(str(db) + s).exists() for s in ('-wal', '-shm', '-journal')), 'SQLite sidecar not supported')
@@ -290,6 +347,13 @@ def load_legacy_replay_recording(db, run_id, market_id, *, expected_sha256):
                               tuple(dict(o, available_ns=ends[o['slot_id']]) for o in sorted(opportunities, key=lambda o: (-1 if o['start_ns'] is None else o['start_ns'], o['slot_id'], o['outcome']))))
         pairs = _pair_paper_snapshots(recording, _market_descriptor(recording, market))
         evidence, settlement = _settlement(conn, market, revision_ids)
+        external = None
+        if settlement_file is not None:
+            observation = conn.execute("SELECT response_hash FROM resolution_observations WHERE market_id=? AND classification='RESOLVED_DIRECTIONAL' ORDER BY learned_wall_us DESC,resolution_id DESC LIMIT 1",
+                                       (MARKET_ID,)).fetchone()
+            evidence, settlement, external = _external_settlement(
+                settlement_file, settlement_sha256, market, digest, evidence,
+                observation['response_hash'] if observation is not None else None)
         scope = dict(identity_proof='DISCOVERY_ENVELOPE_VERIFIED', run_id=run_id, market_id=market_id,
                      event_id=market['event_id'], source_sha256=digest,
                      original_config_json=run['config_json'], discovery_request_ids=discovery_ids,
@@ -300,6 +364,8 @@ def load_legacy_replay_recording(db, run_id, market_id, *, expected_sha256):
                      paired_captures=len(pairs), valid_books=len(snapshots), excluded_records=len(excluded),
                      one_sided_books=sum(not s.book.bids or not s.book.asks for s in snapshots),
                      two_sided_pairs=sum(bool(p.up.book.bids and p.up.book.asks and p.down.book.bids and p.down.book.asks) for p in pairs))
+        if external is not None:
+            scope['external_settlement'] = external
     _require(sha256(db.read_bytes()).hexdigest() == digest, 'source database changed during read')
     _require(not any(Path(str(db) + s).exists() for s in ('-wal', '-shm', '-journal')), 'SQLite sidecar appeared during read')
     return (pairs, recording.excluded, recording.opportunities, evidence, settlement, recording), scope
