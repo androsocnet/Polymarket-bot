@@ -145,6 +145,14 @@ class NativeEvidenceRegressions(unittest.TestCase):
                 self.assertTrue(all(c.args[:2] == ('systemctl', 'show') for c in call.call_args_list))
             self.assertEqual(sorted(p.name for p in Path(directory).iterdir()), ['approval.json'])
 
+    def test_pilot_requires_exact_1800_second_approval_before_effects(self):
+        from unittest.mock import patch
+        approval_path = Path('/approved-pilot.json')
+        with patch.object(self.native, 'check_approval', side_effect=ValueError('approval rejected')) as check:
+            with self.assertRaisesRegex(ValueError, 'approval rejected'):
+                self.native.launch('pilot', approval_path)
+        check.assert_called_once_with(approval_path, 'pilot', 1800)
+
     def test_garbage_collected_transient_unit_is_already_clean(self):
         from unittest.mock import patch
         state = dict(LoadState='not-found', ActiveState='inactive', SubState='dead', MainPID='0', ControlPID='0', ControlGroup='')
@@ -192,14 +200,20 @@ class NativeEvidenceRegressions(unittest.TestCase):
                 return ''
             def props(unit):
                 return dict(state, ActiveState='active') if unit.endswith('.timer') else state
-            with patch.object(self.native, 'secure_bytes', return_value=b''), patch.object(self.native, 'STATE', state_dir), patch.object(self.native, 'EVIDENCE', evidence_dir), patch.object(self.native, 'check_approval', return_value=('hash', {'git_sha': 'a' * 40})), patch.object(self.native, 'environment', return_value={'MVP_STATE_DIR': str(state_dir)}), patch.object(self.native, 'properties', side_effect=props), patch.object(self.native, 'runtime_bound', return_value=1340000000), patch.object(self.native, 'require_service_policy'), patch.object(self.native, 'command', side_effect=run):
+            with patch.object(self.native, 'secure_bytes', return_value=b''), patch.object(self.native, 'STATE', state_dir), patch.object(self.native, 'EVIDENCE', evidence_dir), patch.object(self.native, 'check_approval', return_value=('hash', {'git_sha': 'a' * 40})), patch.object(self.native, 'environment', return_value={'MVP_STATE_DIR': str(state_dir)}), patch.object(self.native, 'properties', side_effect=props), patch.object(self.native, 'runtime_bound', return_value=2040000000), patch.object(self.native, 'require_service_policy'), patch.object(self.native, 'command', side_effect=run):
                 self.assertEqual(self.native.launch('pilot', approval_path), 0)
             data = json.loads((next(evidence_dir.iterdir()) / 'launch.json').read_text())
             self.assertEqual([c[1] for c in commands], ['--unit=' + data['units'][4][:-6], '--unit=' + data['units'][3][:-8], '--unit=' + data['units'][0], '--unit=' + data['units'][1]])
             for call in commands:
                 self.assertIn('--property=RemainAfterExit=no', call)
                 self.assertNotIn('--remain-after-exit=no', call)
-            self.assertTrue(any('--on-active=1280s' in c for c in commands))
+            self.assertEqual(data['seconds'], 1800)
+            self.assertEqual(data['deadline_after_seconds'], 1980)
+            self.assertEqual(data['audit_after_seconds'], 2400)
+            self.assertTrue(any('--on-active=1980s' in c for c in commands))
+            self.assertTrue(any('--on-active=2400s' in c for c in commands))
+            for call in commands[2:]:
+                self.assertIn('--property=RuntimeMaxSec=2040', call)
 
     def test_launch_failure_disarms_timers_after_verified_cleanup(self):
         from unittest.mock import patch
@@ -212,7 +226,7 @@ class NativeEvidenceRegressions(unittest.TestCase):
             def stop(units):
                 stopped.extend(units)
                 return [], []
-            with patch.object(self.native, 'secure_bytes', return_value=b''), patch.object(self.native, 'STATE', state_dir), patch.object(self.native, 'EVIDENCE', state_dir / 'evidence'), patch.object(self.native, 'check_approval', return_value=('hash', {'git_sha': 'a' * 40})), patch.object(self.native, 'environment', return_value={'MVP_STATE_DIR': str(state_dir)}), patch.object(self.native, 'properties', return_value=state), patch.object(self.native, 'runtime_bound', return_value=1340000000), patch.object(self.native, 'require_service_policy'), patch.object(self.native, 'command', side_effect=RuntimeError('submission failed')), patch.object(self.native, 'stop_units', side_effect=stop):
+            with patch.object(self.native, 'secure_bytes', return_value=b''), patch.object(self.native, 'STATE', state_dir), patch.object(self.native, 'EVIDENCE', state_dir / 'evidence'), patch.object(self.native, 'check_approval', return_value=('hash', {'git_sha': 'a' * 40})), patch.object(self.native, 'environment', return_value={'MVP_STATE_DIR': str(state_dir)}), patch.object(self.native, 'properties', return_value=state), patch.object(self.native, 'runtime_bound', return_value=2040000000), patch.object(self.native, 'require_service_policy'), patch.object(self.native, 'command', side_effect=RuntimeError('submission failed')), patch.object(self.native, 'stop_units', side_effect=stop):
                 with self.assertRaisesRegex(RuntimeError, 'submission failed'):
                     self.native.launch('pilot', approval_path)
             self.assertTrue(any(u.endswith('-deadline.timer') for u in stopped))
@@ -258,9 +272,9 @@ class NativeEvidenceRegressions(unittest.TestCase):
             folder.mkdir()
             import hashlib
             values = {
-                'launch.json': {'trial_id': folder.name, 'phase': 'pilot', 'seconds': 1100, 'units': self.native.owned(folder.name)},
+                'launch.json': {'trial_id': folder.name, 'phase': 'pilot', 'seconds': 1800, 'units': self.native.owned(folder.name)},
                 'approval.json': {},
-                'result.json': {'trial_id': folder.name, 'continuous': True, 'errors': [], 'window_seconds': 1100, 'elapsed_seconds': 1100, 'run_id': 'fresh', 'samples': 110, 'ingestion': {'count': 1}},
+                'result.json': {'trial_id': folder.name, 'continuous': True, 'errors': [], 'window_seconds': 1800, 'elapsed_seconds': 1800, 'run_id': 'fresh', 'samples': 180, 'ingestion': {'count': 1}},
                 'restart-verification.json': {'errors': [], 'continuous_run_id': 'fresh', 'first_run_id': 'restart'},
             }
             for name in ('cleanup.json', 'post-audit.json', 'deadline.json', 'deadline-stop.json'):
@@ -271,13 +285,32 @@ class NativeEvidenceRegressions(unittest.TestCase):
             sample = dict(session='s', boot='b', sequence=1, wall=100, mono=50, boottime=60, interrupted=0)
             values['host.json'] = sample
             (folder / 'host.json.jsonl').write_text(json.dumps(sample) + '\n')
-            (folder / 'samples.jsonl').write_text((json.dumps({'run_id': 'fresh'}) + '\n') * 110)
+            (folder / 'samples.jsonl').write_text((json.dumps({'run_id': 'fresh'}) + '\n') * 180)
             (folder / 'journal.log').write_text('synthetic journal\n')
             for name, value in values.items():
                 (folder / name).write_text(json.dumps(value))
             files = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in folder.iterdir()}
             approval = {'pilot_trial_id': folder.name, 'pilot_evidence_sha256': hashlib.sha256(json.dumps(files, sort_keys=True, separators=(',', ':')).encode()).hexdigest()}
             self.native.verify_pilot(approval, root)
+            for old_seconds in (180, 1100):
+                with self.subTest(old_seconds=old_seconds):
+                    values['launch.json']['seconds'] = old_seconds
+                    (folder / 'launch.json').write_text(json.dumps(values['launch.json']))
+                    files['launch.json'] = hashlib.sha256((folder / 'launch.json').read_bytes()).hexdigest()
+                    approval['pilot_evidence_sha256'] = hashlib.sha256(json.dumps(files, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+                    with self.assertRaisesRegex(ValueError, 'pilot trial/run metadata mismatch'):
+                        self.native.verify_pilot(approval, root)
+            values['launch.json']['seconds'] = 1800
+            (folder / 'launch.json').write_text(json.dumps(values['launch.json']))
+            files['launch.json'] = hashlib.sha256((folder / 'launch.json').read_bytes()).hexdigest()
+            (folder / 'samples.jsonl').write_text((json.dumps({'run_id': 'fresh'}) + '\n') * 179)
+            files['samples.jsonl'] = hashlib.sha256((folder / 'samples.jsonl').read_bytes()).hexdigest()
+            values['result.json']['samples'] = 179
+            (folder / 'result.json').write_text(json.dumps(values['result.json']))
+            files['result.json'] = hashlib.sha256((folder / 'result.json').read_bytes()).hexdigest()
+            approval['pilot_evidence_sha256'] = hashlib.sha256(json.dumps(files, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+            with self.assertRaisesRegex(ValueError, 'pilot samples incomplete'):
+                self.native.verify_pilot(approval, root)
             (folder / 'cleanup.json').write_text('{"errors":["stop failed"]}')
             with self.assertRaisesRegex(ValueError, 'pilot'):
                 self.native.verify_pilot(approval, root)
@@ -500,13 +533,18 @@ class NativeEvidenceRegressions(unittest.TestCase):
                          {'utc': '2026-10-26T17:59:59Z', 'wib': '2026-10-27T00:59:59+07:00'})
 
     def test_approval_mismatch_rejected_without_mutation(self):
-        approval = dict(scope='INFRASTRUCTURE_ONLY', phase='pilot', seconds=1100,
+        approval = dict(scope='INFRASTRUCTURE_ONLY', phase='pilot', seconds=1800,
                         fingerprint='wrong', authorized=True, approved_by='owner',
                         approved_at_utc='2026-10-27T00:00:00Z', git_sha='a' * 40)
         with self.assertRaisesRegex(ValueError, 'fingerprint'):
-            self.native.validate_approval(approval, 'right', 'pilot', 1100, 'a' * 40)
+            self.native.validate_approval(approval, 'right', 'pilot', 1800, 'a' * 40)
         approval['fingerprint'] = 'right'
-        self.native.validate_approval(approval, 'right', 'pilot', 1100, 'a' * 40)
+        self.native.validate_approval(approval, 'right', 'pilot', 1800, 'a' * 40)
+        for old_seconds in (180, 1100):
+            with self.subTest(old_seconds=old_seconds):
+                approval['seconds'] = old_seconds
+                with self.assertRaisesRegex(ValueError, 'explicit phase/code approval required'):
+                    self.native.validate_approval(approval, 'right', 'pilot', 1800, 'a' * 40)
         approval.update(phase='soak', seconds=86400)
         with self.assertRaisesRegex(ValueError, 'pilot'):
             self.native.validate_approval(approval, 'right', 'soak', 86400, 'a' * 40)

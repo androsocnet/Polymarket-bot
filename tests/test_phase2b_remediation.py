@@ -5,11 +5,23 @@ import tempfile
 from unittest.mock import patch, MagicMock, call
 import json
 import importlib.util
+import itertools
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('native_trial', ROOT / 'deploy/infrastructure-trial.py')
 native = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(native)
+
+
+def _raise_after(n):
+    """Side effect that no-ops for the first n calls then raises 'trial ingestion stale'."""
+    counter = {'i': 0}
+
+    def f(*args, **kwargs):
+        counter['i'] += 1
+        if counter['i'] > n:
+            raise ValueError('trial ingestion stale')
+    return f
 
 
 class TestObserverShutdownDefect(unittest.TestCase):
@@ -245,6 +257,262 @@ class TestPostExitAuditContract(unittest.TestCase):
                 self.assertEqual(result['errors'], [])
                 # inspect_cleanup prints, doesn't write post-audit.json
                 self.assertFalse((folder / 'post-audit.json').exists())
+
+
+class TestStaleDiagnosticsTimestampSafety(unittest.TestCase):
+    """I-1: stale_ingestion_diagnostics must never crash when last_received_us is None.
+
+    Genuine failures stay FAIL; diagnostics record computed_age_seconds=None when
+    no valid last-received timestamp exists and preserve the exact failed branch.
+    """
+
+    def _observe_with_stale(self, counts, check_wall=200.0):
+        data = {'trial_id': 'soak-20261027T000000Z', 'phase': 'soak', 'seconds': 86400,
+                'launch_at': {'utc': '2026-10-27T00:00:00Z'}}
+        folder = None
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            source = folder / 'db.sqlite'
+            source.touch()
+            (folder / 'host.json.jsonl').write_text('{}\n')
+            group = folder / 'cgroup'
+            group.mkdir()
+            (group / 'memory.events').write_text('oom 0\noom_kill 0\nmax 0\n')
+            state = dict(ActiveState='active', MainPID='3', InvocationID='second-inv',
+                         NRestarts='0', ControlGroup=str(group))
+            states = [dict(state, ActiveState='inactive', MainPID='0', InvocationID=''),
+                      dict(state, MainPID='2', InvocationID='first-inv')] + [dict(state)] * 40
+            snapshot_data = {'trading': {}, 'observations': 0, 'run_ids': []}
+
+            class DB:
+                def execute(self, *args):
+                    return self
+                def fetchone(self):
+                    return ('continuous', int(__import__('time').time() * 1e6), 'RUNNING')
+                def fetchall(self):
+                    return [('ok',)]
+                def close(self):
+                    pass
+
+            def lockstep_monotonic():
+                """Yield each value twice so |mono-previous_mono| <= 2 passes the clock-gap
+                guard while monotonic still ramps past the 30s stale threshold (observe()
+                calls time.monotonic twice per loop iteration: line 652 + line 689 sleep)."""
+                v = 0
+                while True:
+                    yield v
+                    yield v
+                    v += 1
+
+            check_pending = False
+            def clock():
+                nonlocal check_pending
+                if check_pending:
+                    check_pending = False
+                    return check_wall
+                return 200.0
+
+            def read_ingestion(*args):
+                nonlocal check_pending
+                check_pending = True
+                return counts
+
+            with patch.object(native, 'trial_metadata', return_value=data), \
+                 patch.object(native, 'check_approval'), \
+                 patch.object(native, 'require_service_policy'), \
+                 patch.object(native, 'environment', return_value={'MVP_DB_PATH': str(source), 'MVP_BOT_ID': 'bot', 'MVP_STATE_DIR': str(folder)}), \
+                 patch.object(native, 'snapshot', return_value=snapshot_data), \
+                 patch.object(native, 'properties', side_effect=states), \
+                 patch.object(native, 'wait_run', side_effect=['first', 'continuous']), \
+                 patch.object(native, 'stop_units', return_value=([], [])), \
+                 patch.object(native, 'command', return_value=''), \
+                 patch.object(native, 'connect', return_value=DB()), \
+                 patch.object(native, 'fresh_run', return_value=True), \
+                 patch.object(native, 'read_host', return_value={}), \
+                 patch.object(native, 'memory_events', return_value={'oom': '0', 'oom_kill': '0', 'max': '0'}), \
+                 patch.object(native, 'hash_due', return_value=False), \
+                 patch.object(native, 'ingestion', side_effect=read_ingestion), \
+                 patch.object(native.time, 'monotonic', side_effect=lockstep_monotonic()), \
+                 patch.object(native.time, 'time', side_effect=clock), \
+                 patch.object(native.time, 'sleep', return_value=None):
+                code = native.observe(folder, reset_stop=True)
+                result = json.loads((folder / 'result.json').read_text())
+                return code, result
+
+    def test_stale_with_none_timestamp_records_null_age_and_never_crashes(self):
+        """Stale failure with last_received_us=None must stay FAIL without TypeError."""
+        code, result = self._observe_with_stale({'count': 5, 'last_received_us': None})
+        self.assertEqual(code, 1)
+        diagnostics = result['stale_ingestion_diagnostics']
+        self.assertEqual(diagnostics['count'], 5)
+        self.assertIsNone(diagnostics['last_received_us'])
+        self.assertIsNotNone(diagnostics['wall_time'])
+        self.assertIsNone(diagnostics['computed_age_seconds'],
+                          'computed_age_seconds must be null when no valid last-received timestamp exists')
+        self.assertEqual(diagnostics['failed_branch'], 'missing_timestamp')
+        self.assertEqual(diagnostics['run_id'], 'continuous')
+        # Genuine failure must remain FAIL — strict thresholds preserved.
+        self.assertTrue(any('trial ingestion stale' in e for e in result['errors']))
+
+    def test_diagnostics_use_exact_stale_check_wall_at_threshold(self):
+        code, result = self._observe_with_stale(
+            {'count': 5, 'last_received_us': 170_000_000}, check_wall=200.1)
+        self.assertEqual(code, 1)
+        diagnostics = result['stale_ingestion_diagnostics']
+        self.assertEqual(diagnostics['wall_time'], 200.1)
+        self.assertAlmostEqual(diagnostics['computed_age_seconds'], 30.1)
+        self.assertEqual(diagnostics['failed_branch'], 'age_exceeds_30')
+
+    def test_stale_diagnostic_helper_preserves_exact_branch(self):
+        """Exact branch for every stale failure mode, never crashing on None."""
+        diagnostics = getattr(native, 'stale_diagnostics')
+        self.assertEqual(diagnostics({'count': 0, 'last_received_us': 1000}, 100.0, 'r', 40.0)['failed_branch'],
+                         'zero_count')
+        self.assertEqual(diagnostics({'count': 5, 'last_received_us': None}, 100.0, 'r', 40.0)['failed_branch'],
+                         'missing_timestamp')
+        self.assertEqual(diagnostics({'count': 5, 'last_received_us': 200_000_000}, 100.0, 'r', 40.0)['failed_branch'],
+                         'future_timestamp')
+        self.assertEqual(diagnostics({'count': 5, 'last_received_us': 1000}, 100.0, 'r', 40.0)['failed_branch'],
+                         'age_exceeds_30')
+        self.assertEqual(diagnostics({'count': 0, 'last_received_us': None}, 100.0, 'r', 10.0)['failed_branch'],
+                         'not_checked')
+        self.assertIsNone(diagnostics({'count': 5, 'last_received_us': None}, 100.0, 'r', 40.0)['computed_age_seconds'])
+        self.assertAlmostEqual(diagnostics({'count': 5, 'last_received_us': 200_000_000}, 100.0, 'r', 40.0)['computed_age_seconds'],
+                               -100.0)
+
+
+class TestStartupEarlyCleanup(unittest.TestCase):
+    """I-2: every successfully started trial-owned service must be stopped in finally,
+    even when failure happens between systemctl start and the old started=True point."""
+
+    def _observe_with_second_start_failure(self):
+        data = {'trial_id': 'soak-20261027T000000Z', 'phase': 'soak', 'seconds': 86400,
+                'launch_at': {'utc': '2026-10-27T00:00:00Z'}}
+        stop_calls = []
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            source = folder / 'db.sqlite'
+            source.touch()
+            (folder / 'host.json.jsonl').write_text('{}\n')
+            group = folder / 'cgroup'
+            group.mkdir()
+            (group / 'memory.events').write_text('oom 0\noom_kill 0\nmax 0\n')
+            state = dict(ActiveState='active', MainPID='3', InvocationID='second-inv',
+                         NRestarts='0', ControlGroup=str(group))
+            states = [dict(state, ActiveState='inactive', MainPID='0', InvocationID=''),
+                      dict(state, MainPID='2', InvocationID='first-inv'),
+                      dict(state, MainPID='3', InvocationID='second-inv')]
+            snapshot_data = {'trading': {}, 'observations': 0, 'run_ids': []}
+
+            def stop_units_mock(units):
+                stop_calls.append(list(units))
+                return [], [{'unit': u} for u in units]
+
+            monotonic_values = [0]
+            for _ in range(5):
+                monotonic_values.append(1.0)
+            time_mock = MagicMock(side_effect=monotonic_values)
+            with patch.object(native, 'trial_metadata', return_value=data), \
+                 patch.object(native, 'check_approval'), \
+                 patch.object(native, 'require_service_policy'), \
+                 patch.object(native, 'environment', return_value={'MVP_DB_PATH': str(source), 'MVP_BOT_ID': 'bot', 'MVP_STATE_DIR': str(folder)}), \
+                 patch.object(native, 'snapshot', return_value=snapshot_data), \
+                 patch.object(native, 'properties', side_effect=states), \
+                 patch.object(native, 'wait_run', side_effect=['first', 'first']), \
+                 patch.object(native, 'stop_units', side_effect=stop_units_mock), \
+                 patch.object(native, 'command', return_value=''), \
+                 patch.object(native.time, 'monotonic', side_effect=time_mock), \
+                 patch.object(native.time, 'time', return_value=200.0):
+                outcome = native.observe(folder, reset_stop=True)
+                result = json.loads((folder / 'result.json').read_text())
+                return outcome, stop_calls, result
+
+    def test_cleanup_on_second_start_verification_failure(self):
+        """Failure right after the continuous start must stop the started service."""
+        main_unit = 'polymarket-btc-infrastructure.service'
+        code, stop_calls, result = self._observe_with_second_start_failure()
+        self.assertEqual(code, 1)
+        self.assertTrue(any('restart did not create fresh database run' in e for e in result['errors']))
+        main_unit_stops = [c for c in stop_calls if c == [main_unit]]
+        self.assertGreaterEqual(len(main_unit_stops), 2,
+            f"final cleanup stop must follow restart-verification stop. All stop_calls: {stop_calls}")
+
+    def _observe_with_first_start_failure(self):
+        data = {'trial_id': 'soak-20261027T000000Z', 'phase': 'soak', 'seconds': 86400,
+                'launch_at': {'utc': '2026-10-27T00:00:00Z'}}
+        stop_calls = []
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            source = folder / 'db.sqlite'
+            source.touch()
+            state_inactive = dict(ActiveState='inactive', MainPID='0', InvocationID='', ControlGroup='x')
+            states = [state_inactive, dict(state_inactive, ActiveState='starting', MainPID='0')]
+            snapshot_data = {'trading': {}, 'observations': 0, 'run_ids': []}
+
+            def stop_units_mock(units):
+                stop_calls.append(list(units))
+                return [], [{'unit': u} for u in units]
+
+            with patch.object(native, 'trial_metadata', return_value=data), \
+                 patch.object(native, 'check_approval'), \
+                 patch.object(native, 'require_service_policy'), \
+                 patch.object(native, 'environment', return_value={'MVP_DB_PATH': str(source), 'MVP_BOT_ID': 'bot', 'MVP_STATE_DIR': str(folder)}), \
+                 patch.object(native, 'snapshot', return_value=snapshot_data), \
+                 patch.object(native, 'properties', side_effect=states), \
+                 patch.object(native, 'wait_run', return_value='first_run'), \
+                 patch.object(native, 'stop_units', side_effect=stop_units_mock), \
+                 patch.object(native, 'command', return_value=''), \
+                 patch.object(native.time, 'monotonic', return_value=1.0), \
+                 patch.object(native.time, 'time', return_value=200.0):
+                outcome = native.observe(folder, reset_stop=True)
+                return outcome, stop_calls, json.loads((folder / 'result.json').read_text())
+
+    def test_cleanup_on_first_start_verification_failure(self):
+        """Failure right after the initial start must stop the started service.
+
+        'service failed startup' is raised between systemctl start and any stop,
+        so finally must still stop the trial-owned unit.
+        """
+        code, stop_calls, result = self._observe_with_first_start_failure()
+        self.assertEqual(code, 1)
+        self.assertTrue(any('service failed startup' in e for e in result['errors']))
+        main_unit = 'polymarket-btc-infrastructure.service'
+        self.assertIn([main_unit], stop_calls,
+            f"service started then failed startup verification must still be stopped. stop_calls: {stop_calls}")
+
+    def test_never_stops_service_it_did_not_start(self):
+        """Service active before observer start is unrelated work — leave it alone."""
+        data = {'trial_id': 'soak-20261027T000000Z', 'phase': 'soak', 'seconds': 86400,
+                'launch_at': {'utc': '2026-10-27T00:00:00Z'}}
+        stop_calls = []
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            source = folder / 'db.sqlite'
+            source.touch()
+            state = dict(ActiveState='active', MainPID='9', InvocationID='pre-existing',
+                         NRestarts='0', ControlGroup='x')
+            snapshot_data = {'trading': {}, 'observations': 0, 'run_ids': []}
+
+            def stop_units_mock(units):
+                stop_calls.append(list(units))
+                return [], [{'unit': u} for u in units]
+
+            with patch.object(native, 'trial_metadata', return_value=data), \
+                 patch.object(native, 'check_approval'), \
+                 patch.object(native, 'require_service_policy'), \
+                 patch.object(native, 'environment', return_value={'MVP_DB_PATH': str(source), 'MVP_BOT_ID': 'bot', 'MVP_STATE_DIR': str(folder)}), \
+                 patch.object(native, 'snapshot', return_value=snapshot_data), \
+                 patch.object(native, 'properties', return_value=state), \
+                 patch.object(native, 'stop_units', side_effect=stop_units_mock), \
+                 patch.object(native, 'command', return_value=''), \
+                 patch.object(native.time, 'monotonic', return_value=1.0), \
+                 patch.object(native.time, 'time', return_value=200.0):
+                outcome = native.observe(folder, reset_stop=True)
+                result = json.loads((folder / 'result.json').read_text())
+        self.assertEqual(outcome, 1)
+        self.assertTrue(any('service already active' in e for e in result['errors']))
+        self.assertNotIn(['polymarket-btc-infrastructure.service'], stop_calls,
+            "observer must never stop a service it did not start")
 
 
 if __name__ == '__main__':
