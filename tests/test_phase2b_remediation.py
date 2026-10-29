@@ -45,7 +45,7 @@ class TestObserverShutdownDefect(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory)
             data = {'trial_id': 'soak-20261027T000000Z', 'phase': 'soak', 'seconds': 86400,
-                    'launch_at': {'utc': '2026-10-27T00:00:00Z'}}
+                    'launch_at': {'utc': '2026-10-27T00:00:00Z'}, 'units': native.owned('soak-20261027T000000Z')}
             source = folder / 'db.sqlite'
             source.touch()
             (folder / 'host.json.jsonl').write_text('{}\n')
@@ -249,7 +249,7 @@ class TestPostExitAuditContract(unittest.TestCase):
             folder = Path(directory)
             data = {'trial_id': 'pilot-20261027T000000Z', 'units': native.owned('pilot-20261027T000000Z')}
             (folder / 'cleanup.json').write_text('{"errors": []}')
-            state = dict(ActiveState='inactive', SubState='dead', MainPID='0', ControlPID='0')
+            state = dict(ActiveState='inactive', SubState='dead', MainPID='0', ControlPID='0', Result='success', ExecMainStatus='0')
             with patch.object(native, 'trial_metadata', return_value=data), \
                  patch.object(native, 'unit_evidence', side_effect=lambda u: {'unit': u, 'properties': state, 'pids': []}), \
                  patch.object(native, 'command', return_value='0 jobs listed.\n'):
@@ -268,7 +268,7 @@ class TestStaleDiagnosticsTimestampSafety(unittest.TestCase):
 
     def _observe_with_stale(self, counts, check_wall=200.0):
         data = {'trial_id': 'soak-20261027T000000Z', 'phase': 'soak', 'seconds': 86400,
-                'launch_at': {'utc': '2026-10-27T00:00:00Z'}}
+                'launch_at': {'utc': '2026-10-27T00:00:00Z'}, 'units': native.owned('soak-20261027T000000Z')}
         folder = None
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory)
@@ -330,6 +330,7 @@ class TestStaleDiagnosticsTimestampSafety(unittest.TestCase):
                  patch.object(native, 'fresh_run', return_value=True), \
                  patch.object(native, 'read_host', return_value={}), \
                  patch.object(native, 'memory_events', return_value={'oom': '0', 'oom_kill': '0', 'max': '0'}), \
+                 patch.multiple(native, start_observation_timing=MagicMock(side_effect=lambda *a: {'baseline_mono': native.time.monotonic()}), monotonic_now=MagicMock(return_value=0), stop_main=MagicMock(return_value={'errors': [], 'units': []})), \
                  patch.object(native, 'hash_due', return_value=False), \
                  patch.object(native, 'ingestion', side_effect=read_ingestion), \
                  patch.object(native.time, 'monotonic', side_effect=lockstep_monotonic()), \
@@ -387,7 +388,7 @@ class TestStartupEarlyCleanup(unittest.TestCase):
 
     def _observe_with_second_start_failure(self):
         data = {'trial_id': 'soak-20261027T000000Z', 'phase': 'soak', 'seconds': 86400,
-                'launch_at': {'utc': '2026-10-27T00:00:00Z'}}
+                'launch_at': {'utc': '2026-10-27T00:00:00Z'}, 'units': native.owned('soak-20261027T000000Z')}
         stop_calls = []
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory)
@@ -439,7 +440,7 @@ class TestStartupEarlyCleanup(unittest.TestCase):
 
     def _observe_with_first_start_failure(self):
         data = {'trial_id': 'soak-20261027T000000Z', 'phase': 'soak', 'seconds': 86400,
-                'launch_at': {'utc': '2026-10-27T00:00:00Z'}}
+                'launch_at': {'utc': '2026-10-27T00:00:00Z'}, 'units': native.owned('soak-20261027T000000Z')}
         stop_calls = []
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory)
@@ -483,7 +484,7 @@ class TestStartupEarlyCleanup(unittest.TestCase):
     def test_never_stops_service_it_did_not_start(self):
         """Service active before observer start is unrelated work — leave it alone."""
         data = {'trial_id': 'soak-20261027T000000Z', 'phase': 'soak', 'seconds': 86400,
-                'launch_at': {'utc': '2026-10-27T00:00:00Z'}}
+                'launch_at': {'utc': '2026-10-27T00:00:00Z'}, 'units': native.owned('soak-20261027T000000Z')}
         stop_calls = []
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory)

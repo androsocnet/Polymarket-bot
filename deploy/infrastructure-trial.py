@@ -21,13 +21,16 @@ EVIDENCE = STATE / 'evidence'
 TRADING = ('orders', 'positions', 'settlements', 'decisions', 'equity')
 PROPERTIES = ('LoadState,ActiveState,SubState,MainPID,ControlPID,Result,NRestarts,InvocationID,'
               'ControlGroup,Restart,RuntimeMaxUSec,MemoryCurrent,MemoryPeak,MemoryMax,'
-              'CPUUsageNSec,CPUQuotaPerSecUSec,TasksMax,ExecMainStatus')
+              'CPUUsageNSec,CPUQuotaPerSecUSec,TasksMax,ExecMainCode,ExecMainStatus,ActiveEnterTimestampMonotonic,'
+              'InactiveEnterTimestampMonotonic,RuntimeRandomizedExtraUSec')
 
 # Phase durations (seconds) — separate approval required when these change.
 PILOT_SECONDS = 1800
 SOAK_SECONDS = 86400
 # Offset constants shared across launch/observe/verify to avoid scattered literals.
-DEADLINE_AFTER_SECONDS = 180   # Independent deadline timer fires at seconds + 180.
+DEADLINE_AFTER_SECONDS = 60    # Baseline-relative, never launch-relative.
+STARTUP_SECONDS = 360         # Admission ceiling; expiration blocks trial, not a scheduling guarantee.
+MIN_STOP_WINDOW = 60          # Useful nominal stop window; actual shutdown proof still required.
 AUDIT_AFTER_SECONDS = 600      # Independent audit timer fires at seconds + 600.
 RUNTIME_MAX_PADDING = 240      # Service RuntimeMaxSec = seconds + 240 (fail-safe after deadline).
 HOST_LIVENESS_SECONDS = 60     # Host heartbeat liveness window = seconds + 60.
@@ -133,10 +136,10 @@ def require_service_policy():
         raise ValueError('effective service policy/limits differ')
 
 
-def runtime_bound():
+def runtime_bound(property_name='RuntimeMaxUSec'):
     object_path = '/org/freedesktop/systemd1/unit/' + UNIT.replace('-', '_2d').replace('.', '_2e')
     raw = command('busctl', 'get-property', 'org.freedesktop.systemd1', object_path,
-                  'org.freedesktop.systemd1.Service', 'RuntimeMaxUSec').split()
+                  'org.freedesktop.systemd1.Service', property_name).split()
     if len(raw) != 2 or raw[0] != 't':
         raise ValueError('numeric systemd runtime bound unavailable')
     return int(raw[1])
@@ -157,7 +160,8 @@ def verify_pilot(approval, evidence_root):
                     'restart-verification.json', 'deadline.json', 'deadline-stop.json',
                     'before-db.json', 'after-db.json', 'deadline-db.json',
                     'before.sqlite', 'after.sqlite', 'deadline.sqlite', 'samples.jsonl',
-                    'host.json', 'host.json.jsonl', 'journal.log'}
+                    'host.json', 'host.json.jsonl', 'journal.log', 'timing.json', 'shutdown.json',
+                    'startup-timers.json', 'startup-handoff.json'}
         if not required <= files.keys():
             raise ValueError('pilot evidence inventory incomplete')
         for name in ('result.json', 'cleanup.json', 'restart-verification.json',
@@ -168,12 +172,19 @@ def verify_pilot(approval, evidence_root):
         launch = json.loads((folder / 'launch.json').read_text())
         result = json.loads((folder / 'result.json').read_text())
         restart = json.loads((folder / 'restart-verification.json').read_text())
+        if (folder / 'startup-stop.json').exists() or (folder / 'launch-error.json').exists():
+            raise ValueError('pilot startup failed')
+        if json.loads((folder / 'startup-handoff.json').read_text())['errors']:
+            raise ValueError('pilot startup handoff failed')
         if (launch['trial_id'] != trial_id or launch['phase'] != 'pilot' or launch['seconds'] != PILOT_SECONDS
                 or launch['units'] != owned(trial_id) or not result['continuous']
                 or result['window_seconds'] != PILOT_SECONDS or result['elapsed_seconds'] < PILOT_SECONDS
                 or result['run_id'] != restart['continuous_run_id']
                 or result['run_id'] == restart['first_run_id'] or result['ingestion']['count'] <= 0):
             raise ValueError('pilot trial/run metadata mismatch')
+        timing = json.loads((folder / 'timing.json').read_text())
+        validate_timing(launch, timing, result, json.loads((folder / 'shutdown.json').read_text()))
+        validate_deadline(timing, json.loads((folder / 'deadline-stop.json').read_text()))
         samples = [json.loads(line) for line in (folder / 'samples.jsonl').read_text().splitlines()]
         if len(samples) < PILOT_SECONDS // SAMPLE_INTERVAL_DIVISOR or len(samples) != result['samples'] or any(s['run_id'] != result['run_id'] for s in samples):
             raise ValueError('pilot samples incomplete')
@@ -261,7 +272,11 @@ def verify_host_runtime(baseline):
 
 def fingerprint(root, manifest, environment, unit_text, effective):
     verify_artifacts(root, manifest)
-    return hashlib.sha256(json.dumps([manifest, environment.hex(), unit_text, effective],
+    contract = {'version': 'observable-baseline-v1', 'startup': STARTUP_SECONDS, 'grace': DEADLINE_AFTER_SECONDS,
+                'runtime_padding': RUNTIME_MAX_PADDING, 'min_stop_window': MIN_STOP_WINDOW, 'max_deadline_lateness': 30,
+                'timer_accuracy_us': 1000000, 'clock': 'CLOCK_MONOTONIC',
+                'owned_roles': [u.split('20261030T000000Z-')[1] for u in owned('pilot-20261030T000000Z')]}
+    return hashlib.sha256(json.dumps([manifest, environment.hex(), unit_text, effective, contract],
                                     sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
 
@@ -452,7 +467,69 @@ def owned(trial_id):
     prefix = 'infra-' + trial_id
     return [prefix + '-heartbeat.service', prefix + '-observer.service',
             prefix + '-deadline.timer', prefix + '-deadline.service', prefix + '-audit.timer',
-            prefix + '-audit.service']
+            prefix + '-audit.service', prefix + '-startup.timer', prefix + '-startup.service']
+
+
+def boot_id():
+    return Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+
+
+def monotonic_now(data):
+    now = time.monotonic()
+    if boot_id() != data['boot_id'] or abs(now - time.clock_gettime(time.CLOCK_MONOTONIC)) > .1:
+        raise ValueError('boot/monotonic clock mismatch')
+    return now
+
+
+def helper_options():
+    return ['--property=Restart=no', '--property=KillMode=control-group', '--property=RemainAfterExit=no',
+            '--property=TimeoutStopSec=10', '--setenv=PYTHONDONTWRITEBYTECODE=1',
+            '--setenv=PYTHONPATH=' + str(ROOT / 'src'), '--property=MemoryMax=256M', '--property=CPUQuota=50%']
+
+
+def arm_timer(data, timer, expiry, action, folder, runtime=360):
+    if expiry - monotonic_now(data) < MIN_STOP_WINDOW:
+        raise ValueError('timer expired or insufficient arming window')
+    command('systemd-run', '--unit=' + timer[:-6], '--on-boot=' + str(round(expiry * 1e6)) + 'us',
+            '--timer-property=AccuracySec=1s', '--timer-property=RandomizedDelaySec=0',
+            '--timer-property=WakeSystem=no', '--timer-property=RemainAfterElapse=no',
+            *helper_options(), '--property=RuntimeMaxSec=' + str(runtime), sys.executable,
+            str(ROOT / 'deploy/infrastructure-trial.py'), action, '--folder', str(folder))
+    object_path = '/org/freedesktop/systemd1/unit/' + timer.replace('-', '_2d').replace('.', '_2e')
+    raw = json.loads(command('busctl', '--json=short', 'call', 'org.freedesktop.systemd1', object_path,
+                             'org.freedesktop.DBus.Properties', 'GetAll', 's', 'org.freedesktop.systemd1.Timer'))
+    values = {key: value['data'] for key, value in raw['data'][0].items()}
+    usec = round(expiry * 1e6)
+    expected = {'Unit': timer[:-6] + '.service', 'TimersMonotonic': [['OnBootUSec', usec, usec]],
+                'TimersCalendar': [], 'NextElapseUSecMonotonic': usec, 'NextElapseUSecRealtime': 0,
+                'AccuracyUSec': 1000000, 'RandomizedDelayUSec': 0, 'WakeSystem': False,
+                'RemainAfterElapse': False, 'OnClockChange': False, 'OnTimezoneChange': False}
+    if (any(values.get(k) != v for k, v in expected.items())
+            or values.get('RandomizedOffsetUSec', 0) != 0
+            or properties(timer)['ActiveState'] != 'active'):
+        raise ValueError('effective timer policy/expiry mismatch')
+    if expiry - monotonic_now(data) < MIN_STOP_WINDOW:
+        raise ValueError('timer expired or insufficient arming window')
+    return values
+
+
+def start_observation_timing(folder, data, service):
+    baseline = monotonic_now(data)
+    activation = int(service['ActiveEnterTimestampMonotonic']) / 1e6
+    runtime = (data['seconds'] + RUNTIME_MAX_PADDING)
+    expiry = baseline + data['seconds'] + DEADLINE_AFTER_SECONDS
+    if (activation <= 0 or activation > baseline or baseline - data['launch_mono'] >= STARTUP_SECONDS
+            or runtime_bound() != runtime * 1000000
+            or runtime_bound('RuntimeRandomizedExtraUSec') != 0
+            or activation + runtime - expiry < MIN_STOP_WINDOW):
+        raise ValueError('activation/runtime/startup timing margin unavailable')
+    effective = arm_timer(data, data['units'][2], expiry, 'deadline', folder)
+    timing = {'fingerprint': data['fingerprint'], 'boot_id': data['boot_id'],
+              'activation_mono': activation, 'baseline_mono': baseline, 'deadline_mono': expiry,
+              'runtime_expiry_mono': activation + runtime, 'invocation_id': service['InvocationID'],
+              'timer': effective}
+    write_json(folder / 'timing.json', timing)
+    return timing
 
 
 def trial_metadata(folder):
@@ -462,11 +539,80 @@ def trial_metadata(folder):
     return data
 
 
+def stop_main(folder, data, timing):
+    requested = monotonic_now(data)
+    errors, evidence = stop_units([UNIT])
+    completed = monotonic_now(data)
+    state = evidence[0]['properties'] if evidence else {}
+    fallback = state.get('Result') == 'timeout'
+    if (not evidence or state.get('ActiveState') != 'inactive' or not quiescent(state, evidence[0]['pids'])
+            or state.get('Result') != 'success' or state.get('InvocationID') != timing['invocation_id']
+            or completed >= timing['runtime_expiry_mono']):
+        errors.append('shutdown not proven before runtime backstop')
+    proof = {'stop_request_mono': requested, 'quiescence_mono': completed, 'runtime_fallback': fallback,
+             'units': evidence, 'errors': errors, 'boot_id': data['boot_id']}
+    write_json(folder / 'shutdown.json', proof)
+    return proof
+
+
+def validate_timing(data, timing, result, shutdown):
+    if (timing['fingerprint'] != data['fingerprint'] or timing['boot_id'] != data['boot_id']
+            or timing['deadline_mono'] != timing['baseline_mono'] + data['seconds'] + DEADLINE_AFTER_SECONDS
+            or timing['runtime_expiry_mono'] != timing['activation_mono'] + data['seconds'] + RUNTIME_MAX_PADDING
+            or timing['runtime_expiry_mono'] - timing['deadline_mono'] < MIN_STOP_WINDOW
+            or not result['continuous'] or result['errors'] or shutdown['errors'] or shutdown['runtime_fallback']
+            or result['observation_end_mono'] < timing['baseline_mono'] + data['seconds']
+            or not result['observation_end_mono'] <= shutdown['stop_request_mono'] <= shutdown['quiescence_mono'] < timing['runtime_expiry_mono']):
+        raise ValueError('incomplete or failed observation/shutdown timing proof')
+    state = shutdown['units'][0]['properties']
+    if (state['ActiveState'] != 'inactive' or state['Result'] != 'success'
+            or state['InvocationID'] != timing['invocation_id']
+            or not quiescent(state, shutdown['units'][0]['pids'])):
+        raise ValueError('shutdown state/identity proof failed')
+
+
+def validate_deadline(timing, proof):
+    # Acceptance limit, not a promise of Linux dispatch latency; retain nominal stop budget.
+    if (proof['errors'] or not timing['deadline_mono'] <= proof['trigger_mono'] <= timing['deadline_mono'] + 30
+            or proof['trigger_mono'] >= timing['runtime_expiry_mono']):
+        raise ValueError('deadline trigger outside accepted 30-second window')
+
+
+def startup_timeout(folder):
+    data = trial_metadata(folder)
+    errors, evidence = stop_units([UNIT, data['units'][1], data['units'][0], data['units'][6]])
+    write_json(folder / 'startup-stop.json', {'trigger_mono': time.monotonic(), 'units': evidence,
+                                           'errors': ['startup watchdog expired', *errors]})
+    return 1
+
+
 def deadline(folder):
     data = trial_metadata(folder)
-    # This oneshot cannot stop itself and still write evidence; audit runs after exit.
-    errors, evidence = stop_units([UNIT, *data['units'][:3]])
-    write_json(folder / 'deadline-stop.json', {'at': timestamps(time.time()), 'units': evidence, 'errors': errors})
+    trigger = monotonic_now(data)
+    errors = []
+    try:
+        timing = json.loads(secure_bytes(folder / 'timing.json'))
+        validate_deadline(timing, {'trigger_mono': trigger, 'errors': []})
+        if not (folder / 'shutdown.json').exists():
+            proof = stop_main(folder, data, timing)
+        else:
+            proof = json.loads(secure_bytes(folder / 'shutdown.json'))
+        errors.extend(proof['errors'])
+    except Exception as exc:
+        errors.append('deadline timing/shutdown evidence: ' + str(exc))
+        stop_errors, main_evidence = stop_units([UNIT])
+        errors.extend(stop_errors)
+        proof = {'errors': errors.copy(), 'units': main_evidence}
+        timing = {}
+    stop_errors, evidence = stop_units([*data['units'][:3], *data['units'][6:]])
+    errors.extend(stop_errors)
+    try:
+        result = json.loads(secure_bytes(folder / 'result.json'))
+        validate_timing(data, timing, result, proof)
+    except Exception as exc:
+        errors.append(str(exc))
+    write_json(folder / 'deadline-stop.json', {'at': timestamps(time.time()), 'trigger_mono': trigger,
+               'units': evidence, 'shutdown': proof, 'errors': errors})
     try:
         # Whole snapshot subprocess includes integrity/digests/hash under one hard timeout.
         subprocess.run([sys.executable, str(ROOT / 'deploy/infrastructure-trial.py'),
@@ -475,6 +621,33 @@ def deadline(folder):
         errors.append('deadline backup: ' + str(exc))
     write_json(folder / 'deadline.json', {'at': timestamps(time.time()), 'units': evidence, 'errors': errors})
     return 1 if errors else 0
+
+
+def validate_helper_exits(data, evidence, include_audit=False):
+    main = next((item for item in evidence if item['unit'] == UNIT), None)
+    if (main is None or main['properties'].get('ActiveState') != 'inactive'
+            or main['properties'].get('Result') != 'success'
+            or not quiescent(main['properties'], main['pids'])):
+        raise ValueError('current main service not inactive/successful')
+    required = {data['units'][3]}
+    if include_audit:
+        required.add(data['units'][5])
+    seen = set()
+    for item in evidence:
+        unit, state = item['unit'], item['properties']
+        if not unit.endswith('.service') or unit == UNIT:
+            continue
+        if state.get('LoadState') == 'not-found' and unit not in required:
+            continue  # Canceled/unstarted optional transient helper.
+        intentional_heartbeat_stop = (unit == data['units'][0]
+                                      and state.get('ExecMainCode') == '2' and state.get('ExecMainStatus') == '15')
+        if (state.get('ActiveState') != 'inactive' or state.get('Result') != 'success'
+                or (state.get('ExecMainStatus') != '0' and not intentional_heartbeat_stop)
+                or not quiescent(state, item['pids'])):
+            raise ValueError(unit + ': successful terminal helper result unavailable')
+        seen.add(unit)
+    if not required <= seen:
+        raise ValueError('required terminal helper evidence missing')
 
 
 def inspect_cleanup(folder):
@@ -487,6 +660,10 @@ def inspect_cleanup(folder):
         props = item['properties']
         if not quiescent(props, item['pids']) or (item['unit'].endswith('.timer') and props['ActiveState'] != 'inactive'):
             errors.append(item['unit'] + ': not cleaned')
+    try:
+        validate_helper_exits(data, evidence, include_audit=True)
+    except ValueError as exc:
+        errors.append(str(exc))
     jobs = command('systemctl', 'list-jobs', '--no-legend', '--plain')
     for unit in [UNIT, *data['units']]:
         if unit in jobs.split():
@@ -497,11 +674,12 @@ def inspect_cleanup(folder):
 
 def audit(folder):
     data = trial_metadata(folder)
-    errors, evidence = stop_units([UNIT, *data['units'][:-1]])
+    errors, evidence = stop_units([UNIT, *(u for u in data['units'] if u != data['units'][5])])
     for item in evidence:
         if item['unit'].endswith('.timer') and item['properties']['ActiveState'] != 'inactive':
             errors.append(item['unit'] + ': timer not inactive')
     try:
+        validate_helper_exits(data, evidence)
         identity, _ = runtime_identity()
         if identity != data['fingerprint']:
             errors.append('final runtime fingerprint changed')
@@ -509,6 +687,14 @@ def audit(folder):
             errors.append('independent deadline evidence missing')
         elif json.loads((folder / 'deadline.json').read_text())['errors']:
             errors.append('independent deadline failed')
+        timing = json.loads(secure_bytes(folder / 'timing.json'))
+        validate_timing(data, timing, json.loads(secure_bytes(folder / 'result.json')),
+                        json.loads(secure_bytes(folder / 'shutdown.json')))
+        validate_deadline(timing, json.loads(secure_bytes(folder / 'deadline-stop.json')))
+        if (folder / 'startup-stop.json').exists() or (folder / 'launch-error.json').exists():
+            errors.append('startup/launch failed')
+        if json.loads(secure_bytes(folder / 'startup-handoff.json'))['errors']:
+            errors.append('startup handoff failed')
     except Exception as exc:
         errors.append(str(exc))
     write_json(folder / 'cleanup.json', {'at': timestamps(time.time()), 'units': evidence,
@@ -542,34 +728,30 @@ def launch(phase, approval_path, reset_stop=False):
             if not quiescent(info['properties'], info['pids']) or (unit.endswith('.timer') and info['properties']['ActiveState'] != 'inactive'):
                 raise ValueError('previous trial jobs still active: ' + unit)
     launched = time.time()
+    launch_mono = time.monotonic()
     trial_id = phase + '-' + datetime.fromtimestamp(launched, timezone.utc).strftime('%Y%m%dT%H%M%SZ')
     folder = EVIDENCE / trial_id
     folder.mkdir(parents=True, exist_ok=False)
     units = owned(trial_id)
     data = {'trial_id': trial_id, 'phase': phase, 'seconds': seconds, 'launch_at': timestamps(launched),
             'fingerprint': identity, 'git_sha': approval['git_sha'], 'units': units,
-            'deadline_after_seconds': seconds + DEADLINE_AFTER_SECONDS, 'audit_after_seconds': seconds + AUDIT_AFTER_SECONDS}
+            'boot_id': boot_id(), 'launch_mono': launch_mono,
+            'startup_expiry_mono': launch_mono + STARTUP_SECONDS,
+            'heartbeat_expiry_mono': launch_mono + STARTUP_SECONDS + seconds + 120,
+            'audit_expiry_mono': launch_mono + STARTUP_SECONDS + seconds + DEADLINE_AFTER_SECONDS + 420,
+            'deadline_after_seconds': seconds + DEADLINE_AFTER_SECONDS}
     write_json(folder / 'approval.json', approval)
     write_json(folder / 'launch.json', data)
     script = str(ROOT / 'deploy/infrastructure-trial.py')
-    common = ['--property=Restart=no', '--property=KillMode=control-group', '--property=RemainAfterExit=no',
-              '--property=TimeoutStopSec=10',
-              '--setenv=PYTHONDONTWRITEBYTECODE=1', '--setenv=PYTHONPATH=' + str(ROOT / 'src'),
-              '--property=MemoryMax=256M', '--property=CPUQuota=50%']
+    common = helper_options()
     try:
-        # Audit is armed first; still runs if launch fails halfway through.
-        command('systemd-run', '--unit=' + units[4][:-6], '--on-active=' + str(seconds + AUDIT_AFTER_SECONDS) + 's',
-                '--timer-property=RemainAfterElapse=no', '--timer-property=AccuracySec=1s',
-                *common, '--property=RuntimeMaxSec=480', sys.executable, script, 'audit', '--folder', str(folder))
-        command('systemd-run', '--unit=' + units[3][:-8], '--on-active=' + str(seconds + DEADLINE_AFTER_SECONDS) + 's',
-                '--timer-property=RemainAfterElapse=no', '--timer-property=AccuracySec=1s',
-                *common, '--property=RuntimeMaxSec=360', sys.executable, script, 'deadline', '--folder', str(folder))
-        for timer in (units[2], units[4]):
-            if properties(timer)['ActiveState'] != 'active':
-                raise ValueError('independent timer not active: ' + timer)
-        command('systemd-run', '--unit=' + units[0], *common, '--property=RuntimeMaxSec=' + str(seconds + RUNTIME_MAX_PADDING),
+        # Audit survives all early failures, including failed watchdog submission.
+        audit_timer = arm_timer(data, units[4], data['audit_expiry_mono'], 'audit', folder, runtime=600)
+        startup_timer = arm_timer(data, units[6], data['startup_expiry_mono'], 'startup-timeout', folder)
+        write_json(folder / 'startup-timers.json', {'fingerprint': identity, 'audit': audit_timer, 'startup': startup_timer})
+        command('systemd-run', '--unit=' + units[0], *common, '--property=RuntimeMaxSec=' + str(STARTUP_SECONDS + seconds + 120),
                 '--setenv=PATH=' + str(ROOT / '.venv/bin') + ':/usr/bin:/bin',
-                '/bin/bash', str(ROOT / 'deploy/infrastructure-host-heartbeat.sh'), str(folder / 'host.json'), str(seconds + HOST_LIVENESS_SECONDS))
+                '/bin/bash', str(ROOT / 'deploy/infrastructure-host-heartbeat.sh'), str(folder / 'host.json'), str(data['heartbeat_expiry_mono']))
         until = time.monotonic() + 10
         while not (folder / 'host.json').exists():
             if time.monotonic() >= until:
@@ -581,14 +763,13 @@ def launch(phase, approval_path, reset_stop=False):
             if not reset_stop:
                 raise ValueError('infrastructure STOP present; explicit --reset-stop required')
             stop.unlink()
-        command('systemd-run', '--unit=' + units[1], *common, '--property=RuntimeMaxSec=' + str(seconds + RUNTIME_MAX_PADDING),
+        if monotonic_now(data) >= data['startup_expiry_mono']:
+            raise ValueError('startup budget exhausted')
+        command('systemd-run', '--unit=' + units[1], *common, '--property=RuntimeMaxSec=' + str(STARTUP_SECONDS + seconds + 120),
                 sys.executable, script, 'observe', '--folder', str(folder))
     except BaseException as exc:
         errors, evidence = stop_units([UNIT, units[0], units[1]])
-        if not errors:
-            timer_errors, timer_evidence = stop_units(units[2:])
-            errors.extend(timer_errors)
-            evidence.extend(timer_evidence)
+        # Independent audit stays armed; startup failures must retain final evidence.
         write_json(folder / 'launch-error.json', {'error': str(exc), 'cleanup_errors': errors, 'units': evidence})
         raise
     finally:
@@ -604,6 +785,7 @@ def observe(folder, reset_stop=False):
     db_path = None
     host_stream = None
     started = False
+    timing = None
     try:
         check_approval(folder / 'approval.json', data['phase'], data['seconds'])
         env = environment()
@@ -652,7 +834,13 @@ def observe(folder, reset_stop=False):
                    'first': first, 'first_run_id': first_run_id, 'stopped': stopped,
                    'second': initial, 'continuous_run_id': run_id, 'errors': []})
         started = True
-        baseline = time.monotonic()
+        timing = start_observation_timing(folder, data, initial)
+        baseline = timing['baseline_mono']
+        watchdog_errors, watchdog_evidence = stop_units([data['units'][6]])
+        if watchdog_errors or (folder / 'startup-stop.json').exists():
+            raise ValueError('startup watchdog handoff failed: ' + str(watchdog_errors))
+        write_json(folder / 'startup-handoff.json', {'at_mono': monotonic_now(data), 'errors': watchdog_errors,
+                                                  'units': watchdog_evidence})
         result['service_started_at'] = timestamps(time.time())
         result['window_seconds'] = data['seconds']
         previous_wall, previous_mono = time.time(), baseline
@@ -699,7 +887,7 @@ def observe(folder, reset_stop=False):
             if mono - baseline >= data['seconds']:
                 break
             time.sleep(min(5, max(0, baseline + data['seconds'] - time.monotonic())))
-        result.update(continuous=True, elapsed_seconds=mono - baseline, run_id=run_id,
+        result.update(continuous=True, observation_end_mono=mono, elapsed_seconds=mono - baseline, run_id=run_id,
                       ingestion=ingestion(db_path, env['MVP_BOT_ID'], run_id or ''))
         if samples < data['seconds'] // SAMPLE_INTERVAL_DIVISOR or result['ingestion']['count'] <= 0:
             raise ValueError('insufficient samples or trial ingestion')
@@ -710,10 +898,22 @@ def observe(folder, reset_stop=False):
     finally:
         if host_stream is not None:
             host_stream.close()
+        result.setdefault('observation_end_mono', time.monotonic())
         if started:
-            stop_errors, evidence = stop_units([UNIT])
-            errors.extend(stop_errors)
-            result['terminal_service'] = evidence
+            if timing is not None:
+                try:
+                    proof = stop_main(folder, data, timing)
+                    errors.extend(proof['errors'])
+                    result['terminal_service'] = proof['units']
+                except Exception as exc:
+                    errors.append('shutdown evidence: ' + str(exc))
+                    stop_errors, evidence = stop_units([UNIT])
+                    errors.extend(stop_errors)
+                    result['terminal_service'] = evidence
+            else:
+                stop_errors, evidence = stop_units([UNIT])
+                errors.extend(stop_errors)
+                result['terminal_service'] = evidence
         if db_path is not None:
             try:
                 after = snapshot(db_path, folder / 'after.sqlite')
@@ -742,7 +942,7 @@ def observe(folder, reset_stop=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=('fingerprint', 'launch', 'observe', 'deadline', 'audit', 'inspect-cleanup', 'snapshot'))
+    parser.add_argument('action', choices=('fingerprint', 'launch', 'observe', 'deadline', 'audit', 'inspect-cleanup', 'snapshot', 'startup-timeout'))
     parser.add_argument('--phase', choices=('pilot', 'soak'), default='pilot')
     parser.add_argument('--approval', type=Path)
     parser.add_argument('--folder', type=Path)
@@ -769,7 +969,7 @@ def main():
         return 1 if result['errors'] else 0
     if args.action == 'observe':
         return observe(args.folder, args.reset_stop)
-    return {'deadline': deadline, 'audit': audit}[args.action](args.folder)
+    return {'deadline': deadline, 'audit': audit, 'startup-timeout': startup_timeout}[args.action](args.folder)
 
 
 if __name__ == '__main__':

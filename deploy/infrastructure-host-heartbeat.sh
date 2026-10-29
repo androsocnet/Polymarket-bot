@@ -6,8 +6,8 @@
 set -euo pipefail
 
 OUTPUT_PATH="${1:?usage: infrastructure-host-heartbeat.sh <output.json> <seconds>}"
-SECONDS_PARAM="${2:?usage: infrastructure-host-heartbeat.sh <output.json> <seconds>}"
-DEADLINE=$(( $(date +%s) + SECONDS_PARAM + 120 ))
+DEADLINE="${2:?usage: infrastructure-host-heartbeat.sh <output.json> <absolute-monotonic-deadline>}"
+python3 -c 'import math,sys; d=float(sys.argv[1]); assert math.isfinite(d)' "$DEADLINE"
 INTERVAL=5
 
 BOOT_ID="$(cat /proc/sys/kernel/random/boot_id)"
@@ -64,7 +64,7 @@ print(time.clock_gettime(time.CLOCK_BOOTTIME))
 
     write_sample "$SEQ" "$WALL" "$MONO" "$BOOTTIME" "$INTERRUPTED"
 
-    if [[ "$(date +%s)" -ge "$DEADLINE" ]]; then
+    if python3 -c 'import sys; exit(0 if float(sys.argv[1]) >= float(sys.argv[2]) else 1)' "$MONO" "$DEADLINE"; then
         break
     fi
     sleep "$INTERVAL"
