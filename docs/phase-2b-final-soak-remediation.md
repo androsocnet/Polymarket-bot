@@ -3,6 +3,8 @@
 **Status: BLOCKED. Not Phase 2B acceptance, deployment authorization, or soak authorization.**
 Historical trial: `soak-20261026T040455Z`. Approved historical base: `f8ccedc5fe8d0b7465cb65aa87ee0e15b0737f4a`. User reports six of eight gates passed; gates 3 and 8 blocked. Exact VPS runtime files are not bundled locally. No direct VPS access performed.
 
+**Independent review blocker:** `subagent` tool unavailable in this environment — all invocations fail with `Subagent session not found: ses_invalid`. Independent reviewer cannot be dispatched from this session. This block is documented, not invented.
+
 ## Root causes reproduced in repository
 
 - Deadline command stops only main infrastructure service. Shell semicolon lets final `systemctl show` hide stop failure. No helper/timer/cgroup cleanup proof.
@@ -12,6 +14,7 @@ Historical trial: `soak-20261026T040455Z`. Approved historical base: `f8ccedc5fe
 - Historical `code_hash` excludes shell helpers, hashes subset of Python files, and reads paper config. Installer copied mutable working bytes and editable-installed source checkout. Git SHA alone did not describe installed runtime.
 - Cumulative DB totals mix run IDs. No consistent trial snapshots means historical delta cannot be reconstructed confidently.
 - Trial suffix identifies launch metadata time, not service observation start. Manual timezone arithmetic is ambiguous. New metadata records UTC `Z`, WIB `+07:00`, launch versus observation start separately. Example: `2026-10-26T04:04:55Z` is `2026-10-26T11:04:55+07:00`, not evidence that service started at that instant.
+- Stale ingestion failures now write `stale_ingestion_diagnostics` to `result.json` capturing exact count, last_received_us, wall_time, computed_age_seconds, run_id, and failed_branch. Failure itself is NOT suppressed — strict thresholds preserved. See Fix 3 in `deploy/infrastructure-trial.py`.
 
 ## Hermes evidence request — read-only, no code modifications
 
@@ -36,6 +39,8 @@ Root-owned `/var/lib/polymarket-btc-infrastructure` separates root-only evidence
 
 Independent deadline stops main service, heartbeat, observer and deadline timer, preserving errors individually. Durable `deadline-stop.json` precedes DB processing. Snapshot subprocess has 60-second whole-operation timeout; deadline helper gets 360 seconds for four bounded stops/queries plus snapshot, audit starts 420 seconds after deadline and gets 480 seconds for six bounded stops/queries plus fingerprint. These are ceilings, not permission to accept missing proof. Later independent audit verifies/stops deadline service and both timers after deadline exits. Cgroup descendants checked, not only MainPID. `active/exited` plus PID 0 and empty cgroup means no running process; timers still must be inactive. Failed stop never becomes success through later show.
 
+Observer `started` flag set after verified restart so `finally` block stops main service on any observation failure (Fix 1 in `deploy/infrastructure-trial.py`).
+
 SQLite before/after/deadline snapshots use online backup API, bounded backup progress, integrity checks, exclusive creation and streaming hashes. Trial ingestion filtered by bot/run ID; samples retain per-run counts and timestamps. Trading rows compared by ordered content digests, including historical positions lacking run IDs.
 
 ## Hermes redeployment — only after verified commit and explicit deployment authorization
@@ -46,11 +51,11 @@ Do not use untracked helper scripts. Do not edit runtime code on VPS. Do not run
 2. In `/home/ubuntu/Polymarket-bot`, fetch `origin linux-mvp`; verify supplied full SHA equals `origin/linux-mvp`, inspect `git status`. Use separate clean checkout of exact SHA if local tracked edits exist; preserve them. Never reset/delete local edits. Verify no `feat/strategy-learning` merge.
 3. Run source tests using repository dependencies and `PYTHONPATH=src`, Bash syntax checks. Execute `sudo env PATH="$PATH" bash deploy/install-infrastructure.sh` from clean exact checkout. Installer must not start service. If release path already exists, stop; inspect/verify it, do not delete or overwrite.
 4. Set `R=/opt/polymarket-btc-infrastructure/releases/<VERIFIED_FULL_SHA>`. Review preserved `/etc/polymarket-btc/infrastructure.env`; keep `MODE=PAPER_ONLY` and risk values unchanged. New DB path must be `/var/lib/polymarket-btc-infrastructure/data/infrastructure.sqlite`, with service-owned parent for WAL/SHM. Set `MVP_STATE_DIR=/var/lib/polymarket-btc-infrastructure/data/state` too. Archive old config before authorizing only these storage-path changes; any old infrastructure DB/evidence stays in place. Installer checks service traversal of new data/state paths; it never grants access to paper-owned parent. Leave old DB/history in place; new trial initializes separate schema. Do not copy a live DB file or silently rewrite config. Review `systemctl cat polymarket-btc-infrastructure.service` and every drop-in. Main `ExecStart` must use `$R/.venv/bin/python -m polymarket_bot.linux_mvp ingest` and `PYTHONPATH=$R/src`.
-5. Install phase-bound drop-in through explicit operator authorization, not local code edits: `[Service]`, `Restart=no`, `RuntimeMaxSec=300` for pilot. Run `systemctl daemon-reload`; verify raw D-Bus RuntimeMaxUSec `300000000`, KillMode control-group, user, resource limits, no unexpected drop-ins. Config/unit changes occur **before** fingerprint approval.
+5. Install phase-bound drop-in through explicit operator authorization, not local code edits: `[Service]`, `Restart=no`, `RuntimeMaxSec=1100+240=1340` for pilot, `RuntimeMaxSec=86640` for soak. Run `systemctl daemon-reload`; verify raw D-Bus RuntimeMaxUSec `1340000000` (pilot) or `86640000000` (soak), KillMode control-group, user, resource limits, no unexpected drop-ins. Config/unit changes occur **before** fingerprint approval. Value changed from `seconds+120` to `seconds+240` so independent deadline at `seconds+180` fires first; see Fix 2 in `deploy/infrastructure-trial.py`.
 6. Run `sudo env PYTHONDONTWRITEBYTECODE=1 "$R/.venv/bin/python" "$R/deploy/infrastructure-trial.py" fingerprint`. Export manifest, effective unit/config, full SHA and fingerprint for independent owner review. Fingerprinting is not approval.
-7. Owner supplies root-owned approval file, outside release, with `scope=INFRASTRUCTURE_ONLY`, `phase=pilot`, `seconds=180`, exact `git_sha` and `fingerprint`, `authorized=true`, real `approved_by`, real `approved_at_utc` ending `Z`. Do not generate approval by copying newly calculated hash without review. Never alter historical approval.
+7. Owner supplies root-owned approval file, outside release, with `scope=INFRASTRUCTURE_ONLY`, `phase=pilot`, `seconds=1100`, exact `git_sha` and `fingerprint`, `authorized=true`, real `approved_by`, real `approved_at_utc` ending `Z`. Do not generate approval by copying newly calculated hash without review. Never alter historical approval.
 
-## Fresh 180-second pilot
+## Fresh 1100-second pilot
 
 After deployment and exact fingerprint authorization:
 
@@ -62,13 +67,13 @@ sudo env PHASE=pilot APPROVAL=/etc/polymarket-btc/approved-native-pilot.json \
 
 If infrastructure STOP exists, pause. Owner must explicitly authorize infrastructure-only reset; rerun command with `--reset-stop`. No automatic sentinel deletion. Main paper STOP untouched.
 
-Runner prints single trial ID and evidence path. Separate bounded restart proof precedes continuous window. Do not disconnect-dependent tail, restart during observation, edit runtime, or stop safety timers. Continuous pilot is 180 seconds; deadline scheduled at launch +360 seconds, audit at launch +780 seconds. Wait for audit to finish before judging cleanup; inspect audit service itself afterward for inactive/failed with MainPID=ControlPID=0, empty cgroup, no jobs. `PENDING_REVIEW` is not acceptance.
+Runner prints single trial ID and evidence path. Separate bounded restart proof precedes continuous window. Do not disconnect-dependent tail, restart during observation, edit runtime, or stop safety timers. Continuous pilot is 1100 seconds; deadline scheduled at launch +1280 seconds, audit at launch +1700 seconds. Wait for audit to finish before judging cleanup; inspect audit service itself afterward for inactive/failed with MainPID=ControlPID=0, empty cgroup, no jobs. `PENDING_REVIEW` is not acceptance.
 
 After audit exits, run `sudo env PYTHONDONTWRITEBYTECODE=1 "$R/.venv/bin/python" "$R/deploy/infrastructure-trial.py" inspect-cleanup --folder /var/lib/polymarket-btc-infrastructure/evidence/<TRIAL_ID>` and preserve stdout as new external post-audit evidence. After reviewing successful exit, explicitly install that output as root-owned mode-0600 `<TRIAL_FOLDER>/post-audit.json` before freezing pilot bundle; no overwrite of historical files. Soak preflight requires this post-exit artifact, snapshots/summaries, samples, full host JSONL, launch/approval/restart/deadline/cleanup records and journal, with consistent trial/run metadata and snapshot hashes. This read-only check includes audit service, cgroups and pending jobs. Nonzero exit blocks gate 3. Export complete fresh trial folder and journals for all exact owned unit names, post-audit unit/cgroup evidence, runtime fingerprint and SHA inventory. Require before/after/deadline DB integrity; check trial-run ingestion and unchanged trading digests. Do not substitute lifetime totals. Resource/continuity gaps block review.
 
 ## Eight unchanged acceptance gates
 
-1. Continuous 180s pilot / 86400s soak, required samples (at least seconds/10), elapsed monotonic time, unchanged PID/InvocationID/NRestarts.
+1. Continuous 1100s pilot / 86400s soak, required samples (at least seconds/10), elapsed monotonic time, unchanged PID/InvocationID/NRestarts.
 2. Separate restart proof with distinct InvocationID and verified clean stop before continuous window.
 3. Independent deadline + post-exit cleanup audit, main/helpers/timers/cgroup PIDs and audit service terminal state. Test observer-failure path on separately authorized bounded pilot; do not infer deadline effectiveness only from already-stopped service.
 4. Per-run positive ingestion, fresh sample progress across complete window, attributable run ID and timestamp range. Historical rows excluded.
@@ -81,4 +86,4 @@ After audit exits, run `sudo env PYTHONDONTWRITEBYTECODE=1 "$R/.venv/bin/python"
 
 All eight fresh pilot gates independently reviewed and accepted; exact Hermes historical deltas exported or explicitly documented unavailable; successful bounded observer-failure/deadline test; deployment and full runtime identity reviewed; no unresolved important code-review findings. Owner explicitly authorizes new soak trial, not old trial repair.
 
-Set/review soak `RuntimeMaxSec=86520` before new fingerprint; no code/config changes except reviewed phase-bound setting. New soak approval requires `phase=soak`, `seconds=86400`, exact full SHA/fingerprint, all `pilot_gates` keys `1` through `8` true, real `pilot_trial_id`, and `pilot_evidence_sha256`: SHA-256 of compact sorted JSON map of trial-relative file paths to SHA-256, covering frozen complete pilot evidence. Controller verifies referenced local evidence. Approval remains separate owner act. Run PHASE=soak only after that authorization. Any runtime edit, fingerprint mismatch, cleanup gap, timestamp conflict, missing snapshot, ingestion/continuity/trading violation blocks run and review.
+Set/review soak `RuntimeMaxSec=86640` before new fingerprint; no code/config changes except reviewed phase-bound setting. New soak approval requires `phase=soak`, `seconds=86400`, exact full SHA/fingerprint, all `pilot_gates` keys `1` through `8` true, real `pilot_trial_id`, and `pilot_evidence_sha256`: SHA-256 of compact sorted JSON map of trial-relative file paths to SHA-256, covering frozen complete pilot evidence. Controller verifies referenced local evidence. Approval remains separate owner act. Run PHASE=soak only after that authorization. Any runtime edit, fingerprint mismatch, cleanup gap, timestamp conflict, missing snapshot, ingestion/continuity/trading violation blocks run and review. Value changed from `seconds+120` to `seconds+240` so independent deadline at `seconds+180` fires first; see Fix 2 in `deploy/infrastructure-trial.py`.

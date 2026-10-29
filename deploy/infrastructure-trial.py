@@ -157,14 +157,14 @@ def verify_pilot(approval, evidence_root):
         launch = json.loads((folder / 'launch.json').read_text())
         result = json.loads((folder / 'result.json').read_text())
         restart = json.loads((folder / 'restart-verification.json').read_text())
-        if (launch['trial_id'] != trial_id or launch['phase'] != 'pilot' or launch['seconds'] != 180
+        if (launch['trial_id'] != trial_id or launch['phase'] != 'pilot' or launch['seconds'] != 1100
                 or launch['units'] != owned(trial_id) or not result['continuous']
-                or result['window_seconds'] != 180 or result['elapsed_seconds'] < 180
+                or result['window_seconds'] != 1100 or result['elapsed_seconds'] < 1100
                 or result['run_id'] != restart['continuous_run_id']
                 or result['run_id'] == restart['first_run_id'] or result['ingestion']['count'] <= 0):
             raise ValueError('pilot trial/run metadata mismatch')
         samples = [json.loads(line) for line in (folder / 'samples.jsonl').read_text().splitlines()]
-        if len(samples) < 18 or len(samples) != result['samples'] or any(s['run_id'] != result['run_id'] for s in samples):
+        if len(samples) < 110 or len(samples) != result['samples'] or any(s['run_id'] != result['run_id'] for s in samples):
             raise ValueError('pilot samples incomplete')
         before = None
         for label in ('before', 'after', 'deadline'):
@@ -178,6 +178,21 @@ def verify_pilot(approval, evidence_root):
             read_host(stream, None, json.loads((folder / 'host.json').read_text())['wall'])
     except (OSError, KeyError) as exc:
         raise ValueError('pilot evidence unavailable') from exc
+
+
+def _stale_branch(counts, wall, elapsed):
+    if elapsed > 30:
+        if counts['count'] <= 0:
+            return 'zero_count'
+        if counts['last_received_us'] is None:
+            return 'missing_timestamp'
+        age = wall - counts['last_received_us'] / 1e6
+        if age < 0:
+            return 'future_timestamp'
+        if age > 30:
+            return 'age_exceeds_30'
+        return 'age_in_bounds_check_failed'
+    return 'not_checked'
 
 
 def require_ingestion_progress(counts, wall, elapsed):
@@ -480,7 +495,7 @@ def audit(folder):
 
 def launch(phase, approval_path, reset_stop=False):
     import fcntl
-    seconds = {'pilot': 180, 'soak': 86400}[phase]
+    seconds = {'pilot': 1100, 'soak': 86400}[phase]
     # Approval validation precedes even directory creation or lock acquisition.
     identity, approval = check_approval(approval_path, phase, seconds)
     env = environment()
@@ -491,7 +506,7 @@ def launch(phase, approval_path, reset_stop=False):
     state = properties(UNIT)
     if state['ActiveState'] != 'inactive' or not quiescent(state, cgroup_pids(state['ControlGroup'])):
         raise ValueError('infrastructure service not stopped')
-    if state['Restart'] != 'no' or runtime_bound() != (seconds + 120) * 1_000_000:
+    if state['Restart'] != 'no' or runtime_bound() != (seconds + 240) * 1_000_000:
         raise ValueError('install reviewed phase-specific RuntimeMaxSec and Restart=no first')
     # Installer creates root-controlled parent; never accept service-writable ancestry.
     secure_bytes(STATE / 'controller-owner')
@@ -543,7 +558,7 @@ def launch(phase, approval_path, reset_stop=False):
             if not reset_stop:
                 raise ValueError('infrastructure STOP present; explicit --reset-stop required')
             stop.unlink()
-        command('systemd-run', '--unit=' + units[1], *common, '--property=RuntimeMaxSec=' + str(seconds + 120),
+        command('systemd-run', '--unit=' + units[1], *common, '--property=RuntimeMaxSec=' + str(seconds + 240),
                 sys.executable, script, 'observe', '--folder', str(folder))
     except BaseException as exc:
         errors, evidence = stop_units([UNIT, units[0], units[1]])
@@ -612,6 +627,7 @@ def observe(folder, reset_stop=False):
         write_json(folder / 'restart-verification.json', {'trial_id': data['trial_id'], 'at': timestamps(time.time()),
                    'first': first, 'first_run_id': first_run_id, 'stopped': stopped,
                    'second': initial, 'continuous_run_id': run_id, 'errors': []})
+        started = True
         baseline = time.monotonic()
         result['service_started_at'] = timestamps(time.time())
         result['window_seconds'] = data['seconds']
@@ -664,6 +680,15 @@ def observe(folder, reset_stop=False):
             raise ValueError('insufficient samples or trial ingestion')
     except BaseException as exc:
         errors.append(type(exc).__name__ + ': ' + str(exc))
+        if str(exc) == 'trial ingestion stale':
+            result['stale_ingestion_diagnostics'] = {
+                'count': counts['count'],
+                'last_received_us': counts['last_received_us'],
+                'wall_time': wall,
+                'computed_age_seconds': wall - counts['last_received_us'] / 1e6,
+                'run_id': run_id,
+                'failed_branch': _stale_branch(counts, wall, mono - baseline),
+            }
     finally:
         if host_stream is not None:
             host_stream.close()
