@@ -67,7 +67,7 @@ Do not use untracked helper scripts. Do not edit runtime code on VPS. Do not run
 | Runtime backstop | `A+2040`, never disabled |
 | Nominal deadline/runtime gap | `180-L`; require at least 60 seconds, hence `0<=L<=120` |
 | Timer admission | at least 60 seconds remain until intended expiry before and after readback |
-| Heartbeat lifetime | absolute monotonic `T+2280` (`360+1800+120`), finite helper runtime 2280 |
+| Heartbeat lifetime | required absolute monotonic `T+2280` (`360+1800+120`), finite helper runtime 2340 from helper activation (60-second exit margin) |
 | Observer runtime ceiling | 2280 seconds from its activation; deadline independently stops it |
 | Independent final audit | absolute monotonic `T+2640` (`360+1800+60+420`), runtime600 |
 
@@ -99,6 +99,38 @@ After audit exits, run `sudo env PYTHONDONTWRITEBYTECODE=1 "$R/.venv/bin/python"
 6. Full native host JSONL starts sequence 1, consecutive samples, one boot/session, no suspend/clock/gap flags. Guest continuity only, not hypervisor power evidence.
 7. No new/changed orders, positions, settlements, decisions or equity; history retained.
 8. Pretrial independent approval matches source-controlled deployed artifacts/config/effective unit and final fingerprint. No retrospective approval of modified historical runtime.
+
+## Heartbeat timeout remediation (2026-10-30)
+
+Failed pilot `pilot-20261030T092719Z` remains **FAIL**: reported 1800-second observation passed, but heartbeat covered only 2278.821 seconds of required launch-relative 2280 seconds; systemd recorded `Result=timeout`, signal 15. Independent audit and post-exit cleanup were BLOCKED. Historical evidence is not changed or retroactively accepted.
+
+Heartbeat previously had the same numeric runtime ceiling as its required coverage duration. Its five-second loop must sample at/after monotonic expiry, append the terminal record and exit; a hard limit at that boundary can terminate it first. Only heartbeat `RuntimeMaxSec` gains a bounded 60-second margin for sampling, startup and terminal work. Required expiry stays `launch + 360 + seconds + 120`; main runtime, observer runtime, observation duration and all eight gates stay unchanged. This margin is not a scheduler guarantee: delayed sampling, incomplete coverage, timeout, SIGTERM, failed helper exits or late/missing independent deadline evidence still block acceptance.
+
+| Configuration | Required coverage from launch | Heartbeat hard limit from helper activation | Main hard limit from main activation |
+|---|---|---|---|
+| Pilot (1800 seconds) | 2280 seconds | 2340 seconds | 2040 seconds |
+| Soak (86400 seconds) | 86880 seconds | 86940 seconds | 86640 seconds |
+
+Local command-boundary regressions cover both configurations; a controlled-clock execution of the real Bash loop covers five-second sampling across expiry and clean terminal exit. These checks are not VPS runtime acceptance or proof of independent deadline effectiveness under observer failure. That still requires a separately authorized bounded runtime test against an active main service, not inference from an already-stopped service. Follow Hermes redeployment steps above using the new published full SHA, then obtain fresh exact-SHA/fingerprint owner pilot approval. Previous approvals cannot authorize this release. No deployment or new trial is authorized by this change.
+
+### Publication verification and known test limitations
+
+Publication authorized with baseline platform errors and incomplete full-suite verification explicitly disclosed. Focused heartbeat/infrastructure suites: **122 PASS**. Linux MVP regressions: **159 tests OK, one skipped**. Python source parsing and deploy Bash syntax checks: **PASS**. Fresh independent Superpowers reviewer: **ACCEPT**, no Critical, Important or Minor findings; verdict covers final source and targeted test changes. No unrelated Windows tests repaired.
+
+Full test suite **did not complete successfully**. Harness reported timeouts; the retained verbose log later recorded completion after 2444.360 seconds: **1337 tests, six failures, six errors, 29 skipped**. Four pre-existing WSL errors reproduce on unchanged base `e737b6ac810d1da39440a9c4f4e38878a5c8515f`. All raise `OSError: windows_job_required`:
+
+- `tests.test_live_guard_races.BlockedTransportDeadlineTests.test_real_job_kills_child_while_stop_waits_on_blocked_transport`
+- `tests.test_live_guard_races.StartupRaceTests.test_delayed_assignment_after_child_waits_then_go_succeeds`
+- `tests.test_live_guard_races.StartupRaceTests.test_premature_go_existing_but_unassigned_job_refuses`
+- `tests.test_live_guard_races.StartupRaceTests.test_supervisor_delays_assignment_until_actual_child_waits`
+
+Additional full-suite limitations, outside heartbeat changes:
+
+- `tests.test_cp57_arm_serialization_audit.ArmSerializationAuditTests.test_retained_numeric_event_reaches_actual_arm_before_publication`: missing retained SQLite evidence `data/cp5_6c_replacement_20261017_0351adeb-6594-492e-9237-adf7d833dba0.sqlite3`; reproduces in archived base environment.
+- Six `tests.test_recorder_live_clob.LiveClobTests` failures in `setUp`: retained response hashes differ from expected hashes. Base Git fixture bytes equal worktree bytes; all six failures reproduce on base: `test_c_alias_does_not_override_gamma_identity`, `test_c_alias_preserves_token_and_outcome_rejection`, `test_captured_responses_acquire_selected_revision`, `test_each_alias_and_matching_combinations_accepted`, `test_malformed_or_conflicting_alias_never_hidden_by_matching_alias`, `test_missing_condition_alias_rejected`.
+- `tests.test_read_only_boundary.ReadOnlyBoundaryTests.test_offline_suite_blocks_network`: full run received `ConnectionRefusedError` instead of expected offline guard assertion. Isolated base run passes; full-suite interaction cause not established. Test and boundary sources are unchanged; no claim that this full-suite interaction was reproduced on base.
+
+Those tests, fixtures and their production code are unchanged. Publication is not a claim of a green full suite. Previous pilot remains **FAIL**; new VPS deployment, fresh exact-code/fingerprint approval and pilot acceptance remain pending. No VPS, deployment, approval creation, trial or trading operations performed during this remediation.
 
 ## Conditions for repeating 24-hour soak
 

@@ -321,6 +321,34 @@ class TestFDeadlineNeverStopsHeartbeat(unittest.TestCase):
             persisted = json.loads((folder / 'deadline-stop.json').read_text())
             self.assertNotIn(heartbeat, [item['unit'] for item in persisted['units']])
 
+    def test_deadline_stops_active_main_without_observer_shutdown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            write_observer_artifacts(folder)
+            (folder / 'shutdown.json').unlink()
+            (folder / 'shutdown-pre.json').unlink()
+            stopped = []
+            def stopping(units):
+                stopped.extend(units)
+                return helper_evidence(units)
+            with patch.object(n, 'trial_metadata', return_value=trial_data()), \
+                 patch.object(n, 'monotonic_now', side_effect=[2066., 2066.1, 2067.]), \
+                 patch.object(n, 'secure_bytes', side_effect=lambda p: p.read_bytes()), \
+                 patch.object(n, 'unit_evidence', return_value=pre_unit()), \
+                 patch.object(n, 'cgroup_pids', return_value=[]), \
+                 patch.object(n, 'stop_units', side_effect=stopping), \
+                 patch.object(n.subprocess, 'run', return_value=None):
+                self.assertEqual(n.deadline(folder), 0)
+            self.assertEqual(stopped[0], n.UNIT)
+            self.assertNotIn(trial_data()['units'][0], stopped)
+            proof = json.loads((folder / 'shutdown.json').read_text())
+            self.assertEqual(proof['pre_states'][0]['properties']['ActiveState'], 'active')
+            self.assertEqual(proof['pre_states'][0]['properties']['InvocationID'], 'inv')
+            self.assertEqual(proof['errors'], [])
+            self.assertEqual(proof['stop_request_mono'], 2066.1)
+            self.assertEqual(proof['quiescence_mono'], 2067.)
+            self.assertEqual(json.loads((folder / 'deadline-stop.json').read_text())['shutdown'], proof)
+
     def test_deadline_reuses_observer_shutdown_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory)
@@ -404,6 +432,49 @@ class TestIAuditEvaluatesAllHelpers(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertTrue(any('terminal helper result unavailable' in e for e in report['errors']))
 
+    def test_timeout_with_full_coverage_still_blocks_audit_and_post_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            full_audit_folder(folder)
+            data = trial_data()
+            heartbeat = data['units'][0]
+            def timed_out(units):
+                return helper_evidence(units, override=lambda u, s:
+                    dict(s, ActiveState='failed', Result='timeout', ExecMainCode='2',
+                         ExecMainStatus='15') if u == heartbeat else s)
+            before = timed_out([heartbeat])[1][0]
+            code, report = run_audit(folder, stopping=timed_out, heartbeat_before=before)
+            self.assertEqual(code, 1)
+            self.assertEqual(report['verdict'], 'BLOCKED')
+            self.assertIn('heartbeat did not self-terminate successfully before audit', report['errors'])
+            self.assertIsNone(n.heartbeat_coverage_error(folder, data))
+            with patch.object(n, 'trial_metadata', return_value=data), \
+                 patch.object(n, 'unit_evidence', side_effect=lambda u: timed_out([u])[1][0]), \
+                 patch.object(n, 'command', return_value=''):
+                inspected = n.inspect_cleanup(folder)
+            self.assertEqual(inspected['verdict'], 'BLOCKED')
+            self.assertTrue(any('terminal helper' in e for e in inspected['errors']))
+
+    def test_missing_deadline_blocks_even_with_stopped_main(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            full_audit_folder(folder)
+            (folder / 'deadline.json').unlink()
+            code, report = run_audit(folder)
+            self.assertEqual(code, 1)
+            self.assertIn('independent deadline evidence missing', report['errors'])
+
+    def test_late_deadline_blocks_even_with_stopped_main(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            full_audit_folder(folder)
+            proof = json.loads((folder / 'deadline-stop.json').read_text())
+            proof['trigger_mono'] = 2096.  # Deadline 2065 + 31, outside accepted window.
+            (folder / 'deadline-stop.json').write_text(json.dumps(proof))
+            code, report = run_audit(folder)
+            self.assertEqual(code, 1)
+            self.assertIn('deadline trigger outside accepted 30-second window', report['errors'])
+
     def test_failed_deadline_blocks(self):
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory)
@@ -463,8 +534,61 @@ class TestJHistoricalRegressionFixture(unittest.TestCase):
             self.assertEqual(code, 0, report['errors'])
 
 
+def terminal_heartbeat(expiry):
+    """Run real Bash loop across expiry, with 0.1s command cost and real 5s cadence."""
+    import os
+    import sys
+    with tempfile.TemporaryDirectory() as directory:
+        folder = Path(directory)
+        clock = folder / 'clock'
+        clock.write_text(str(expiry - 1.179))
+        python = folder / 'python3'
+        python.write_text(f'#!{Path(sys.executable).resolve()}\n' + '''import os, sys, time
+from pathlib import Path
+clock = Path(os.environ['TEST_CLOCK'])
+now = float(clock.read_text())
+clock.write_text(str(now + .1))
+time.time = lambda: now
+time.clock_gettime = lambda clock_id: now
+code = sys.argv[2]
+sys.argv = ['-c', *sys.argv[3:]]
+exec(compile(code, '<heartbeat-clock>', 'exec'))
+''')
+        sleep = folder / 'sleep'
+        sleep.write_text(f'#!{Path(sys.executable).resolve()}\n' + '''import os, sys
+from pathlib import Path
+assert sys.argv[1:] == ['5'], 'normal heartbeat sampling must remain five seconds'
+clock = Path(os.environ['TEST_CLOCK'])
+clock.write_text(str(float(clock.read_text()) + 5))
+''')
+        python.chmod(0o755)
+        sleep.chmod(0o755)
+        output = folder / 'host.json'
+        result = subprocess.run(['bash', str(ROOT / 'deploy/infrastructure-host-heartbeat.sh'),
+                                 str(output), str(expiry)], capture_output=True, text=True, timeout=30,
+                                env=dict(os.environ, PATH=str(folder) + ':' + os.environ['PATH'],
+                                         TEST_CLOCK=str(clock)))
+        if result.returncode:
+            raise AssertionError(result.stderr)
+        records = [json.loads(line) for line in Path(str(output) + '.jsonl').read_text().splitlines()]
+        assert json.loads(output.read_text()) == records[-1]
+        return records, float(clock.read_text())
+
+
 class TestHeartbeatScriptTerminalPath(unittest.TestCase):
     """FIX 2 point 3: controlled, bounded terminal path after required coverage."""
+
+    def test_five_second_sampling_crosses_expiry_and_exits_before_hard_limit(self):
+        for expiry, hard_limit in ((2280, 2340), (86880, 86940)):
+            with self.subTest(expiry=expiry):
+                records, exited = terminal_heartbeat(expiry)
+                self.assertEqual(len(records), 2)
+                self.assertLess(records[0]['mono'], expiry)
+                self.assertGreaterEqual(records[-1]['mono'], expiry)
+                self.assertLessEqual(records[-1]['mono'], expiry + 20)
+                self.assertGreater(exited, records[-1]['mono'])
+                self.assertLess(exited, hard_limit)
+                self.assertEqual(n.host_error(records[0], records[1], records[1]['wall']), '')
 
     def test_heartbeat_terminates_after_required_coverage(self):
         with tempfile.TemporaryDirectory() as directory:

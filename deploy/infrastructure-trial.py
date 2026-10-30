@@ -35,6 +35,7 @@ MIN_STOP_WINDOW = 60          # Useful nominal stop window; actual shutdown proo
 AUDIT_AFTER_SECONDS = 600      # Independent audit timer fires at seconds + 600.
 RUNTIME_MAX_PADDING = 240      # Service RuntimeMaxSec = seconds + 240 (fail-safe after deadline).
 HOST_LIVENESS_SECONDS = 60     # Host heartbeat liveness window = seconds + 60.
+HEARTBEAT_EXIT_MARGIN = 60     # Hard-limit headroom for sampling and clean exit after required expiry.
 STALE_AGE_LIMIT = 30           # Ingestion heartbeat considered stale after this many seconds.
 SAMPLE_INTERVAL_DIVISOR = 10   # Minimum samples = seconds // 10.
 
@@ -712,7 +713,7 @@ def deadline(folder):
         proof = {'errors': errors.copy(), 'units': main_evidence}
         timing = {}
     # Heartbeat helper (units[0]) keeps its full required lifetime (expiry =
-    # launch + startup + seconds + 120, mirrored in helper RuntimeMaxSec):
+    # launch + startup + seconds + 120; helper RuntimeMaxSec adds exit margin):
     # it self-terminates at coverage; stopping it here would truncate host
     # continuity before T+seconds+120 and fail host continuity evidence.
     stop_errors, evidence = stop_units([data['units'][1], data['units'][2],
@@ -908,7 +909,7 @@ def launch(phase, approval_path, reset_stop=False):
         audit_timer = arm_timer(data, units[4], data['audit_expiry_mono'], 'audit', folder, runtime=600)
         startup_timer = arm_timer(data, units[6], data['startup_expiry_mono'], 'startup-timeout', folder)
         write_json(folder / 'startup-timers.json', {'fingerprint': identity, 'audit': audit_timer, 'startup': startup_timer})
-        command('systemd-run', '--unit=' + units[0], *common, '--property=RuntimeMaxSec=' + str(STARTUP_SECONDS + seconds + 120),
+        command('systemd-run', '--unit=' + units[0], *common, '--property=RuntimeMaxSec=' + str(STARTUP_SECONDS + seconds + 120 + HEARTBEAT_EXIT_MARGIN),
                 '--setenv=PATH=' + str(ROOT / '.venv/bin') + ':/usr/bin:/bin',
                 '/bin/bash', str(ROOT / 'deploy/infrastructure-host-heartbeat.sh'), str(folder / 'host.json'), str(data['heartbeat_expiry_mono']))
         until = time.monotonic() + 10

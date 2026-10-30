@@ -184,6 +184,12 @@ class NativeEvidenceRegressions(unittest.TestCase):
         self.assertEqual(stream.tell(), position)
 
     def test_launch_submits_native_jobs_with_exact_owned_names(self):
+        for phase, seconds, expiry, hard_limit in (
+                ('pilot', 1800, 2280, 2340), ('soak', 86400, 86880, 86940)):
+            with self.subTest(phase=phase):
+                self.check_launch_timing(phase, seconds, expiry, hard_limit)
+
+    def check_launch_timing(self, phase, seconds, expiry, hard_limit):
         from unittest.mock import patch
         import os
         with tempfile.TemporaryDirectory() as directory:
@@ -200,19 +206,22 @@ class NativeEvidenceRegressions(unittest.TestCase):
                 return ''
             def props(unit):
                 return dict(state, ActiveState='active') if unit.endswith('.timer') else state
-            with patch.object(self.native, 'secure_bytes', return_value=b''), patch.object(self.native, 'STATE', state_dir), patch.object(self.native, 'EVIDENCE', evidence_dir), patch.object(self.native, 'check_approval', return_value=('hash', {'git_sha': 'a' * 40})), patch.object(self.native, 'environment', return_value={'MVP_STATE_DIR': str(state_dir)}), patch.object(self.native, 'properties', side_effect=props), patch.object(self.native, 'runtime_bound', return_value=2040000000), patch.object(self.native, 'require_service_policy'), patch.object(self.native, 'command', side_effect=run), patch.object(self.native, 'arm_timer', return_value={}) as timers:
-                self.assertEqual(self.native.launch('pilot', approval_path), 0)
+            with patch.object(self.native, 'secure_bytes', return_value=b''), patch.object(self.native, 'STATE', state_dir), patch.object(self.native, 'EVIDENCE', evidence_dir), patch.object(self.native, 'check_approval', return_value=('hash', {'git_sha': 'a' * 40})), patch.object(self.native, 'environment', return_value={'MVP_STATE_DIR': str(state_dir)}), patch.object(self.native, 'properties', side_effect=props), patch.object(self.native, 'runtime_bound', return_value=(seconds + 240) * 1000000), patch.object(self.native, 'require_service_policy'), patch.object(self.native, 'command', side_effect=run), patch.object(self.native, 'arm_timer', return_value={}) as timers:
+                self.assertEqual(self.native.launch(phase, approval_path), 0)
             data = json.loads((next(evidence_dir.iterdir()) / 'launch.json').read_text())
             self.assertEqual([c[1] for c in commands], ['--unit=' + data['units'][0], '--unit=' + data['units'][1]])
             self.assertEqual([c.args[1] for c in timers.call_args_list], [data['units'][4], data['units'][6]])
             for call in commands:
                 self.assertIn('--property=RemainAfterExit=no', call)
                 self.assertNotIn('--remain-after-exit=no', call)
-            self.assertEqual(data['seconds'], 1800)
-            self.assertEqual(data['deadline_after_seconds'], 1860)
-            self.assertAlmostEqual(data['audit_expiry_mono'] - data['launch_mono'], 2640)
-            for call in commands:
-                self.assertIn('--property=RuntimeMaxSec=2280', call)
+            self.assertEqual(data['seconds'], seconds)
+            self.assertEqual(data['deadline_after_seconds'], seconds + 60)
+            self.assertAlmostEqual(data['audit_expiry_mono'] - data['launch_mono'], seconds + 840)
+            self.assertAlmostEqual(data['heartbeat_expiry_mono'] - data['launch_mono'], expiry)
+            self.assertEqual(float(commands[0][-1]), data['heartbeat_expiry_mono'])
+            self.assertIn('--property=RuntimeMaxSec=' + str(hard_limit), commands[0])
+            self.assertIn('--property=RuntimeMaxSec=' + str(expiry), commands[1])
+            self.assertFalse(any(c[:2] == ('systemctl', 'set-property') for c in commands))
 
     def test_launch_failure_retains_independent_audit_and_watchdog(self):
         from unittest.mock import patch
@@ -230,6 +239,42 @@ class NativeEvidenceRegressions(unittest.TestCase):
                     self.native.launch('pilot', approval_path)
             self.assertFalse(any(u.endswith('.timer') for u in stopped))
             self.assertIn(self.native.UNIT, stopped)
+
+    def test_observer_submission_failure_preserves_cleanup_failure_and_audit(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            evidence = root / 'evidence'
+            state = dict(ActiveState='inactive', SubState='dead', MainPID='0',
+                         ControlPID='0', ControlGroup='', Restart='no')
+            def submit(*args, **kwargs):
+                if 'infrastructure-host-heartbeat.sh' in ' '.join(args):
+                    (next(evidence.iterdir()) / 'host.json').write_text('{}')
+                    return ''
+                raise RuntimeError('observer submission failed')
+            with patch.object(self.native, 'STATE', root), \
+                 patch.object(self.native, 'EVIDENCE', evidence), \
+                 patch.object(self.native, 'secure_bytes', return_value=b''), \
+                 patch.object(self.native, 'check_approval', return_value=('hash', {'git_sha': 'a' * 40})), \
+                 patch.object(self.native, 'environment', return_value={'MVP_STATE_DIR': str(root)}), \
+                 patch.object(self.native, 'properties', return_value=state), \
+                 patch.object(self.native, 'runtime_bound', return_value=2040000000), \
+                 patch.object(self.native, 'require_service_policy'), \
+                 patch.object(self.native, 'arm_timer', return_value={}) as timers, \
+                 patch.object(self.native, 'command', side_effect=submit), \
+                 patch.object(self.native, 'stop_units', return_value=(['heartbeat stop failed'], [])) as stop, \
+                 redirect_stdout(StringIO()):
+                with self.assertRaisesRegex(RuntimeError, 'observer submission failed'):
+                    self.native.launch('pilot', root / 'approval.json')
+            folder = next(evidence.iterdir())
+            data = json.loads((folder / 'launch.json').read_text())
+            self.assertEqual(stop.call_args.args[0], [self.native.UNIT, *data['units'][:2]])
+            self.assertEqual([c.args[1] for c in timers.call_args_list], [data['units'][4], data['units'][6]])
+            report = json.loads((folder / 'launch-error.json').read_text())
+            self.assertEqual(report['error'], 'observer submission failed')
+            self.assertEqual(report['cleanup_errors'], ['heartbeat stop failed'])
 
     def test_timer_without_service_pid_properties_is_quiescent(self):
         from unittest.mock import patch
