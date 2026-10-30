@@ -160,34 +160,58 @@ class LifecycleTests(TimingTests):
     def test_main_shutdown_requires_inactive_no_timeout_no_pids_before_runtime(self):
         self.assertTrue(hasattr(n, 'stop_main'), 'observed shutdown proof missing')
         timing, _ = self.schedule()
-        state = dict(self.service, ActiveState='inactive', MainPID='0', ControlPID='0', SubState='dead')
+        pre = {'unit': n.UNIT, 'properties': dict(self.service, ActiveState='active'), 'pids': ['123']}
+        state = dict(self.service, ActiveState='inactive', MainPID='0', ControlPID='0', SubState='dead', InvocationID='')
         evidence = [{'unit': n.UNIT, 'properties': state, 'pids': []}]
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory)
-            with patch.object(n, 'boot_id', return_value='boot'), patch.object(n.time, 'monotonic', return_value=2010), patch.object(n.time, 'clock_gettime', return_value=2010), patch.object(n, 'stop_units', return_value=([], evidence)):
-                proof = n.stop_main(folder, self.data, timing)
+            restart = dict(trial_id=self.data['trial_id'], errors=[], first_run_id='first',
+                           continuous_run_id='run', second=self.service)
+            (folder / 'restart-verification.json').write_text(json.dumps(restart))
+            base_timing = timing
+            with patch.object(n, 'secure_bytes', side_effect=lambda p: p.read_bytes()), patch.object(n, 'boot_id', return_value='boot'), patch.object(n, 'unit_evidence', return_value=pre), patch.object(n.time, 'monotonic', side_effect=[2005, 2007]), patch.object(n.time, 'clock_gettime', side_effect=[2005, 2007]), patch.object(n, 'stop_units', return_value=([], evidence)):
+                proof = n.stop_main(folder, self.data, base_timing)
                 self.assertEqual(proof['errors'], [])
-                self.assertEqual(proof['quiescence_mono'], 2010)
-            for change in ('timeout', 'pids', 'late', 'active', 'invocation'):
+                self.assertEqual(proof['quiescence_mono'], 2007)
+                self.assertEqual(proof['pre_states'][0]['properties']['InvocationID'], 'inv')
+                self.assertEqual((folder / 'shutdown.json').exists(), True)
+            for change in ('timeout', 'pids', 'late', 'active', 'missing-pre', 'mismatched-pre', 'empty-timing', 'post-invocation'):
+                folder = Path(directory) / change
+                folder.mkdir()
+                (folder / 'restart-verification.json').write_text(json.dumps(restart))
                 bad = copy.deepcopy(evidence)
+                current_timing = copy.deepcopy(base_timing)
+                current_pre = copy.deepcopy(pre)
                 now = 2010
                 if change == 'timeout': bad[0]['properties']['Result'] = 'timeout'
                 if change == 'pids': bad[0]['pids'] = [9]
-                if change == 'late': now = timing['runtime_expiry_mono']
+                if change == 'late': now = base_timing['runtime_expiry_mono']
                 if change == 'active': bad[0]['properties']['ActiveState'] = 'active'
-                if change == 'invocation': bad[0]['properties']['InvocationID'] = 'other'
-                with self.subTest(change=change), patch.object(n, 'boot_id', return_value='boot'), patch.object(n.time, 'monotonic', return_value=now), patch.object(n.time, 'clock_gettime', return_value=now), patch.object(n, 'stop_units', return_value=([], bad)):
-                    self.assertTrue(n.stop_main(folder, self.data, timing)['errors'])
+                if change == 'missing-pre':
+                    current_pre['properties'].update(ActiveState='inactive', InvocationID='')
+                if change == 'mismatched-pre':
+                    current_pre['properties'].update(InvocationID='other')
+                if change == 'empty-timing': current_timing['invocation_id'] = ''
+                if change == 'post-invocation': bad[0]['properties']['InvocationID'] = 'other'
+                with self.subTest(change=change), patch.object(n, 'secure_bytes', side_effect=lambda p: p.read_bytes()), patch.object(n, 'boot_id', return_value='boot'), patch.object(n, 'unit_evidence', return_value=current_pre), patch.object(n.time, 'monotonic', side_effect=[2005, now]), patch.object(n.time, 'clock_gettime', side_effect=[2005, now]), patch.object(n, 'stop_units', return_value=([], bad)):
+                    self.assertTrue(n.stop_main(folder, self.data, current_timing)['errors'])
 
     def test_late_deadline_fails_despite_valid_completed_shutdown(self):
         timing, _ = self.schedule()
         result = dict(continuous=True, observation_end_mono=2005, errors=[])
-        shutdown = dict(errors=[], quiescence_mono=2007, stop_request_mono=2006, runtime_fallback=False,
-                        units=[{'unit': n.UNIT, 'properties': dict(self.service, ActiveState='inactive', MainPID='0', ControlPID='0', SubState='dead'), 'pids': []}])
+        shutdown = dict(errors=[], quiescence_mono=2007, stop_request_mono=2006, runtime_fallback=False, boot_id='boot',
+                        pre_states=[{'unit': n.UNIT, 'properties': dict(self.service, ActiveState='active'), 'pids': []}],
+                        units=[{'unit': n.UNIT, 'properties': dict(self.service, ActiveState='inactive', MainPID='0', ControlPID='0', SubState='dead', InvocationID=''), 'pids': []}])
         for trigger, expected in ((2064.99, 1), (2065, 0), (2095, 0), (2095.01, 1), (3000, 1)):
             with self.subTest(trigger=trigger), tempfile.TemporaryDirectory() as directory:
                 folder = Path(directory)
-                values = {'timing.json': timing, 'result.json': result, 'shutdown.json': shutdown}
+                result['run_id'] = 'run'
+                shutdown['run_id'] = 'run'
+                values = {'timing.json': timing, 'result.json': result, 'shutdown.json': shutdown,
+                          'restart-verification.json': dict(trial_id=self.data['trial_id'], errors=[],
+                              first_run_id='first', continuous_run_id='run', second=self.service),
+                          'shutdown-pre.json': dict(trial_id=self.data['trial_id'], boot_id='boot',
+                              run_id='run', at_mono=2006, units=shutdown['pre_states'], errors=[])}
                 for name, value in values.items():
                     (folder / name).write_text(json.dumps(value))
                 with patch.object(n, 'trial_metadata', return_value=self.data), patch.object(n, 'monotonic_now', return_value=trigger), patch.object(n, 'secure_bytes', side_effect=lambda p: p.read_bytes()), patch.object(n, 'stop_units', return_value=([], [])), patch.object(n.subprocess, 'run', return_value=None):
@@ -220,7 +244,7 @@ class LifecycleTests(TimingTests):
                 def evidence(unit):
                     state = dict(ActiveState='inactive', SubState='dead', MainPID='0', ControlPID='0', Result='success', ExecMainStatus='0', LoadState='loaded')
                     if unit == self.data['units'][0]:
-                        state.update(ExecMainCode='2', ExecMainStatus='15')  # Intentional systemctl stop: CLD_KILLED/SIGTERM.
+                        state.update(ExecMainCode='1', ExecMainStatus='0')  # Heartbeat self-exits successfully.
                     if unit == failed:
                         state.update(ActiveState='failed', SubState='failed', Result='timeout')
                     return {'unit': unit, 'properties': state, 'pids': []}
@@ -251,8 +275,9 @@ class LifecycleTests(TimingTests):
         self.assertTrue(hasattr(n, 'validate_timing'), 'final timing validation missing')
         timing, _ = self.schedule()
         result = dict(continuous=True, observation_end_mono=timing['baseline_mono'] + 1800, errors=[])
-        shutdown = dict(errors=[], quiescence_mono=2010, stop_request_mono=2005, runtime_fallback=False,
-                        units=[{'unit': n.UNIT, 'properties': dict(self.service, ActiveState='inactive', MainPID='0', ControlPID='0', SubState='dead'), 'pids': []}])
+        shutdown = dict(errors=[], quiescence_mono=2010, stop_request_mono=2005, runtime_fallback=False, boot_id='boot',
+                        pre_states=[{'unit': n.UNIT, 'properties': dict(self.service, ActiveState='active'), 'pids': []}],
+                        units=[{'unit': n.UNIT, 'properties': dict(self.service, ActiveState='inactive', MainPID='0', ControlPID='0', SubState='dead', InvocationID=''), 'pids': []}])
         n.validate_timing(self.data, timing, result, shutdown)
         for key, val in [('observation_end_mono', timing['baseline_mono'] + 1799), ('continuous', False)]:
             with self.subTest(key=key), self.assertRaises(ValueError):

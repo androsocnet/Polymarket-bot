@@ -210,7 +210,7 @@ class NativeEvidenceRegressions(unittest.TestCase):
                 self.assertNotIn('--remain-after-exit=no', call)
             self.assertEqual(data['seconds'], 1800)
             self.assertEqual(data['deadline_after_seconds'], 1860)
-            self.assertEqual(data['audit_expiry_mono'] - data['launch_mono'], 2640)
+            self.assertAlmostEqual(data['audit_expiry_mono'] - data['launch_mono'], 2640)
             for call in commands:
                 self.assertIn('--property=RuntimeMaxSec=2280', call)
 
@@ -265,6 +265,10 @@ class NativeEvidenceRegressions(unittest.TestCase):
                 self.native.verify_pilot(approval, root)
 
     def test_soak_valid_pilot_bundle_is_bound_and_mutation_rejected(self):
+        from unittest.mock import patch
+        reader = patch.object(self.native, 'secure_bytes', side_effect=lambda p: p.read_bytes())
+        reader.start()
+        self.addCleanup(reader.stop)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             folder = root / 'pilot-20261027T000000Z'
@@ -276,23 +280,30 @@ class NativeEvidenceRegressions(unittest.TestCase):
                 'result.json': {'trial_id': folder.name, 'continuous': True, 'errors': [], 'window_seconds': 1800, 'elapsed_seconds': 1800, 'run_id': 'fresh', 'samples': 180, 'ingestion': {'count': 1}},
                 'restart-verification.json': {'errors': [], 'continuous_run_id': 'fresh', 'first_run_id': 'restart'},
             }
-            values['launch.json'].update(fingerprint='hash', boot_id='b')
+            values['launch.json'].update(fingerprint='hash', boot_id='b', launch_mono=0., heartbeat_expiry_mono=2280.)
+            values['restart-verification.json'].update(trial_id=folder.name,
+                second=dict(ActiveState='active', MainPID='2', InvocationID='inv', ActiveEnterTimestampMonotonic='95000000'))
             values['result.json']['observation_end_mono'] = 1900
             values['timing.json'] = dict(fingerprint='hash', boot_id='b', activation_mono=95, baseline_mono=100,
                                          deadline_mono=1960, runtime_expiry_mono=2135, invocation_id='inv')
-            values['shutdown.json'] = dict(errors=[], runtime_fallback=False, stop_request_mono=1901, quiescence_mono=1902,
-                units=[{'unit': self.native.UNIT, 'properties': dict(ActiveState='inactive', SubState='dead', MainPID='0', ControlPID='0', Result='success', InvocationID='inv'), 'pids': []}])
+            values['shutdown.json'] = dict(errors=[], runtime_fallback=False, stop_request_mono=1901, quiescence_mono=1902, boot_id='b',
+                pre_states=[{'unit': self.native.UNIT, 'properties': dict(ActiveState='active', MainPID='2', ControlPID='0', Result='success', InvocationID='inv'), 'pids': []}],
+                units=[{'unit': self.native.UNIT, 'properties': dict(ActiveState='inactive', SubState='dead', MainPID='0', ControlPID='0', Result='success', InvocationID=''), 'pids': []}])
+            values['shutdown.json'].update(run_id='fresh', trial_id=folder.name)
+            values['shutdown-pre.json'] = dict(trial_id=folder.name, boot_id='b', run_id='fresh',
+                at_mono=1901, units=values['shutdown.json']['pre_states'], errors=[])
             values['startup-timers.json'] = {}
             values['startup-handoff.json'] = {'errors': []}
             for name in ('cleanup.json', 'post-audit.json', 'deadline.json', 'deadline-stop.json'):
                 values[name] = {'errors': []}
-            values['deadline-stop.json']['trigger_mono'] = 1961
+            values['deadline-stop.json'].update(trigger_mono=1961, shutdown=values['shutdown.json'])
             for label in ('before', 'after', 'deadline'):
                 (folder / (label + '.sqlite')).write_bytes(b'synthetic snapshot')
                 values[label + '-db.json'] = {'integrity': 'ok', 'sha256': hashlib.sha256(b'synthetic snapshot').hexdigest(), 'trading': {}}
-            sample = dict(session='s', boot='b', sequence=1, wall=100, mono=50, boottime=60, interrupted=0)
-            values['host.json'] = sample
-            (folder / 'host.json.jsonl').write_text(json.dumps(sample) + '\n')
+            records = [dict(session='s', boot='b', sequence=i + 1, wall=100 + 5*i,
+                            mono=5*i, boottime=10 + 5*i, interrupted=0) for i in range(457)]
+            values['host.json'] = records[-1]
+            (folder / 'host.json.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in records))
             (folder / 'samples.jsonl').write_text((json.dumps({'run_id': 'fresh'}) + '\n') * 180)
             (folder / 'journal.log').write_text('synthetic journal\n')
             for name, value in values.items():
@@ -300,6 +311,23 @@ class NativeEvidenceRegressions(unittest.TestCase):
             files = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in folder.iterdir()}
             approval = {'pilot_trial_id': folder.name, 'pilot_evidence_sha256': hashlib.sha256(json.dumps(files, sort_keys=True, separators=(',', ':')).encode()).hexdigest()}
             self.native.verify_pilot(approval, root)
+            for missing in ('shutdown-pre.json', 'restart-verification.json'):
+                saved = (folder / missing).read_bytes()
+                (folder / missing).unlink()
+                mutated_files = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in folder.iterdir()}
+                mutated = dict(approval, pilot_evidence_sha256=hashlib.sha256(json.dumps(
+                    mutated_files, sort_keys=True, separators=(',', ':')).encode()).hexdigest())
+                with self.subTest(missing=missing), self.assertRaises(ValueError):
+                    self.native.verify_pilot(mutated, root)
+                (folder / missing).write_bytes(saved)
+            saved = (folder / 'host.json.jsonl').read_bytes()
+            (folder / 'host.json.jsonl').write_text(json.dumps(records[-1]) + '\n')
+            mutated_files = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in folder.iterdir()}
+            mutated = dict(approval, pilot_evidence_sha256=hashlib.sha256(json.dumps(
+                mutated_files, sort_keys=True, separators=(',', ':')).encode()).hexdigest())
+            with self.assertRaisesRegex(ValueError, 'heartbeat'):
+                self.native.verify_pilot(mutated, root)
+            (folder / 'host.json.jsonl').write_bytes(saved)
             values['deadline-stop.json']['trigger_mono'] = 3000
             (folder / 'deadline-stop.json').write_text(json.dumps(values['deadline-stop.json']))
             files['deadline-stop.json'] = hashlib.sha256((folder / 'deadline-stop.json').read_bytes()).hexdigest()
@@ -410,17 +438,18 @@ class NativeEvidenceRegressions(unittest.TestCase):
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory)
-            data = {'trial_id': 'pilot-20261027T000000Z', 'fingerprint': 'hash',
-                    'units': self.native.owned('pilot-20261027T000000Z')}
-            (folder / 'deadline.json').write_text('{"errors": []}')
+            from tests.test_phase2b_lifecycle_fixes import trial_data, full_audit_folder, helper_evidence
+            data = trial_data()
+            full_audit_folder(folder)
             stopped = []
             def stop(units):
                 stopped.extend(units)
                 return [], [{'unit': u, 'properties': {'ActiveState': 'inactive', 'SubState': 'dead', 'MainPID': '0', 'ControlPID': '0', 'Result': 'success', 'ExecMainStatus': '0'}, 'pids': []} for u in units]
-            for name in ('result.json', 'shutdown.json', 'startup-handoff.json'):
-                (folder / name).write_text('{"errors": []}')
-            (folder / 'timing.json').write_text('{"deadline_mono": 1960, "runtime_expiry_mono": 2135}')
-            (folder / 'deadline-stop.json').write_text('{"errors": [], "trigger_mono": 1961}')
+            heartbeat = helper_evidence([data['units'][0]])[1][0]
+            self.addCleanup(patch.stopall)
+            patch.object(self.native, 'unit_evidence', return_value=heartbeat).start()
+            shutdown = json.loads((folder / 'shutdown.json').read_text())
+            (folder / 'deadline-stop.json').write_text(json.dumps(dict(errors=[], trigger_mono=2066, shutdown=shutdown)))
             with patch.object(self.native, 'secure_bytes', side_effect=lambda p: p.read_bytes()), patch.object(self.native, 'validate_timing'), patch.object(self.native, 'trial_metadata', return_value=data), patch.object(self.native, 'stop_units', side_effect=stop), patch.object(self.native, 'runtime_identity', return_value=('hash', {})):
                 self.assertEqual(self.native.audit(folder), 0)
             self.assertEqual(stopped, [self.native.UNIT, *(u for u in data['units'] if u != data['units'][5])])
@@ -445,7 +474,7 @@ class NativeEvidenceRegressions(unittest.TestCase):
             def backup(*args, **kwargs):
                 self.assertTrue((folder / 'deadline-stop.json').exists())
                 raise subprocess.TimeoutExpired('snapshot', 60)
-            with patch.object(self.native, 'trial_metadata', return_value=data), patch.object(self.native, 'stop_units', return_value=([], [])), patch.object(self.native, 'monotonic_now', return_value=1961), patch.object(self.native, 'secure_bytes', return_value=b'{"deadline_mono": 1960, "runtime_expiry_mono": 2135}'), patch.object(self.native, 'stop_main', return_value={'errors': [], 'units': []}), patch.object(self.native, 'validate_timing'), patch.object(self.native.subprocess, 'run', side_effect=backup):
+            with patch.object(self.native, 'trial_metadata', return_value=data), patch.object(self.native, 'stop_units', return_value=([], [])), patch.object(self.native, 'monotonic_now', return_value=1961), patch.object(self.native, 'secure_bytes', return_value=b'{"deadline_mono": 1960, "runtime_expiry_mono": 2135}'), patch.object(self.native, 'stop_main', return_value={'errors': [], 'units': []}), patch.object(self.native, 'validate_timing'), patch.object(self.native, 'validate_shutdown_records'), patch.object(self.native.subprocess, 'run', side_effect=backup):
                 self.assertEqual(self.native.deadline(folder), 1)
             self.assertTrue((folder / 'deadline-stop.json').exists())
             self.assertIn('deadline backup', json.loads((folder / 'deadline.json').read_text())['errors'][0])
@@ -455,7 +484,7 @@ class NativeEvidenceRegressions(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory)
             data = {'trial_id': 'pilot-20261027T000000Z', 'units': self.native.owned('pilot-20261027T000000Z')}
-            with patch.object(self.native, 'trial_metadata', return_value=data), patch.object(self.native, 'stop_units', return_value=(['stop failed'], [])), patch.object(self.native, 'environment', return_value={'MVP_DB_PATH': '/unused'}), patch.object(self.native, 'monotonic_now', return_value=1961), patch.object(self.native, 'secure_bytes', return_value=b'{"deadline_mono": 1960, "runtime_expiry_mono": 2135}'), patch.object(self.native, 'stop_main', return_value={'errors': [], 'units': []}), patch.object(self.native, 'validate_timing'), patch.object(self.native.subprocess, 'run', return_value=None):
+            with patch.object(self.native, 'trial_metadata', return_value=data), patch.object(self.native, 'stop_units', return_value=(['stop failed'], [])), patch.object(self.native, 'environment', return_value={'MVP_DB_PATH': '/unused'}), patch.object(self.native, 'monotonic_now', return_value=1961), patch.object(self.native, 'secure_bytes', return_value=b'{"deadline_mono": 1960, "runtime_expiry_mono": 2135}'), patch.object(self.native, 'stop_main', return_value={'errors': [], 'units': []}), patch.object(self.native, 'validate_timing'), patch.object(self.native, 'validate_shutdown_records'), patch.object(self.native.subprocess, 'run', return_value=None):
                 self.assertEqual(self.native.deadline(folder), 1)
             self.assertEqual(json.loads((folder / 'deadline.json').read_text())['errors'], ['stop failed'])
 

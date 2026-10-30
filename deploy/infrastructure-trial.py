@@ -5,6 +5,7 @@ from contextlib import closing
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import sqlite3
@@ -161,7 +162,7 @@ def verify_pilot(approval, evidence_root):
                     'before-db.json', 'after-db.json', 'deadline-db.json',
                     'before.sqlite', 'after.sqlite', 'deadline.sqlite', 'samples.jsonl',
                     'host.json', 'host.json.jsonl', 'journal.log', 'timing.json', 'shutdown.json',
-                    'startup-timers.json', 'startup-handoff.json'}
+                    'startup-timers.json', 'startup-handoff.json', 'shutdown-pre.json'}
         if not required <= files.keys():
             raise ValueError('pilot evidence inventory incomplete')
         for name in ('result.json', 'cleanup.json', 'restart-verification.json',
@@ -183,8 +184,13 @@ def verify_pilot(approval, evidence_root):
                 or result['run_id'] == restart['first_run_id'] or result['ingestion']['count'] <= 0):
             raise ValueError('pilot trial/run metadata mismatch')
         timing = json.loads((folder / 'timing.json').read_text())
-        validate_timing(launch, timing, result, json.loads((folder / 'shutdown.json').read_text()))
-        validate_deadline(timing, json.loads((folder / 'deadline-stop.json').read_text()))
+        shutdown = json.loads((folder / 'shutdown.json').read_text())
+        validate_timing(launch, timing, result, shutdown)
+        validate_shutdown_records(folder, launch, timing, result, shutdown)
+        validate_deadline(timing, json.loads((folder / 'deadline-stop.json').read_text()), shutdown)
+        coverage_error = heartbeat_coverage_error(folder, launch)
+        if coverage_error:
+            raise ValueError(coverage_error)
         samples = [json.loads(line) for line in (folder / 'samples.jsonl').read_text().splitlines()]
         if len(samples) < PILOT_SECONDS // SAMPLE_INTERVAL_DIVISOR or len(samples) != result['samples'] or any(s['run_id'] != result['run_id'] for s in samples):
             raise ValueError('pilot samples incomplete')
@@ -539,23 +545,114 @@ def trial_metadata(folder):
     return data
 
 
+def write_once_json(path, value):
+    # Exclusive creation under shutdown lock; interrupted writes remain fail-closed.
+    with path.open('x') as output:
+        json.dump(value, output, sort_keys=True, indent=2)
+        output.flush()
+        os.fsync(output.fileno())
+    descriptor = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def validate_run_identity(folder, data, timing, result=None):
+    restart = json.loads(secure_bytes(folder / 'restart-verification.json'))
+    second = restart['second']
+    if (restart['trial_id'] != data['trial_id'] or restart['errors']
+            or not restart['continuous_run_id']
+            or restart['continuous_run_id'] == restart['first_run_id']
+            or not timing.get('invocation_id')
+            or second['ActiveState'] != 'active' or int(second['MainPID']) <= 0
+            or second['InvocationID'] != timing['invocation_id']
+            or int(second['ActiveEnterTimestampMonotonic']) / 1e6 != timing['activation_mono']
+            or (result is not None and result['run_id'] != restart['continuous_run_id'])):
+        raise ValueError('continuous service/run identity mismatch')
+    return restart['continuous_run_id']
+
+
+def validate_shutdown_records(folder, data, timing, result, shutdown):
+    run_id = validate_run_identity(folder, data, timing, result)
+    pre = json.loads(secure_bytes(folder / 'shutdown-pre.json'))
+    if (pre['units'] != shutdown['pre_states'] or pre['errors']
+            or pre['boot_id'] != data['boot_id'] or pre['trial_id'] != data['trial_id']
+            or pre['run_id'] != run_id or shutdown['run_id'] != run_id
+            or pre['at_mono'] != shutdown['stop_request_mono']):
+        raise ValueError('durable pre-stop proof mismatch')
+
+
 def stop_main(folder, data, timing):
+    import fcntl
+    with (folder / 'shutdown.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if (folder / 'shutdown.json').exists():
+            proof = json.loads(secure_bytes(folder / 'shutdown.json'))
+            # Observer may reuse deadline's proof only after independent validation.
+            validate_timing(data, timing, dict(continuous=True, errors=[],
+                observation_end_mono=timing['baseline_mono'] + data['seconds']), proof)
+            validate_shutdown_records(folder, data, timing, None, proof)
+            return proof
+        return record_main_shutdown(folder, data, timing)
+
+
+def record_main_shutdown(folder, data, timing):
     requested = monotonic_now(data)
-    errors, evidence = stop_units([UNIT])
+    errors, pre_states = [], []
+    try:
+        # Persist the ACTIVE service identity immediately before stop. A stopped unit
+        # may clear InvocationID; only the pre-stop identity proves which invocation
+        # was actually stopped (run identity bound to timing.json from restart
+        # verification). Missing, stale, mismatched or unverifiable pre-stop
+        # identity must fail even if the post-stop state looks quiescent.
+        pre_states.append(unit_evidence(UNIT))
+        pre_props = pre_states[0]['properties']
+        if (pre_states[0]['unit'] != UNIT
+                or pre_props.get('ActiveState') != 'active'
+                or not pre_props.get('InvocationID')):
+            errors.append('pre-stop active service identity unavailable')
+        elif pre_props['InvocationID'] != timing.get('invocation_id', ''):
+            errors.append('pre-stop identity mismatch against continuous-run timing proof')
+    except (OSError, subprocess.SubprocessError) as exc:
+        errors.append('pre-stop identity unavailable: ' + str(exc))
+    run_id = None
+    try:
+        run_id = validate_run_identity(folder, data, timing)
+    except Exception as exc:
+        errors.append('pre-stop run identity unavailable: ' + str(exc))
+    pre_proof = {'trial_id': data['trial_id'], 'boot_id': data['boot_id'],
+                 'at_mono': requested, 'run_id': run_id, 'units': pre_states, 'errors': errors.copy()}
+    write_once_json(folder / 'shutdown-pre.json', pre_proof)
+    stop_errors, evidence = stop_units([UNIT])
+    errors.extend(stop_errors)
+    # systemd may clear ControlGroup after stop; inspect the captured target too.
+    if pre_states and evidence:
+        group = pre_states[0]['properties'].get('ControlGroup', '')
+        evidence[0]['pids'] = sorted(set(evidence[0]['pids'] + cgroup_pids(group)))
     completed = monotonic_now(data)
     state = evidence[0]['properties'] if evidence else {}
     fallback = state.get('Result') == 'timeout'
+    post_invocation = state.get('InvocationID', '')
+    if post_invocation and post_invocation != timing.get('invocation_id', ''):
+        errors.append('post-stop invocation identity changed')
     if (not evidence or state.get('ActiveState') != 'inactive' or not quiescent(state, evidence[0]['pids'])
-            or state.get('Result') != 'success' or state.get('InvocationID') != timing['invocation_id']
+            or state.get('Result') != 'success'
             or completed >= timing['runtime_expiry_mono']):
         errors.append('shutdown not proven before runtime backstop')
     proof = {'stop_request_mono': requested, 'quiescence_mono': completed, 'runtime_fallback': fallback,
-             'units': evidence, 'errors': errors, 'boot_id': data['boot_id']}
-    write_json(folder / 'shutdown.json', proof)
+             'pre_states': pre_states, 'units': evidence, 'errors': errors, 'boot_id': data['boot_id'],
+             'trial_id': data['trial_id'], 'run_id': run_id}
+    write_once_json(folder / 'shutdown.json', proof)
     return proof
 
 
 def validate_timing(data, timing, result, shutdown):
+    values = [timing[k] for k in ('activation_mono', 'baseline_mono', 'deadline_mono', 'runtime_expiry_mono')]
+    values += [result['observation_end_mono'], shutdown['stop_request_mono'], shutdown['quiescence_mono']]
+    if (any(isinstance(value, bool) or not math.isfinite(value) for value in values)
+            or not 0 < timing['activation_mono'] <= timing['baseline_mono']):
+        raise ValueError('invalid finite activation/shutdown timing')
     if (timing['fingerprint'] != data['fingerprint'] or timing['boot_id'] != data['boot_id']
             or timing['deadline_mono'] != timing['baseline_mono'] + data['seconds'] + DEADLINE_AFTER_SECONDS
             or timing['runtime_expiry_mono'] != timing['activation_mono'] + data['seconds'] + RUNTIME_MAX_PADDING
@@ -565,17 +662,27 @@ def validate_timing(data, timing, result, shutdown):
             or not result['observation_end_mono'] <= shutdown['stop_request_mono'] <= shutdown['quiescence_mono'] < timing['runtime_expiry_mono']):
         raise ValueError('incomplete or failed observation/shutdown timing proof')
     state = shutdown['units'][0]['properties']
+    pre_state = (shutdown.get('pre_states') or [{}])[0].get('properties', {})
+    post_invocation = state.get('InvocationID', '')
     if (state['ActiveState'] != 'inactive' or state['Result'] != 'success'
-            or state['InvocationID'] != timing['invocation_id']
+            or not timing.get('invocation_id')
+            or shutdown['boot_id'] != data['boot_id']
+            or shutdown['units'][0]['unit'] != UNIT
+            or shutdown['pre_states'][0]['unit'] != UNIT
+            or pre_state.get('ActiveState') != 'active'
+            or (post_invocation and post_invocation != timing['invocation_id'])
+            or pre_state.get('InvocationID') != timing['invocation_id']
             or not quiescent(state, shutdown['units'][0]['pids'])):
         raise ValueError('shutdown state/identity proof failed')
 
 
-def validate_deadline(timing, proof):
+def validate_deadline(timing, proof, shutdown=None):
     # Acceptance limit, not a promise of Linux dispatch latency; retain nominal stop budget.
     if (proof['errors'] or not timing['deadline_mono'] <= proof['trigger_mono'] <= timing['deadline_mono'] + 30
             or proof['trigger_mono'] >= timing['runtime_expiry_mono']):
         raise ValueError('deadline trigger outside accepted 30-second window')
+    if shutdown is not None and proof.get('shutdown') != shutdown:
+        raise ValueError('deadline/canonical shutdown proof mismatch')
 
 
 def startup_timeout(folder):
@@ -604,11 +711,17 @@ def deadline(folder):
         errors.extend(stop_errors)
         proof = {'errors': errors.copy(), 'units': main_evidence}
         timing = {}
-    stop_errors, evidence = stop_units([*data['units'][:3], *data['units'][6:]])
+    # Heartbeat helper (units[0]) keeps its full required lifetime (expiry =
+    # launch + startup + seconds + 120, mirrored in helper RuntimeMaxSec):
+    # it self-terminates at coverage; stopping it here would truncate host
+    # continuity before T+seconds+120 and fail host continuity evidence.
+    stop_errors, evidence = stop_units([data['units'][1], data['units'][2],
+                                        *data['units'][6:]])
     errors.extend(stop_errors)
     try:
         result = json.loads(secure_bytes(folder / 'result.json'))
         validate_timing(data, timing, result, proof)
+        validate_shutdown_records(folder, data, timing, result, proof)
     except Exception as exc:
         errors.append(str(exc))
     write_json(folder / 'deadline-stop.json', {'at': timestamps(time.time()), 'trigger_mono': trigger,
@@ -629,7 +742,7 @@ def validate_helper_exits(data, evidence, include_audit=False):
             or main['properties'].get('Result') != 'success'
             or not quiescent(main['properties'], main['pids'])):
         raise ValueError('current main service not inactive/successful')
-    required = {data['units'][3]}
+    required = {data['units'][0], data['units'][1], data['units'][3]}
     if include_audit:
         required.add(data['units'][5])
     seen = set()
@@ -639,10 +752,8 @@ def validate_helper_exits(data, evidence, include_audit=False):
             continue
         if state.get('LoadState') == 'not-found' and unit not in required:
             continue  # Canceled/unstarted optional transient helper.
-        intentional_heartbeat_stop = (unit == data['units'][0]
-                                      and state.get('ExecMainCode') == '2' and state.get('ExecMainStatus') == '15')
         if (state.get('ActiveState') != 'inactive' or state.get('Result') != 'success'
-                or (state.get('ExecMainStatus') != '0' and not intentional_heartbeat_stop)
+                or state.get('ExecMainStatus') != '0'
                 or not quiescent(state, item['pids'])):
             raise ValueError(unit + ': successful terminal helper result unavailable')
         seen.add(unit)
@@ -672,9 +783,50 @@ def inspect_cleanup(folder):
             'errors': errors, 'verdict': 'BLOCKED' if errors else 'PENDING_REVIEW'}
 
 
+def heartbeat_coverage_error(folder, data):
+    """Validate complete append-only continuity through monotonic expiry."""
+    try:
+        required = data['heartbeat_expiry_mono']
+        expected = data['launch_mono'] + STARTUP_SECONDS + data['seconds'] + 120
+        if not math.isfinite(required) or required != expected:
+            raise ValueError('heartbeat expiry metadata mismatch')
+        previous = None
+        with (folder / 'host.json.jsonl').open() as stream:
+            for line in stream:
+                if not line.endswith('\n'):
+                    raise ValueError('heartbeat truncated record')
+                current = json.loads(line)
+                if any(isinstance(current[k], bool) or not math.isfinite(current[k])
+                       for k in ('wall', 'mono', 'boottime')):
+                    raise ValueError('heartbeat non-finite timestamp')
+                if (current['boot'] != data['boot_id'] or not current['session']
+                        or current['interrupted'] or (previous is None and
+                        (current['sequence'] != 1 or not data['launch_mono'] <= current['mono'] <= data['launch_mono'] + 15))
+                        or (previous is not None and host_error(previous, current, current['wall']))):
+                    raise ValueError('heartbeat continuity failed')
+                previous = current
+        if previous is None or not required <= previous['mono'] <= required + 20:
+            return 'heartbeat required coverage incomplete'
+    except (OSError, KeyError, TypeError, ValueError) as exc:
+        return 'heartbeat coverage invalid: ' + str(exc)
+    return None
+
+
 def audit(folder):
     data = trial_metadata(folder)
-    errors, evidence = stop_units([UNIT, *(u for u in data['units'] if u != data['units'][5])])
+    errors, heartbeat_before = [], None
+    try:
+        heartbeat_before = unit_evidence(data['units'][0])
+        state = heartbeat_before['properties']
+        if (state.get('LoadState') == 'not-found' or state.get('ActiveState') != 'inactive'
+                or state.get('Result') != 'success' or state.get('ExecMainCode') != '1'
+                or state.get('ExecMainStatus') != '0'
+                or not quiescent(state, heartbeat_before['pids'])):
+            errors.append('heartbeat did not self-terminate successfully before audit')
+    except Exception as exc:
+        errors.append('heartbeat pre-cleanup evidence unavailable: ' + str(exc))
+    stop_errors, evidence = stop_units([UNIT, *(u for u in data['units'] if u != data['units'][5])])
+    errors.extend(stop_errors)
     for item in evidence:
         if item['unit'].endswith('.timer') and item['properties']['ActiveState'] != 'inactive':
             errors.append(item['unit'] + ': timer not inactive')
@@ -690,14 +842,21 @@ def audit(folder):
         timing = json.loads(secure_bytes(folder / 'timing.json'))
         validate_timing(data, timing, json.loads(secure_bytes(folder / 'result.json')),
                         json.loads(secure_bytes(folder / 'shutdown.json')))
-        validate_deadline(timing, json.loads(secure_bytes(folder / 'deadline-stop.json')))
+        validate_deadline(timing, json.loads(secure_bytes(folder / 'deadline-stop.json')),
+                          json.loads(secure_bytes(folder / 'shutdown.json')))
+        validate_shutdown_records(folder, data, timing, json.loads(secure_bytes(folder / 'result.json')),
+                                  json.loads(secure_bytes(folder / 'shutdown.json')))
         if (folder / 'startup-stop.json').exists() or (folder / 'launch-error.json').exists():
             errors.append('startup/launch failed')
         if json.loads(secure_bytes(folder / 'startup-handoff.json'))['errors']:
             errors.append('startup handoff failed')
     except Exception as exc:
         errors.append(str(exc))
+    coverage_error = heartbeat_coverage_error(folder, data)
+    if coverage_error:
+        errors.append(coverage_error)
     write_json(folder / 'cleanup.json', {'at': timestamps(time.time()), 'units': evidence,
+                                       'heartbeat_before_cleanup': heartbeat_before,
                                        'errors': errors, 'verdict': 'BLOCKED' if errors else 'PENDING_REVIEW'})
     return 1 if errors else 0
 
