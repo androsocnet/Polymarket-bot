@@ -26,7 +26,8 @@ class TimingTests(unittest.TestCase):
                          boot_id='boot', launch_mono=100., units=n.owned('pilot-20261030T000000Z'))
         self.service = dict(ActiveState='active', MainPID='123', InvocationID='inv',
                             ActiveEnterTimestampMonotonic='200000000', RuntimeMaxUSec='34min',
-                            RuntimeRandomizedExtraUSec='0', Result='success', NRestarts='0')
+                            RuntimeRandomizedExtraUSec='0', Result='success', NRestarts='0',
+                            ControlGroup='/system.slice/polymarket-btc-infrastructure.service')
 
     def schedule(self, lag=5, mutate=None):
         now = 200. + lag
@@ -105,7 +106,7 @@ class LifecycleTests(TimingTests):
                 def sleep(seconds):
                     now[0] += seconds
                     if crash and now[0] >= 250: raise RuntimeError('observer interrupted')
-                state = dict(self.service, ControlGroup='', ControlPID='0', SubState='running')
+                state = dict(self.service, ControlGroup='/system.slice/polymarket-btc-infrastructure.service', ControlPID='0', SubState='running')
                 states = iter([dict(state, ActiveState='inactive'), dict(state, InvocationID='first')])
                 def props(unit): return next(states, state)
                 data = dict(self.data, phase='pilot', launch_at={'utc': '2026-10-30T00:00:00Z'})

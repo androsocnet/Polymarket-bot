@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ENV = Path('/etc/polymarket-btc/infrastructure.env')
 STATE = Path('/var/lib/polymarket-btc-infrastructure')
 DATA = STATE / 'data'
+CGROUP_ROOT = Path('/sys/fs/cgroup')
 EVIDENCE = STATE / 'evidence'
 TRADING = ('orders', 'positions', 'settlements', 'decisions', 'equity')
 PROPERTIES = ('LoadState,ActiveState,SubState,MainPID,ControlPID,Result,NRestarts,InvocationID,'
@@ -146,6 +147,22 @@ def runtime_bound(property_name='RuntimeMaxUSec'):
     if len(raw) != 2 or raw[0] != 't':
         raise ValueError('numeric systemd runtime bound unavailable')
     return int(raw[1])
+
+
+def invocation_cgroup_kill(cgroup: str, invocation_id: str, timing: dict) -> None:
+    """Kill all processes in `cgroup` after verifying `invocation_id` matches `timing`.
+
+    Fails closed if IDs differ. Treats absent cgroup as already-dead (safe no-op).
+    Does NOT substitute for the independent deadline timer; called before stop_units
+    to guarantee the exact pre-stop invocation is targeted even under PID reuse.
+    """
+    if invocation_id != timing.get('invocation_id', ''):
+        raise ValueError('invocation identity mismatch; refuse cgroup kill')
+    kill_path = CGROUP_ROOT / cgroup.lstrip('/') / 'cgroup.kill'
+    try:
+        kill_path.write_text('1')
+    except FileNotFoundError:
+        pass  # cgroup already removed; process already dead — safe no-op
 
 
 def verify_pilot(approval, evidence_root):
@@ -530,6 +547,9 @@ def start_observation_timing(folder, data, service):
     activation = int(service['ActiveEnterTimestampMonotonic']) / 1e6
     runtime = (data['seconds'] + RUNTIME_MAX_PADDING)
     expiry = baseline + data['seconds'] + DEADLINE_AFTER_SECONDS
+    invocation_cgroup = service.get('ControlGroup', '')
+    if not invocation_cgroup:
+        raise ValueError('activation cgroup path unavailable; cannot arm invocation-bound shutdown')
     if (activation <= 0 or activation > baseline or baseline - data['launch_mono'] >= STARTUP_SECONDS
             or runtime_bound() != runtime * 1000000
             or runtime_bound('RuntimeRandomizedExtraUSec') != 0
@@ -539,7 +559,7 @@ def start_observation_timing(folder, data, service):
     timing = {'fingerprint': data['fingerprint'], 'boot_id': data['boot_id'],
               'activation_mono': activation, 'baseline_mono': baseline, 'deadline_mono': expiry,
               'runtime_expiry_mono': activation + runtime, 'invocation_id': service['InvocationID'],
-              'timer': effective}
+              'invocation_cgroup': invocation_cgroup, 'timer': effective}
     write_json(folder / 'timing.json', timing)
     return timing
 
@@ -630,6 +650,16 @@ def record_main_shutdown(folder, data, timing):
     pre_proof = {'trial_id': data['trial_id'], 'boot_id': data['boot_id'],
                  'at_mono': requested, 'run_id': run_id, 'units': pre_states, 'errors': errors.copy()}
     write_once_json(folder / 'shutdown-pre.json', pre_proof)
+    # Invocation-bound cgroup kill: targets the exact pre-stop cgroup before stop_units,
+    # guaranteeing that a replacement invocation in a distinct cgroup is never touched.
+    # Only executes when pre-stop identity is fully verified (no errors so far).
+    if not errors:
+        try:
+            pre_cgroup = pre_states[0]['properties'].get('ControlGroup', '') if pre_states else ''
+            pre_invocation = pre_states[0]['properties'].get('InvocationID', '') if pre_states else ''
+            invocation_cgroup_kill(pre_cgroup, pre_invocation, timing)
+        except (ValueError, OSError) as exc:
+            errors.append('invocation cgroup kill: ' + str(exc))
     stop_errors, evidence = stop_units([UNIT])
     errors.extend(stop_errors)
     # systemd may clear ControlGroup after stop; inspect the captured target too.
@@ -703,6 +733,7 @@ def deadline(folder):
     data = trial_metadata(folder)
     trigger = monotonic_now(data)
     errors = []
+    timing = {}  # init before try so fallback can safely call .get()
     try:
         timing = json.loads(secure_bytes(folder / 'timing.json'))
         validate_deadline(timing, {'trigger_mono': trigger, 'errors': []})
@@ -713,10 +744,20 @@ def deadline(folder):
         errors.extend(proof['errors'])
     except Exception as exc:
         errors.append('deadline timing/shutdown evidence: ' + str(exc))
+        # Invocation-bound cgroup kill in fallback: use captured cgroup from timing if available.
+        # Fails closed on mismatch; treats absent cgroup as already-dead.
+        try:
+            invocation_cgroup_kill(
+                timing.get('invocation_cgroup', ''),
+                timing.get('invocation_id', ''),
+                timing,
+            )
+        except (ValueError, OSError, KeyError) as ckg_exc:
+            errors.append('deadline fallback cgroup kill: ' + str(ckg_exc))
         stop_errors, main_evidence = stop_units([UNIT])
         errors.extend(stop_errors)
         proof = {'errors': errors.copy(), 'units': main_evidence}
-        timing = {}
+        timing = {}  # reset timing so downstream validation uses empty dict
     # Heartbeat helper (units[0]) keeps its full required lifetime (expiry =
     # launch + startup + seconds + 120; helper RuntimeMaxSec adds exit margin):
     # it self-terminates at coverage; stopping it here would truncate host
