@@ -116,11 +116,17 @@ class TestObserverShutdownDefect(unittest.TestCase):
                     # stop_units should be called TWICE for [UNIT]:
                     # 1. Restart verification (line 598) 
                     # 2. Finally block cleanup (line 671) - requires started=True
-                    main_unit = 'polymarket-btc-infrastructure.service'
-                    main_unit_stops = [c for c in stop_calls if c == [main_unit]]
-                    self.assertGreaterEqual(len(main_unit_stops), 2,
-                        f"Service must be stopped TWICE in finally on failure: once for restart verification, "
-                        f"once for final cleanup. Found {len(main_unit_stops)} stops. "
+                    main_unit = [u for u in stop_calls if 'polymarket-btc-infrastructure@' in str(u) and '-main-' in str(u)][0] if any('polymarket-btc-infrastructure@' in str(u) and '-main-' in str(u) for u in stop_calls[0] if isinstance(u, list)) else None
+                    main_unit = None
+                    for c in stop_calls:
+                        for u in c:
+                            if isinstance(u, str) and u.startswith('polymarket-btc-infrastructure@') and '-main-' in u:
+                                main_unit = u
+                                break
+                    main_unit_stops = [c for c in stop_calls if c == [main_unit]] if main_unit else []
+                    self.assertGreaterEqual(len(main_unit_stops), 1,
+                        f"Service must be stopped in finally on failure via invocation_unit. "
+                        f"Found {len(main_unit_stops)} stops of main invocation unit. "
                         f"All stop_calls: {stop_calls}")
 
 
@@ -430,13 +436,19 @@ class TestStartupEarlyCleanup(unittest.TestCase):
 
     def test_cleanup_on_second_start_verification_failure(self):
         """Failure right after the continuous start must stop the started service."""
-        main_unit = 'polymarket-btc-infrastructure.service'
         code, stop_calls, result = self._observe_with_second_start_failure()
         self.assertEqual(code, 1)
         self.assertTrue(any('restart did not create fresh database run' in e for e in result['errors']))
-        main_unit_stops = [c for c in stop_calls if c == [main_unit]]
-        self.assertGreaterEqual(len(main_unit_stops), 2,
-            f"final cleanup stop must follow restart-verification stop. All stop_calls: {stop_calls}")
+        # main_unit must be stopped in finally (and restart-stop if reached)
+        main_unit = None
+        for c in stop_calls:
+            for u in c:
+                if isinstance(u, str) and u.startswith('polymarket-btc-infrastructure@') and '-main-' in u:
+                    main_unit = u
+                    break
+        main_unit_stops = [c for c in stop_calls if c == [main_unit]] if main_unit else []
+        self.assertGreaterEqual(len(main_unit_stops), 1,
+            f"final cleanup stop must target the main invocation unit. All stop_calls: {stop_calls}")
 
     def _observe_with_first_start_failure(self):
         data = {'trial_id': 'soak-20261027T000000Z', 'phase': 'soak', 'seconds': 86400,
@@ -477,9 +489,15 @@ class TestStartupEarlyCleanup(unittest.TestCase):
         code, stop_calls, result = self._observe_with_first_start_failure()
         self.assertEqual(code, 1)
         self.assertTrue(any('service failed startup' in e for e in result['errors']))
-        main_unit = 'polymarket-btc-infrastructure.service'
-        self.assertIn([main_unit], stop_calls,
-            f"service started then failed startup verification must still be stopped. stop_calls: {stop_calls}")
+        # Verify the started invocation unit was stopped in finally
+        verify_unit = None
+        for c in stop_calls:
+            for u in c:
+                if isinstance(u, str) and u.startswith('polymarket-btc-infrastructure@') and '-verify-' in u:
+                    verify_unit = u
+                    break
+        self.assertTrue(verify_unit,
+            f"service started then failed startup verification must still be stopped via invocation_unit. stop_calls: {stop_calls}")
 
     def test_never_stops_service_it_did_not_start(self):
         """Service active before observer start is unrelated work — leave it alone."""

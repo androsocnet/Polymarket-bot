@@ -37,7 +37,7 @@ def restart_record():
 
 
 def timing():
-    return {'fingerprint': 'hash', 'boot_id': 'boot', 'activation_mono': 200.,
+    return {'unit': n.UNIT, 'fingerprint': 'hash', 'boot_id': 'boot', 'activation_mono': 200.,
             'baseline_mono': 205., 'deadline_mono': 2065., 'runtime_expiry_mono': 2240.,
             'invocation_id': 'inv', 'invocation_cgroup': 'g'}
 
@@ -48,8 +48,8 @@ def pre_unit(invocation='inv', active=True, unit=None):
             'InvocationID': invocation, 'ControlGroup': 'g'}, 'pids': ['123']}
 
 
-def post_unit(invocation='', result='success', state='inactive', pids=()):
-    return {'unit': n.UNIT, 'properties': {'ActiveState': state,
+def post_unit(invocation='', result='success', state='inactive', pids=(), unit=None):
+    return {'unit': unit or n.UNIT, 'properties': {'ActiveState': state,
             'SubState': 'dead' if state == 'inactive' else 'running', 'MainPID': '0',
             'ControlPID': '0', 'Result': result, 'InvocationID': invocation}, 'pids': list(pids)}
 
@@ -117,13 +117,13 @@ def observe_full_window(folder):
                                          side_effect=lambda name='RuntimeMaxUSec':
                                              2040000000 if name == 'RuntimeMaxUSec' else 0))
         stack.enter_context(patch.object(n, 'arm_timer', return_value={'verified': True}))
-        stack.enter_context(patch.object(n, 'unit_evidence', return_value=pre_unit()))
+        stack.enter_context(patch.object(n, 'unit_evidence', side_effect=lambda u, *a: pre_unit(unit=u)))
         stack.enter_context(patch.object(n, 'secure_bytes', side_effect=lambda p: p.read_bytes()))
         stack.enter_context(patch.object(n, 'cgroup_pids', return_value=[]))
         stop_calls = []
         def stopping(units):
             stop_calls.append(list(units))
-            return [], [post_unit()]
+            return [], [post_unit(unit=u) for u in units]
         stack.enter_context(patch.object(n, 'stop_units', side_effect=stopping))
         code = n.observe(folder)
         result = json.loads((folder / 'result.json').read_text())

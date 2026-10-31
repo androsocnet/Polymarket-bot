@@ -220,13 +220,18 @@ class LifecycleTests(TimingTests):
                 proof = json.loads((folder / 'deadline-stop.json').read_text())
                 self.assertEqual(proof['trigger_mono'], trigger)
 
-    def test_deadline_missing_timing_still_stops_main_and_records_failure(self):
+    def test_deadline_missing_timing_fails_closed_without_unit_stop(self):
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory)
+            main_unit = n.invocation_unit(self.data['trial_id'], 'main')
             with patch.object(n, 'trial_metadata', return_value=self.data), patch.object(n, 'monotonic_now', return_value=2100), patch.object(n, 'secure_bytes', side_effect=FileNotFoundError('missing timing')), patch.object(n, 'unit_evidence', side_effect=lambda u: {'unit': u, 'properties': dict(ActiveState='inactive', SubState='dead', MainPID='0', ControlPID='0', Result='success', ExecMainCode='1', ExecMainStatus='0', LoadState='loaded'), 'pids': []}), patch.object(n, 'stop_units', return_value=([], [])) as stop, patch.object(n.subprocess, 'run', return_value=None):
                 code = n.deadline(folder)
             self.assertEqual(code, 1)
-            self.assertTrue(any(n.UNIT in c.args[0] for c in stop.call_args_list))
+            # Fail-closed: no main unit (static or invocation) should be stopped when timing is missing
+            self.assertTrue(stop.call_args_list, 'helper units still stopped')
+            stopped_units = stop.call_args.args[0] if stop.call_args else []
+            self.assertNotIn(n.UNIT, stopped_units, 'static unit must NEVER be stopped')
+            self.assertNotIn(main_unit, stopped_units, 'invocation unit must NEVER be stopped with missing timing')
             self.assertTrue(json.loads((folder / 'deadline.json').read_text())['errors'])
 
     def test_current_main_timeout_rejected_despite_historical_shutdown(self):
@@ -268,8 +273,9 @@ class LifecycleTests(TimingTests):
             folder = Path(directory)
             with patch.object(n, 'trial_metadata', return_value=self.data), patch.object(n, 'stop_units', return_value=([], [])) as stop:
                 self.assertEqual(n.startup_timeout(folder), 1)
-            self.assertIn(n.UNIT, stop.call_args.args[0])
-            self.assertIn(self.data['units'][1], stop.call_args.args[0])
+            stopped_units = stop.call_args.args[0] if stop.call_args else []
+            self.assertIn(self.data['units'][1], stopped_units)
+            self.assertIn(self.data['units'][0], stopped_units)
             self.assertTrue((folder / 'startup-stop.json').exists())
 
     def test_observation_proof_rejects_truncation_missing_end_and_failed_shutdown(self):

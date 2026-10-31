@@ -240,7 +240,10 @@ class NativeEvidenceRegressions(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'submission failed'):
                     self.native.launch('pilot', approval_path)
             self.assertFalse(any(u.endswith('.timer') for u in stopped))
-            self.assertIn(self.native.UNIT, stopped)
+            # launch error cleanup stops trial-owned heartbeat and observer units; no static UNIT.
+            self.assertEqual(len(stopped), 2)
+            self.assertTrue(all(u.startswith('infra-') for u in stopped))
+            self.assertFalse(any(u.endswith('.timer') for u in stopped))
 
     def test_observer_submission_failure_preserves_cleanup_failure_and_audit(self):
         from contextlib import redirect_stdout
@@ -272,7 +275,7 @@ class NativeEvidenceRegressions(unittest.TestCase):
                     self.native.launch('pilot', root / 'approval.json')
             folder = next(evidence.iterdir())
             data = json.loads((folder / 'launch.json').read_text())
-            self.assertEqual(stop.call_args.args[0], [self.native.UNIT, *data['units'][:2]])
+            self.assertEqual(stop.call_args.args[0], data['units'][:2])
             self.assertEqual([c.args[1] for c in timers.call_args_list], [data['units'][4], data['units'][6]])
             report = json.loads((folder / 'launch-error.json').read_text())
             self.assertEqual(report['error'], 'observer submission failed')
