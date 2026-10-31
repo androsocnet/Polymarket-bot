@@ -8,11 +8,16 @@ import json
 import math
 import os
 from pathlib import Path
+import re
+import secrets
 import sqlite3
 import subprocess
 import sys
 import time
 
+TEMPLATE_BASE = 'polymarket-btc-infrastructure'
+TEMPLATE_UNIT = f'{TEMPLATE_BASE}@.service'
+INSPECTION_UNIT = f'{TEMPLATE_BASE}@default.service'
 UNIT = 'polymarket-btc-infrastructure.service'
 ROOT = Path(__file__).resolve().parents[1]
 ENV = Path('/etc/polymarket-btc/infrastructure.env')
@@ -127,11 +132,21 @@ def wait_run(path, bot_id, started_after_us):
     raise TimeoutError('fresh service heartbeat unavailable')
 
 
-def require_service_policy():
-    policy = dict(line.split('=', 1) for line in command('systemctl', 'show', UNIT,
+def invocation_unit(trial_id: str, role: str) -> str:
+    if not re.fullmatch(r'(pilot|soak)-\d{8}T\d{6}Z', trial_id):
+        raise ValueError('invalid trial ID')
+    if role not in ('verify', 'main'):
+        raise ValueError('invalid role: ' + str(role))
+    token = secrets.token_hex(4)
+    return f'{TEMPLATE_BASE}@{trial_id}-{role}-{token}.service'
+
+
+def require_service_policy(unit=None):
+    inspection = unit or INSPECTION_UNIT
+    policy = dict(line.split('=', 1) for line in command('systemctl', 'show', inspection,
                   '--property=ExecStart,Restart,KillMode,MemoryMax,CPUQuotaPerSecUSec,TasksMax,User').splitlines())
     expected_command = str(ROOT / '.venv/bin/python') + ' -m polymarket_bot.linux_mvp ingest'
-    env_files = command('systemctl', 'show', UNIT, '--property=EnvironmentFiles', '--value').strip()
+    env_files = command('systemctl', 'show', inspection, '--property=EnvironmentFiles', '--value').strip()
     require_environment_files(env_files)
     if expected_command not in policy.get('ExecStart', ''):
         raise ValueError('effective service must use approved ingest command')
@@ -140,8 +155,9 @@ def require_service_policy():
         raise ValueError('effective service policy/limits differ')
 
 
-def runtime_bound(property_name='RuntimeMaxUSec'):
-    object_path = '/org/freedesktop/systemd1/unit/' + UNIT.replace('-', '_2d').replace('.', '_2e')
+def runtime_bound(property_name='RuntimeMaxUSec', unit=None):
+    inspection = unit or INSPECTION_UNIT
+    object_path = '/org/freedesktop/systemd1/unit/' + inspection.replace('@', '_40').replace('-', '_2d').replace('.', '_2e')
     raw = command('busctl', 'get-property', 'org.freedesktop.systemd1', object_path,
                   'org.freedesktop.systemd1.Service', property_name).split()
     if len(raw) != 2 or raw[0] != 't':
@@ -437,10 +453,10 @@ def stable_effective_unit(text):
 def runtime_identity():
     manifest = json.loads(secure_bytes(ROOT / 'runtime-manifest.json'))
     verify_host_runtime(manifest['host_python'])
-    effective = command('systemctl', 'show', UNIT, '--property=ExecStart,Environment,EnvironmentFiles,'
+    effective = command('systemctl', 'show', INSPECTION_UNIT, '--property=ExecStart,Environment,EnvironmentFiles,'
                         'User,Group,WorkingDirectory,Restart,RuntimeMaxUSec,KillMode,TimeoutStopUSec,'
                         'MemoryMax,CPUQuotaPerSecUSec,TasksMax,FragmentPath,DropInPaths')
-    identity = fingerprint(ROOT, manifest, ENV.read_bytes(), command('systemctl', 'cat', UNIT), stable_effective_unit(effective))
+    identity = fingerprint(ROOT, manifest, ENV.read_bytes(), command('systemctl', 'cat', TEMPLATE_UNIT), stable_effective_unit(effective))
     return identity, manifest
 
 
@@ -461,7 +477,7 @@ def environment():
 
 def check_approval(path, phase, seconds):
     identity, manifest = runtime_identity()
-    require_environment_files(command('systemctl', 'show', UNIT, '--property=EnvironmentFiles', '--value'))
+    require_environment_files(command('systemctl', 'show', INSPECTION_UNIT, '--property=EnvironmentFiles', '--value'))
     approval = json.loads(secure_bytes(path))
     validate_approval(approval, identity, phase, seconds, manifest['git_sha'])
     if phase == 'soak':

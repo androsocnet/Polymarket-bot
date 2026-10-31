@@ -241,5 +241,29 @@ class TestDeadlineFallbackCgroupKill(unittest.TestCase):
                         'deadline fallback must call invocation_cgroup_kill')
 
 
+class TestTemplateInvocationNaming(unittest.TestCase):
+    def test_template_unit_constants(self):
+        self.assertEqual(module.TEMPLATE_UNIT, 'polymarket-btc-infrastructure@.service')
+        self.assertEqual(module.INSPECTION_UNIT, 'polymarket-btc-infrastructure@default.service')
+
+    def test_invocation_unit_format_and_uniqueness(self):
+        trial_id = 'pilot-20261031T000000Z'
+        unit1 = module.invocation_unit(trial_id, 'verify')
+        unit2 = module.invocation_unit(trial_id, 'verify')
+        unit_main = module.invocation_unit(trial_id, 'main')
+
+        self.assertRegex(unit1, r'^polymarket-btc-infrastructure@pilot-20261031T000000Z-verify-[0-9a-f]{8}\.service$')
+        self.assertRegex(unit_main, r'^polymarket-btc-infrastructure@pilot-20261031T000000Z-main-[0-9a-f]{8}\.service$')
+        self.assertNotEqual(unit1, unit2, 'each invocation must have unique random token')
+        self.assertNotEqual(unit1, unit_main)
+
+    def test_invocation_unit_validation(self):
+        with self.assertRaises(ValueError):
+            module.invocation_unit('invalid-trial-id', 'verify')
+        with self.assertRaises(ValueError):
+            module.invocation_unit('pilot-20261031T000000Z', 'invalid_role')
+
+
 if __name__ == '__main__':
     unittest.main()
+

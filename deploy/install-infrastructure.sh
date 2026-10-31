@@ -12,13 +12,16 @@ APP_DIR="/opt/polymarket-btc-infrastructure/releases/${SHA}"
 CONF_DIR=/etc/polymarket-btc
 DATA_DIR=/var/lib/polymarket-btc-infrastructure
 SERVICE_USER=polymarket-btc
-UNIT=/etc/systemd/system/polymarket-btc-infrastructure.service
+UNIT=/etc/systemd/system/polymarket-btc-infrastructure@.service
 ENABLE=0 # No boot enablement, even on repeat install.
 if [[ "${EUID}" -ne 0 ]]; then echo 'run as root (sudo)' >&2; exit 1; fi
 command -v uv >/dev/null || { echo 'uv required for frozen hash-verified dependencies' >&2; exit 1; }
 python3 -c 'import sys; assert sys.version_info >= (3,12)'
-if systemctl is-active --quiet polymarket-btc-infrastructure.service; then
+if systemctl list-units --all --plain --no-legend 'polymarket-btc-infrastructure@*' | grep -Eq ' (active|activating|deactivating) '; then
     echo 'infrastructure service must be inactive' >&2; exit 1
+fi
+if systemctl is-active --quiet polymarket-btc-infrastructure.service; then
+    echo 'legacy static infrastructure service must be inactive' >&2; exit 1
 fi
 if systemctl list-units --all --plain --no-legend 'infra-*' | grep -Eq ' (active|activating|deactivating) '; then
     echo 'infrastructure trial jobs still active' >&2; exit 1
@@ -88,7 +91,7 @@ if [[ ! -e "${CONF_DIR}/infrastructure.env" ]]; then
 fi
 # Preserve previous effective fragment before replacing; drop-ins remain for explicit review.
 if [[ -e "${UNIT}" ]]; then cp -a "${UNIT}" "${UNIT}.pre-${SHA}-$(date -u +%Y%m%dT%H%M%SZ)"; fi
-sed "s|/opt/polymarket-btc|${APP_DIR}|g" "${APP_DIR}/deploy/polymarket-btc-infrastructure.service" > "${UNIT}"
+sed "s|/opt/polymarket-btc|${APP_DIR}|g" "${APP_DIR}/deploy/polymarket-btc-infrastructure@.service" > "${UNIT}"
 chmod 0644 "${UNIT}"
 systemctl daemon-reload
 systemd-analyze verify "${UNIT}"
