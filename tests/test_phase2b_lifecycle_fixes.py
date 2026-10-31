@@ -39,7 +39,7 @@ def restart_record():
 def timing():
     return {'fingerprint': 'hash', 'boot_id': 'boot', 'activation_mono': 200.,
             'baseline_mono': 205., 'deadline_mono': 2065., 'runtime_expiry_mono': 2240.,
-            'invocation_id': 'inv'}
+            'invocation_id': 'inv', 'invocation_cgroup': 'g'}
 
 
 def pre_unit(invocation='inv', active=True, unit=None):

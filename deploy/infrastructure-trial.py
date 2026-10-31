@@ -150,14 +150,19 @@ def runtime_bound(property_name='RuntimeMaxUSec'):
 
 
 def invocation_cgroup_kill(cgroup: str, invocation_id: str, timing: dict) -> None:
-    """Kill all processes in `cgroup` after verifying `invocation_id` matches `timing`.
+    """Kill all processes in `cgroup` after verifying both IDs and path match `timing`.
 
-    Fails closed if IDs differ. Treats absent cgroup as already-dead (safe no-op).
+    Fails closed if invocation ID or cgroup path differs from timing, or if cgroup is empty.
+    Treats absent cgroup as already-dead (safe no-op).
     Does NOT substitute for the independent deadline timer; called before stop_units
     to guarantee the exact pre-stop invocation is targeted even under PID reuse.
     """
+    if not cgroup:
+        raise ValueError('empty cgroup path; refuse cgroup kill')
     if invocation_id != timing.get('invocation_id', ''):
         raise ValueError('invocation identity mismatch; refuse cgroup kill')
+    if cgroup != timing.get('invocation_cgroup', ''):
+        raise ValueError('cgroup path mismatch against timing record; refuse cgroup kill')
     kill_path = CGROUP_ROOT / cgroup.lstrip('/') / 'cgroup.kill'
     try:
         kill_path.write_text('1')
@@ -757,7 +762,8 @@ def deadline(folder):
         stop_errors, main_evidence = stop_units([UNIT])
         errors.extend(stop_errors)
         proof = {'errors': errors.copy(), 'units': main_evidence}
-        timing = {}  # reset timing so downstream validation uses empty dict
+        # Do not reassign timing: original (possibly valid) timing used by downstream validate_timing.
+        # validate_timing will fail on the incomplete synthetic proof dict, which is correct behavior.
     # Heartbeat helper (units[0]) keeps its full required lifetime (expiry =
     # launch + startup + seconds + 120; helper RuntimeMaxSec adds exit margin):
     # it self-terminates at coverage; stopping it here would truncate host

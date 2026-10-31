@@ -91,6 +91,19 @@ class TestInvocationCgroupKill(unittest.TestCase):
         with self.assertRaises(ValueError):
             module.invocation_cgroup_kill('/system.slice/x.service', 'wrong_id', timing)
 
+    def test_kill_fails_closed_on_cgroup_path_mismatch(self):
+        # I-2: cgroup arg not matching timing['invocation_cgroup'] must raise
+        timing = {'invocation_id': 'abc',
+                  'invocation_cgroup': '/system.slice/polymarket-btc-infrastructure.service'}
+        with self.assertRaises(ValueError):
+            module.invocation_cgroup_kill('/system.slice/different.service', 'abc', timing)
+
+    def test_kill_fails_closed_on_empty_cgroup(self):
+        # m-6: empty cgroup arg must raise before any path construction
+        timing = {'invocation_id': 'abc', 'invocation_cgroup': ''}
+        with self.assertRaises(ValueError):
+            module.invocation_cgroup_kill('', 'abc', timing)
+
     def test_kill_handles_missing_cgroup_gracefully(self):
         timing = {'invocation_id': 'abc',
                   'invocation_cgroup': '/system.slice/gone.service'}
