@@ -95,8 +95,26 @@ sudo /usr/bin/python3 -I -B tests/check_transient_compat.py --disposable-only
 ## 5. Remaining Risks and Production Path
 
 1. **Production Controller Adoption**:
-   This report validates the disposable isolation mechanism. Incorporating per-invocation transient units into the production controller (`deploy/infrastructure-trial.py`) requires updating the launch mechanism to generate unique unit names (or template instances) and arming the deadline timer with the specific transient unit name.
+   The integration branch `operator/phase2b-transient-integration` (commit `3a0b12b6b1ec1bb8a954d2ccb97895d3582ba13a`) implements `invocation_cgroup_kill` into `deploy/infrastructure-trial.py`. Any VPS deployment requires a new release fingerprint and fresh normal-pilot acceptance before any observer-failure trial.
 2. **Release Fingerprint**:
-   Any changes to controller or effective service definitions will require a fresh release fingerprint and fresh normal pilot acceptance before an observer-failure trial can be executed.
+   Changes to `deploy/infrastructure-trial.py` change the controller fingerprint. Existing approvals reference prior fingerprints and will not validate against this integration.
 3. **Transient Unit GC**:
    With `RemainAfterExit=yes`, transient units stay in memory until explicitly reset. Post-trial cleanup must run `systemctl reset-failed <unit>` to prevent systemd manager memory leakage over repeated soaks.
+
+---
+
+## 6. Integration File Hashes (Post-Integration Branch)
+
+**Branch:** `operator/phase2b-transient-integration`
+**Integration commit:** `3a0b12b6b1ec1bb8a954d2ccb97895d3582ba13a`
+
+**Probe (`tests/check_transient_compat.py`) post-fix hashes:**
+- Git blob SHA: `d79e66439d88c6ba9fb75908271d16dbe7f2bcf0`
+- Byte SHA256 (Linux LF, identical on Windows after `.gitattributes`): `b613facc3aab50bcc24624a086f0d5b037a5844a1d2f77f46736f46bb533e859`
+
+**Files changed by integration (branch diff vs `a894fbb`):**
+- `deploy/infrastructure-trial.py`: `CGROUP_ROOT`, `invocation_cgroup_kill`, `invocation_cgroup` in `start_observation_timing`, cgroup kill before `stop_units` in `record_main_shutdown`, cgroup kill in `deadline()` fallback
+- `tests/test_phase2b_transient_integration.py`: 10 targeted regressions for cgroup kill identity, ordering, fallback, and fail-closed
+- `tests/check_transient_compat.py`: mandatory token (capturing UNIT_RE), non-blocking FIFO `read_fifo`, `pwd` import guard, cgroup path `lstrip`
+- `tests/test_transient_probe.py`: 4 new offline regressions for token strictness, FIFO timeout, pwd guard
+- `tests/test_phase2b_timing.py`: `ControlGroup` added to service fixtures
