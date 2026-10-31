@@ -65,7 +65,9 @@ class ReviewRegressions(unittest.TestCase):
                 snapshots.append(path.read_bytes())
                 return [], [post_unit()]
             with patch.object(n, 'monotonic_now', return_value=2005.), \
-                 patch.object(n, 'unit_evidence', return_value=pre_unit()), \
+                 patch.object(n, 'unit_evidence', side_effect=[pre_unit(), post_unit()]), \
+                 patch.object(n, 'registered_identity', return_value=timing()), \
+                 patch.object(n, 'terminate_invocation', side_effect=lambda identity: stopping([identity['unit']])), \
                  patch.object(n, 'secure_bytes', side_effect=lambda p: p.read_bytes()), \
                  patch.object(n, 'stop_units', side_effect=stopping):
                 first = n.stop_main(folder, data, timing())

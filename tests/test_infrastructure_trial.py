@@ -411,7 +411,7 @@ class NativeEvidenceRegressions(unittest.TestCase):
                 self.native.verify_pilot(approval, root)
 
     def test_observer_lifecycle_keeps_approval_before_each_start(self):
-        from unittest.mock import patch
+        from unittest.mock import MagicMock, patch
         import io
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory)
@@ -443,7 +443,7 @@ class NativeEvidenceRegressions(unittest.TestCase):
                     return ('continuous', int(__import__('time').time() * 1e6), 'RUNNING')
                 def close(self):
                     pass
-            with patch.object(self.native, 'trial_metadata', return_value=data), patch.object(self.native, 'check_approval', side_effect=approve), patch.object(self.native, 'require_service_policy'), patch.object(self.native, 'environment', return_value={'MVP_DB_PATH': str(source), 'MVP_BOT_ID': 'bot', 'MVP_STATE_DIR': str(folder)}), patch.object(self.native, 'snapshot', return_value=snapshot_data), patch.object(self.native, 'properties', side_effect=states), patch.object(self.native, 'wait_run', side_effect=['restart', 'continuous']), patch.object(self.native, 'stop_units', return_value=([], [])), patch.object(self.native, 'start_observation_timing', return_value={'baseline_mono': __import__('time').monotonic()}), patch.object(self.native, 'monotonic_now', return_value=0), patch.object(self.native, 'stop_main', return_value={'errors': [], 'units': []}), patch.object(self.native, 'command', side_effect=cmd), patch.object(self.native, 'connect', return_value=DB()), patch.object(self.native, 'fresh_run', return_value=True), patch.object(self.native, 'read_host', return_value={}), patch.object(self.native, 'memory_events', return_value={'oom': '0', 'oom_kill': '0', 'max': '0'}), patch.object(self.native, 'ingestion', return_value={'count': 1, 'first_received_us': 1, 'last_received_us': 1}):
+            with patch.object(self.native, 'trial_metadata', return_value=data), patch.object(self.native, 'check_approval', side_effect=approve), patch.multiple(self.native, prepare_invocation=MagicMock(), registered_identity=MagicMock(return_value={}), terminate_invocation=MagicMock(), unit_evidence=MagicMock(return_value={'properties': {'ActiveState': 'inactive', 'MainPID': '0', 'ControlPID': '0'}, 'pids': []})), patch.object(self.native, 'require_service_policy'), patch.object(self.native, 'environment', return_value={'MVP_DB_PATH': str(source), 'MVP_BOT_ID': 'bot', 'MVP_STATE_DIR': str(folder)}), patch.object(self.native, 'snapshot', return_value=snapshot_data), patch.object(self.native, 'properties', side_effect=states), patch.object(self.native, 'wait_run', side_effect=['restart', 'continuous']), patch.object(self.native, 'stop_units', return_value=([], [])), patch.object(self.native, 'start_observation_timing', return_value={'baseline_mono': __import__('time').monotonic()}), patch.object(self.native, 'monotonic_now', return_value=0), patch.object(self.native, 'stop_main', return_value={'errors': [], 'units': []}), patch.object(self.native, 'command', side_effect=cmd), patch.object(self.native, 'connect', return_value=DB()), patch.object(self.native, 'fresh_run', return_value=True), patch.object(self.native, 'read_host', return_value={}), patch.object(self.native, 'memory_events', return_value={'oom': '0', 'oom_kill': '0', 'max': '0'}), patch.object(self.native, 'ingestion', return_value={'count': 1, 'first_received_us': 1, 'last_received_us': 1}):
                 self.assertEqual(self.native.observe(folder), 0, (folder / 'result.json').read_text())
             self.assertEqual(actions[:5], ['approval', 'approval', 'start', 'approval', 'start'])
             result = json.loads((folder / 'result.json').read_text())
@@ -498,11 +498,12 @@ class NativeEvidenceRegressions(unittest.TestCase):
             heartbeat = helper_evidence([data['units'][0]])[1][0]
             self.addCleanup(patch.stopall)
             patch.object(self.native, 'unit_evidence', side_effect=lambda u: helper_evidence([u])[1][0]).start()
+            patch.object(self.native, 'cancel_invocations', return_value=helper_evidence([self.native.UNIT])).start()
             shutdown = json.loads((folder / 'shutdown.json').read_text())
             (folder / 'deadline-stop.json').write_text(json.dumps(dict(errors=[], trigger_mono=2066, shutdown=shutdown)))
             with patch.object(self.native, 'secure_bytes', side_effect=lambda p: p.read_bytes()), patch.object(self.native, 'validate_timing'), patch.object(self.native, 'trial_metadata', return_value=data), patch.object(self.native, 'boot_id', return_value='boot'), patch.object(self.native, 'stop_units', side_effect=stop), patch.object(self.native, 'runtime_identity', return_value=('hash', {})):
                 self.assertEqual(self.native.audit(folder), 0)
-            self.assertEqual(stopped, [self.native.UNIT, *(u for u in data['units'] if u != data['units'][5])])
+            self.assertEqual(stopped, [u for u in data['units'] if u != data['units'][5]])
             self.assertEqual(json.loads((folder / 'cleanup.json').read_text())['errors'], [])
             (folder / 'deadline-stop.json').write_text('{"errors": [], "trigger_mono": 3000}')
             with patch.object(self.native, 'secure_bytes', side_effect=lambda p: p.read_bytes()), patch.object(self.native, 'validate_timing'), patch.object(self.native, 'trial_metadata', return_value=data), patch.object(self.native, 'stop_units', side_effect=stop), patch.object(self.native, 'runtime_identity', return_value=('hash', {})):
@@ -512,7 +513,7 @@ class NativeEvidenceRegressions(unittest.TestCase):
                 errors, evidence = stop(units)
                 evidence[0]['properties'].update(ActiveState='failed', Result='timeout')
                 return errors, evidence
-            with patch.object(self.native, 'secure_bytes', side_effect=lambda p: p.read_bytes()), patch.object(self.native, 'validate_timing'), patch.object(self.native, 'trial_metadata', return_value=data), patch.object(self.native, 'stop_units', side_effect=failed_main), patch.object(self.native, 'runtime_identity', return_value=('hash', {})):
+            with patch.object(self.native, 'secure_bytes', side_effect=lambda p: p.read_bytes()), patch.object(self.native, 'validate_timing'), patch.object(self.native, 'trial_metadata', return_value=data), patch.object(self.native, 'cancel_invocations', return_value=failed_main([self.native.UNIT])), patch.object(self.native, 'stop_units', side_effect=stop), patch.object(self.native, 'runtime_identity', return_value=('hash', {})):
                 self.assertEqual(self.native.audit(folder), 1)
             self.assertTrue(any('current main' in e for e in json.loads((folder / 'cleanup.json').read_text())['errors']))
 
@@ -552,7 +553,7 @@ class NativeEvidenceRegressions(unittest.TestCase):
 
     def test_readiness_rejects_missing_ingest_command_and_wrong_limits(self):
         from unittest.mock import patch
-        state = {'ExecStart': 'run', 'Restart': 'no', 'KillMode': 'control-group', 'MemoryMax': '536870912',
+        state = {'ExecStartPreEx': '{ path=' + str(self.native.ROOT / '.venv/bin/python') + ' ; argv[]=' + str(self.native.ROOT / '.venv/bin/python') + ' ' + str(self.native.ROOT / 'deploy/infrastructure-trial.py') + ' register --unit ' + self.native.INSPECTION_UNIT + ' ; flags=no-setuid ; }', 'ExecStart': 'run', 'Restart': 'no', 'KillMode': 'control-group', 'MemoryMax': '536870912',
                  'CPUQuotaPerSecUSec': '500ms', 'TasksMax': '64', 'User': 'polymarket-btc'}
         with patch.object(self.native, 'command', side_effect=['\n'.join(k + '=' + v for k, v in state.items()), '/etc/polymarket-btc/infrastructure.env (ignore_errors=no)']):
             with self.assertRaisesRegex(ValueError, 'ingest'):

@@ -1,557 +1,99 @@
-"""Targeted regressions for per-invocation cgroup-based emergency shutdown integration."""
+"""Per-invocation integration: destructive targets never come from unit names."""
 import importlib.util
 import json
-import os
-import sys
-import tempfile
-import time
-import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+import tempfile
+import unittest
+from unittest.mock import patch
 
-TRIAL_PATH = Path(__file__).parents[1] / 'deploy/infrastructure-trial.py'
-spec = importlib.util.spec_from_file_location('infrastructure_trial', TRIAL_PATH)
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
+spec = importlib.util.spec_from_file_location('transient_trial', Path(__file__).parents[1] / 'deploy/infrastructure-trial.py')
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
 
-
-def _trial_data(trial_id='pilot-20261031T000000Z', seconds=1800):
-    return {
-        'trial_id': trial_id, 'seconds': seconds, 'boot_id': 'testboot',
-        'fingerprint': 'fp', 'launch_mono': time.monotonic() - 10,
-        'startup_expiry_mono': time.monotonic() + 200,
-        'units': module.owned(trial_id),
-    }
-
-
-def _fake_service(invocation_id='iid123', cgroup='/system.slice/polymarket-btc-infrastructure.service'):
-    return {
-        'ActiveEnterTimestampMonotonic': str(int((time.monotonic() - 5) * 1e6)),
-        'InvocationID': invocation_id,
-        'ControlGroup': cgroup,
-    }
-
-
-class TestInvocationCgroupCapture(unittest.TestCase):
-    def _timing_from_service(self, data, service):
-        """Helper: call start_observation_timing with mocked deps."""
-        runtime_usec = (data['seconds'] + module.RUNTIME_MAX_PADDING) * 1_000_000
-        with patch.object(module, 'monotonic_now', return_value=time.monotonic()), \
-             patch.object(module, 'runtime_bound', side_effect=[runtime_usec, 0]), \
-             patch.object(module, 'arm_timer', return_value={'ok': True}):
-            return module.start_observation_timing(Path(self.td), data, service)
-
-    def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
-        self.td = self._tmp.name
-
-    def tearDown(self):
-        self._tmp.cleanup()
-
-    def test_timing_includes_invocation_cgroup(self):
-        data = _trial_data()
-        service = _fake_service()
-        timing = self._timing_from_service(data, service)
-        self.assertIn('invocation_cgroup', timing)
-        self.assertEqual(timing['invocation_cgroup'],
-                         '/system.slice/polymarket-btc-infrastructure.service')
-        self.assertEqual(timing['invocation_id'], 'iid123')
-
-    def test_timing_persisted_invocation_cgroup(self):
-        data = _trial_data()
-        service = _fake_service()
-        timing = self._timing_from_service(data, service)
-        saved = json.loads((Path(self.td) / 'timing.json').read_text())
-        self.assertIn('invocation_cgroup', saved)
-
-    def test_timing_rejects_empty_cgroup(self):
-        data = _trial_data()
-        service = _fake_service(cgroup='')
-        with self.assertRaises(ValueError):
-            self._timing_from_service(data, service)
-
-
-class TestInvocationCgroupKill(unittest.TestCase):
-    def test_kill_writes_to_cgroup_kill(self):
-        with tempfile.TemporaryDirectory() as td:
-            cgroup_rel = 'system.slice/polymarket-btc-infrastructure.service'
-            cgroup_dir = Path(td) / cgroup_rel
-            cgroup_dir.mkdir(parents=True)
-            kill_file = cgroup_dir / 'cgroup.kill'
-            kill_file.write_text('0')
-            timing = {'invocation_id': 'abc',
-                      'invocation_cgroup': '/' + cgroup_rel}
-            with patch.object(module, 'CGROUP_ROOT', Path(td)):
-                module.invocation_cgroup_kill('/' + cgroup_rel, 'abc', timing)
-            self.assertEqual(kill_file.read_text(), '1')
-
-    def test_kill_fails_closed_on_id_mismatch(self):
-        timing = {'invocation_id': 'correct_id',
-                  'invocation_cgroup': '/system.slice/x.service'}
-        with self.assertRaises(ValueError):
-            module.invocation_cgroup_kill('/system.slice/x.service', 'wrong_id', timing)
-
-    def test_kill_fails_closed_on_cgroup_path_mismatch(self):
-        # I-2: cgroup arg not matching timing['invocation_cgroup'] must raise
-        timing = {'invocation_id': 'abc',
-                  'invocation_cgroup': '/system.slice/polymarket-btc-infrastructure.service'}
-        with self.assertRaises(ValueError):
-            module.invocation_cgroup_kill('/system.slice/different.service', 'abc', timing)
-
-    def test_kill_fails_closed_on_empty_cgroup(self):
-        # m-6: empty cgroup arg must raise before any path construction
-        timing = {'invocation_id': 'abc', 'invocation_cgroup': ''}
-        with self.assertRaises(ValueError):
-            module.invocation_cgroup_kill('', 'abc', timing)
-
-    def test_kill_handles_missing_cgroup_gracefully(self):
-        timing = {'invocation_id': 'abc',
-                  'invocation_cgroup': '/system.slice/gone.service'}
-        with patch.object(module, 'CGROUP_ROOT', Path('/nonexistent_xyz')):
-            # Should not raise; process already gone (cgroup absent = dead)
-            module.invocation_cgroup_kill('/system.slice/gone.service', 'abc', timing)
-
-
-class TestRecordMainShutdownCgroupTargeting(unittest.TestCase):
-    CGROUP = '/system.slice/polymarket-btc-infrastructure.service'
-
-    def _shutdown(self, timing, pre_invocation='iid', active=True):
-        timing.setdefault('unit', module.UNIT)
-        data = _trial_data()
-        call_order = []
-        with tempfile.TemporaryDirectory() as td:
-            folder = Path(td)
-            props_val = {
-                'ActiveState': 'active' if active else 'inactive',
-                'InvocationID': pre_invocation,
-                'ControlGroup': self.CGROUP,
-                'MainPID': '1234', 'ControlPID': '0',
-                'Result': '', 'LoadState': 'loaded',
-                'SubState': 'running' if active else 'dead',
-            }
-            dead_evidence = [{
-                'unit': module.UNIT,
-                'properties': {
-                    'ActiveState': 'inactive', 'Result': 'success',
-                    'InvocationID': '', 'MainPID': '0', 'ControlPID': '0',
-                    'ControlGroup': '', 'SubState': 'dead',
-                },
-                'pids': [],
-            }]
-            with patch.object(module, 'unit_evidence',
-                              return_value={'unit': module.UNIT,
-                                           'properties': props_val, 'pids': []}), \
-                 patch.object(module, 'validate_run_identity', return_value='run1'), \
-                 patch.object(module, 'monotonic_now', return_value=100.0), \
-                 patch.object(module, 'invocation_cgroup_kill',
-                              side_effect=lambda *a, **kw: call_order.append('cgroup_kill')), \
-                 patch.object(module, 'stop_units',
-                              side_effect=lambda units: (
-                                  call_order.append('stop_units'), ([], dead_evidence))[1]), \
-                 patch.object(module, 'cgroup_pids', return_value=[]), \
-                 patch.object(module, 'quiescent', return_value=True):
-                proof = module.record_main_shutdown(folder, data, timing)
-        return proof, call_order
-
-    def test_shutdown_uses_cgroup_kill_before_unit_stop(self):
-        timing = {
-            'invocation_id': 'iid', 'invocation_cgroup': self.CGROUP,
-            'baseline_mono': 0.0, 'runtime_expiry_mono': 9999.0,
-        }
-        proof, order = self._shutdown(timing)
-        self.assertEqual(order, ['cgroup_kill', 'stop_units'],
-                         'cgroup kill must precede stop_units')
-
-    def test_shutdown_fail_closed_on_invocation_mismatch(self):
-        timing = {
-            'invocation_id': 'expected_iid', 'invocation_cgroup': self.CGROUP,
-            'baseline_mono': 0.0, 'runtime_expiry_mono': 9999.0,
-        }
-        # pre_invocation differs from timing['invocation_id']
-        proof, order = self._shutdown(timing, pre_invocation='DIFFERENT_iid')
-        self.assertNotIn('cgroup_kill', order,
-                         'cgroup kill must NOT run when invocation mismatch')
-        self.assertTrue(proof['errors'], 'errors must be non-empty on id mismatch')
-
-    def test_shutdown_no_cgroup_kill_when_pre_stop_errors(self):
-        """If pre-stop identity unavailable, cgroup_kill must not execute."""
-        timing = {
-            'invocation_id': 'iid', 'invocation_cgroup': self.CGROUP,
-            'baseline_mono': 0.0, 'runtime_expiry_mono': 9999.0,
-        }
-        data = _trial_data()
-        call_order = []
-        dead_evidence = [{'unit': module.UNIT, 'properties': {
-            'ActiveState': 'inactive', 'Result': 'success',
-            'InvocationID': '', 'MainPID': '0', 'ControlPID': '0',
-            'ControlGroup': '', 'SubState': 'dead',
-        }, 'pids': []}]
-        with tempfile.TemporaryDirectory() as td:
-            folder = Path(td)
-            with patch.object(module, 'unit_evidence',
-                              side_effect=OSError('unit unavailable')), \
-                 patch.object(module, 'validate_run_identity', return_value='run1'), \
-                 patch.object(module, 'monotonic_now', return_value=100.0), \
-                 patch.object(module, 'invocation_cgroup_kill',
-                              side_effect=lambda *a, **kw: call_order.append('cgroup_kill')), \
-                 patch.object(module, 'stop_units',
-                              side_effect=lambda units: (
-                                  call_order.append('stop_units'), ([], dead_evidence))[1]), \
-                 patch.object(module, 'cgroup_pids', return_value=[]), \
-                 patch.object(module, 'quiescent', return_value=True):
-                proof = module.record_main_shutdown(folder, data, timing)
-        self.assertNotIn('cgroup_kill', call_order)
-        self.assertTrue(proof['errors'])
-
-
-class TestDeadlineFallbackCgroupKill(unittest.TestCase):
-    CGROUP = '/system.slice/polymarket-btc-infrastructure.service'
-
-    def test_deadline_fallback_uses_cgroup_kill(self):
-        timing = {
-            'unit': module.UNIT,
-            'invocation_id': 'iid', 'invocation_cgroup': self.CGROUP,
-            'baseline_mono': 0.0, 'deadline_mono': 100.0,
-            'runtime_expiry_mono': 9999.0, 'fingerprint': 'fp', 'boot_id': 'b',
-        }
-        kill_called = []
-        data = _trial_data()
-        with tempfile.TemporaryDirectory() as td:
-            folder = Path(td)
-            (folder / 'timing.json').write_text(json.dumps(timing))
-            with patch.object(module, 'trial_metadata', return_value=data), \
-                 patch.object(module, 'monotonic_now', return_value=100.5), \
-                 patch.object(module, 'secure_bytes',
-                              return_value=json.dumps(timing).encode()), \
-                 patch.object(module, 'validate_deadline'), \
-                 patch.object(module, 'stop_main',
-                              side_effect=RuntimeError('forced fallback')), \
-                 patch.object(module, 'invocation_cgroup_kill',
-                              side_effect=lambda *a, **kw: kill_called.append(True)), \
-                 patch.object(module, 'stop_units', return_value=([], [])), \
-                 patch.object(module, 'unit_evidence',
-                              return_value={'unit': module.UNIT, 'properties': {
-                                  'ActiveState': 'inactive', 'Result': 'success',
-                                  'LoadState': 'loaded', 'MainPID': '0', 'ControlPID': '0',
-                                  'ControlGroup': '', 'InvocationID': '',
-                              }, 'pids': []}), \
-                 patch.object(module, 'write_json'), \
-                 patch.object(module, 'validate_timing'), \
-                 patch.object(module, 'validate_shutdown_records'):
-                module.deadline(folder)
-        self.assertTrue(kill_called,
-                        'deadline fallback must call invocation_cgroup_kill')
+TRIAL = 'pilot-20261031T000000Z'
 
 
 class TestTemplateInvocationNaming(unittest.TestCase):
     def test_template_unit_constants(self):
-        self.assertEqual(module.TEMPLATE_UNIT, 'polymarket-btc-infrastructure@.service')
-        self.assertEqual(module.INSPECTION_UNIT, 'polymarket-btc-infrastructure@default.service')
+        self.assertEqual(m.TEMPLATE_UNIT, 'polymarket-btc-infrastructure@.service')
+        self.assertEqual(m.INSPECTION_UNIT, 'polymarket-btc-infrastructure@default.service')
 
     def test_invocation_unit_format_and_uniqueness(self):
-        trial_id = 'pilot-20261031T000000Z'
-        unit1 = module.invocation_unit(trial_id, 'verify')
-        unit2 = module.invocation_unit(trial_id, 'verify')
-        unit_main = module.invocation_unit(trial_id, 'main')
-
-        self.assertRegex(unit1, r'^polymarket-btc-infrastructure@pilot-20261031T000000Z-verify-[0-9a-f]{8}\.service$')
-        self.assertRegex(unit_main, r'^polymarket-btc-infrastructure@pilot-20261031T000000Z-main-[0-9a-f]{8}\.service$')
-        self.assertNotEqual(unit1, unit2, 'each invocation must have unique random token')
-        self.assertNotEqual(unit1, unit_main)
+        units = [m.invocation_unit(TRIAL, role) for role in ('main', 'main', 'verify')]
+        self.assertEqual(len(set(units)), 3)
+        for unit in units:
+            self.assertRegex(unit, r'^polymarket-btc-infrastructure@pilot-20261031T000000Z-(main|verify)-[0-9a-f]{8}\.service$')
 
     def test_invocation_unit_validation(self):
-        with self.assertRaises(ValueError):
-            module.invocation_unit('invalid-trial-id', 'verify')
-        with self.assertRaises(ValueError):
-            module.invocation_unit('pilot-20261031T000000Z', 'invalid_role')
+        for trial, role in [('invalid', 'main'), (TRIAL, 'invalid')]:
+            with self.assertRaises(ValueError):
+                m.invocation_unit(trial, role)
 
 
-class TestReplacementIsolationRegressions(unittest.TestCase):
-    """Regression suite covering requirements 6A through 6H."""
-
-    def setUp(self):
-        self.trial_id = 'pilot-20261031T000000Z'
-        self.u_orig = module.invocation_unit(self.trial_id, 'main')
-        self.u_repl = module.invocation_unit(self.trial_id, 'main')
-        self.cg_orig = f'/system.slice/system-polymarket\\x2dbtc\\x2dinfrastructure.slice/{self.u_orig}'
-        self.cg_repl = f'/system.slice/system-polymarket\\x2dbtc\\x2dinfrastructure.slice/{self.u_repl}'
-
-    def test_6a_distinct_unit_and_cgroup_identities(self):
-        """6A: Original and replacement have different unit and cgroup identities."""
-        self.assertNotEqual(self.u_orig, self.u_repl)
-        self.assertNotEqual(self.cg_orig, self.cg_repl)
-        self.assertIn(self.u_orig, self.cg_orig)
-        self.assertIn(self.u_repl, self.cg_repl)
-
-    def test_6b_original_shutdown_terminates_descendants(self):
-        """6B: Original shutdown writes '1' to its specific cgroup.kill, terminating descendants."""
+class TestRecordMainShutdown(unittest.TestCase):
+    def shutdown(self, mutation=None):
+        data = {'trial_id': TRIAL, 'boot_id': 'boot'}
+        unit = m.invocation_unit(TRIAL, 'main')
+        timing = {'unit': unit, 'invocation_id': 'original', 'invocation_cgroup': '/original',
+                  'runtime_expiry_mono': 9999}
+        pre = {'unit': unit, 'properties': {'ActiveState': 'active', 'InvocationID': 'original',
+               'ControlGroup': '/original'}, 'pids': [123]}
+        post = {'unit': unit, 'properties': {'ActiveState': 'inactive', 'SubState': 'dead',
+                'MainPID': '0', 'ControlPID': '0', 'Result': 'success', 'InvocationID': ''}, 'pids': []}
+        if mutation == 'replacement':
+            pre['properties']['InvocationID'] = 'replacement'
+        if mutation == 'missing':
+            pre['properties']['InvocationID'] = ''
+        if mutation == 'cgroup':
+            timing['invocation_cgroup'] = '/replacement'
         with tempfile.TemporaryDirectory() as td:
-            # Setup cgroup hierarchy for original
-            orig_dir = Path(td) / self.cg_orig.lstrip('/')
-            orig_dir.mkdir(parents=True)
-            kill_file = orig_dir / 'cgroup.kill'
-            kill_file.write_text('0')
+            with patch.object(m, 'monotonic_now', return_value=100), \
+                 patch.object(m, 'unit_evidence', side_effect=[pre, post]), \
+                 patch.object(m, 'validate_run_identity', return_value='run'), \
+                 patch.object(m, 'registered_identity', return_value=dict(timing, invocation_cgroup='/original')), \
+                 patch.object(m, 'cgroup_pids', return_value=[]), \
+                 patch.object(m, 'terminate_invocation') as terminate, \
+                 patch.object(m, 'stop_units') as stop:
+                proof = m.record_main_shutdown(Path(td), data, timing)
+                stop.assert_not_called()
+                if mutation:
+                    terminate.assert_not_called()
+                    self.assertTrue(proof['errors'])
+                else:
+                    terminate.assert_called_once_with(timing)
+                    self.assertEqual(proof['errors'], [])
 
-            timing = {
-                'unit': self.u_orig,
-                'invocation_id': 'orig_iid_123',
-                'invocation_cgroup': self.cg_orig,
-            }
-            with patch.object(module, 'CGROUP_ROOT', Path(td)):
-                module.invocation_cgroup_kill(self.cg_orig, 'orig_iid_123', timing)
-            self.assertEqual(kill_file.read_text(), '1')
+    def test_original_shutdown_never_uses_name_stop(self):
+        self.shutdown()
 
-    def test_6c_replacement_survives_original_shutdown(self):
-        """6C: Stop-target selection stops only timing['unit'] (original), never replacement."""
-        stopped_units = []
-        timing = {
-            'unit': self.u_orig,
-            'invocation_id': 'orig_iid_123',
-            'invocation_cgroup': self.cg_orig,
-            'baseline_mono': 0.0,
-            'runtime_expiry_mono': 9999.0,
-        }
-        data = _trial_data(trial_id=self.trial_id)
-        with tempfile.TemporaryDirectory() as td:
-            folder = Path(td)
-            props_orig = {
-                'ActiveState': 'active', 'InvocationID': 'orig_iid_123',
-                'ControlGroup': self.cg_orig, 'MainPID': '1001', 'ControlPID': '0',
-                'Result': '', 'LoadState': 'loaded', 'SubState': 'running',
-            }
-            def fake_stop(units):
-                stopped_units.extend(units)
-                return [], [{'unit': u, 'properties': {
-                    'ActiveState': 'inactive', 'Result': 'success',
-                    'InvocationID': '', 'MainPID': '0', 'ControlPID': '0',
-                    'ControlGroup': '', 'SubState': 'dead',
-                }, 'pids': []} for u in units]
+    def test_identity_mismatch_no_destructive_stop(self):
+        self.shutdown('replacement')
 
-            with patch.object(module, 'unit_evidence',
-                              return_value={'unit': self.u_orig, 'properties': props_orig, 'pids': [1001]}), \
-                 patch.object(module, 'validate_run_identity', return_value='run1'), \
-                 patch.object(module, 'monotonic_now', return_value=100.0), \
-                 patch.object(module, 'invocation_cgroup_kill'), \
-                 patch.object(module, 'stop_units', side_effect=fake_stop), \
-                 patch.object(module, 'cgroup_pids', return_value=[]), \
-                 patch.object(module, 'quiescent', return_value=True):
-                proof = module.record_main_shutdown(folder, data, timing)
+    def test_missing_identity_no_destructive_stop(self):
+        self.shutdown('missing')
 
-            self.assertIn(self.u_orig, stopped_units, "Original unit must be stopped")
-            self.assertNotIn(self.u_repl, stopped_units, "Replacement unit must NEVER be stopped")
-            self.assertNotIn('polymarket-btc-infrastructure.service', stopped_units,
-                             "Static unit must NEVER be stopped")
+    def test_timing_registration_cgroup_mismatch_no_destructive_stop(self):
+        self.shutdown('cgroup')
 
-    def test_6d_stale_stop_cannot_affect_replacement(self):
-        """6D: Stale stop targeting dead original handles quiescence and never touches replacement."""
-        stopped_units = []
-        timing = {
-            'unit': self.u_orig,
-            'invocation_id': 'orig_iid_123',
-            'invocation_cgroup': self.cg_orig,
-            'baseline_mono': 0.0,
-            'runtime_expiry_mono': 9999.0,
-        }
-        data = _trial_data(trial_id=self.trial_id)
+
+class TestDeadlineFallback(unittest.TestCase):
+    def test_corrupt_timing_uses_registered_cleanup_only(self):
+        data = {'trial_id': TRIAL, 'units': m.owned(TRIAL), 'boot_id': 'boot'}
         with tempfile.TemporaryDirectory() as td:
             folder = Path(td)
-            props_dead = {
-                'ActiveState': 'inactive', 'InvocationID': '',
-                'ControlGroup': '', 'MainPID': '0', 'ControlPID': '0',
-                'Result': 'success', 'LoadState': 'loaded', 'SubState': 'dead',
-            }
-            def fake_stop(units):
-                stopped_units.extend(units)
-                return [], [{'unit': u, 'properties': props_dead, 'pids': []} for u in units]
-
-            with patch.object(module, 'unit_evidence',
-                              return_value={'unit': self.u_orig, 'properties': props_dead, 'pids': []}), \
-                 patch.object(module, 'validate_run_identity', return_value='run1'), \
-                 patch.object(module, 'monotonic_now', return_value=100.0), \
-                 patch.object(module, 'invocation_cgroup_kill'), \
-                 patch.object(module, 'stop_units', side_effect=fake_stop), \
-                 patch.object(module, 'cgroup_pids', return_value=[]), \
-                 patch.object(module, 'quiescent', return_value=True):
-                proof = module.record_main_shutdown(folder, data, timing)
-
-            self.assertIn(self.u_orig, stopped_units)
-            self.assertNotIn(self.u_repl, stopped_units)
-
-    def test_6e_observer_death_deadline_targets_only_original(self):
-        """6E: When observer dies, deadline fallback targets only timing['unit'], never replacement."""
-        stopped_units = []
-        timing = {
-            'unit': self.u_orig,
-            'invocation_id': 'orig_iid_123',
-            'invocation_cgroup': self.cg_orig,
-            'baseline_mono': 0.0,
-            'deadline_mono': 100.0,
-            'runtime_expiry_mono': 9999.0,
-            'fingerprint': 'fp', 'boot_id': 'testboot',
-        }
-        data = _trial_data(trial_id=self.trial_id)
-        with tempfile.TemporaryDirectory() as td:
-            folder = Path(td)
-            (folder / 'timing.json').write_text(json.dumps(timing))
-
-            def fake_stop(units):
-                stopped_units.extend(units)
-                return [], [{'unit': u, 'properties': {
-                    'ActiveState': 'inactive', 'Result': 'success',
-                    'LoadState': 'loaded', 'MainPID': '0', 'ControlPID': '0',
-                    'ControlGroup': '', 'InvocationID': '',
-                }, 'pids': []} for u in units]
-
-            with patch.object(module, 'trial_metadata', return_value=data), \
-                 patch.object(module, 'monotonic_now', return_value=100.5), \
-                 patch.object(module, 'secure_bytes', return_value=json.dumps(timing).encode()), \
-                 patch.object(module, 'validate_deadline'), \
-                 patch.object(module, 'stop_main', side_effect=RuntimeError('observer died')), \
-                 patch.object(module, 'invocation_cgroup_kill'), \
-                 patch.object(module, 'stop_units', side_effect=fake_stop), \
-                 patch.object(module, 'unit_evidence', return_value={'unit': self.u_orig, 'properties': {
-                     'ActiveState': 'inactive', 'Result': 'success',
-                     'LoadState': 'loaded', 'MainPID': '0', 'ControlPID': '0',
-                     'ControlGroup': '', 'InvocationID': '',
-                 }, 'pids': []}), \
-                 patch.object(module, 'write_json'), \
-                 patch.object(module, 'validate_timing'), \
-                 patch.object(module, 'validate_shutdown_records'):
-                module.deadline(folder)
-
-            self.assertIn(self.u_orig, stopped_units, "Deadline fallback must stop original unit")
-            self.assertNotIn(self.u_repl, stopped_units, "Deadline fallback must NEVER stop replacement")
-            self.assertNotIn('polymarket-btc-infrastructure.service', stopped_units,
-                             "Deadline fallback must NEVER stop static unit")
-
-    def test_6f_missing_or_corrupt_timing_deadline_refuses_broad_stops(self):
-        """6F: Missing or corrupt timing in deadline refuses main unit stops and fails closed."""
-        stopped_units = []
-        data = _trial_data(trial_id=self.trial_id)
-        with tempfile.TemporaryDirectory() as td:
-            folder = Path(td)
-            # Write corrupted timing.json
-            (folder / 'timing.json').write_text('{"invalid_json": ')
-
-            def fake_stop(units):
-                stopped_units.extend(units)
-                return [], [{'unit': u, 'properties': {
-                    'ActiveState': 'inactive', 'Result': 'success',
-                    'LoadState': 'loaded', 'MainPID': '0', 'ControlPID': '0',
-                    'ControlGroup': '', 'InvocationID': '',
-                }, 'pids': []} for u in units]
-
-            with patch.object(module, 'trial_metadata', return_value=data), \
-                 patch.object(module, 'monotonic_now', return_value=100.5), \
-                 patch.object(module, 'invocation_cgroup_kill') as mock_kill, \
-                 patch.object(module, 'stop_units', side_effect=fake_stop), \
-                 patch.object(module, 'unit_evidence', return_value={'unit': data['units'][1], 'properties': {
-                     'ActiveState': 'inactive', 'Result': 'success',
-                     'LoadState': 'loaded', 'MainPID': '0', 'ControlPID': '0',
-                     'ControlGroup': '', 'InvocationID': '',
-                 }, 'pids': []}), \
-                 patch.object(module, 'write_json') as mock_write:
-                module.deadline(folder)
-
-            # Neither static UNIT nor replacement nor any main service was passed to stop_units
-            self.assertNotIn('polymarket-btc-infrastructure.service', stopped_units)
-            self.assertNotIn(self.u_orig, stopped_units)
-            self.assertNotIn(self.u_repl, stopped_units)
-            # No cgroup kill attempted on corrupt timing
-            mock_kill.assert_not_called()
-            # Verified deadline-stop.json written with failure recorded
-            deadline_stops = [call.args[1] for call in mock_write.call_args_list
-                              if str(call.args[0]).endswith('deadline-stop.json')]
-            self.assertTrue(deadline_stops)
-            errors_str = ' '.join(deadline_stops[-1].get('errors', []))
-            self.assertIn('deadline fallback refused', errors_str)
-
-    def test_6g_identity_change_between_inspection_and_shutdown_fails_closed(self):
-        """6G: If pre-stop inspection detects identity change, cgroup kill is refused."""
-        timing = {
-            'unit': self.u_orig,
-            'invocation_id': 'orig_iid_123',
-            'invocation_cgroup': self.cg_orig,
-            'baseline_mono': 0.0,
-            'runtime_expiry_mono': 9999.0,
-        }
-        data = _trial_data(trial_id=self.trial_id)
-        with tempfile.TemporaryDirectory() as td:
-            folder = Path(td)
-            # Pre-stop unit evidence shows DIFFERENT InvocationID (changed behind controller)
-            props_tampered = {
-                'ActiveState': 'active', 'InvocationID': 'CHANGED_IID_456',
-                'ControlGroup': self.cg_orig, 'MainPID': '2002', 'ControlPID': '0',
-                'Result': '', 'LoadState': 'loaded', 'SubState': 'running',
-            }
-            with patch.object(module, 'unit_evidence',
-                              return_value={'unit': self.u_orig, 'properties': props_tampered, 'pids': [2002]}), \
-                 patch.object(module, 'validate_run_identity', return_value='run1'), \
-                 patch.object(module, 'monotonic_now', return_value=100.0), \
-                 patch.object(module, 'invocation_cgroup_kill') as mock_kill, \
-                 patch.object(module, 'stop_units', return_value=([], [{'unit': self.u_orig, 'properties': {
-                     'ActiveState': 'inactive', 'Result': 'success',
-                     'InvocationID': '', 'MainPID': '0', 'ControlPID': '0',
-                     'ControlGroup': '', 'SubState': 'dead',
-                 }, 'pids': []}])), \
-                 patch.object(module, 'cgroup_pids', return_value=[]), \
-                 patch.object(module, 'quiescent', return_value=True):
-                proof = module.record_main_shutdown(folder, data, timing)
-
-            # cgroup kill MUST NOT be called because identity changed
-            mock_kill.assert_not_called()
-            self.assertTrue(proof['errors'])
-            self.assertIn('identity mismatch', ' '.join(proof['errors']))
-
-    def test_6h_cleanup_and_audit_never_terminate_unrelated_units(self):
-        """6H: Audit and inspect_cleanup never terminate unrelated units or static unit."""
-        stopped_units = []
-        timing = {
-            'unit': self.u_orig,
-            'invocation_id': 'orig_iid_123',
-            'invocation_cgroup': self.cg_orig,
-            'baseline_mono': 0.0, 'deadline_mono': 100.0,
-            'runtime_expiry_mono': 9999.0, 'fingerprint': 'fp', 'boot_id': 'testboot',
-        }
-        data = _trial_data(trial_id=self.trial_id)
-        with tempfile.TemporaryDirectory() as td:
-            folder = Path(td)
-            (folder / 'timing.json').write_text(json.dumps(timing))
-            (folder / 'launch.json').write_text(json.dumps(data))
-
-            def fake_stop(units):
-                stopped_units.extend(units)
-                return [], [{'unit': u, 'properties': {
-                    'ActiveState': 'inactive', 'Result': 'success',
-                    'LoadState': 'loaded', 'MainPID': '0', 'ControlPID': '0',
-                    'ControlGroup': '', 'InvocationID': '',
-                }, 'pids': []} for u in units]
-
-            with patch.object(module, 'trial_metadata', return_value=data), \
-                 patch.object(module, 'resolve_helper_exits', return_value=([], [])), \
-                 patch.object(module, 'write_json'), \
-                 patch.object(module, 'stop_units', side_effect=fake_stop), \
-                 patch.object(module, 'runtime_identity', return_value=('fp', {})), \
-                 patch.object(module, 'validate_helper_exits'), \
-                 patch.object(module, 'validate_timing'), \
-                 patch.object(module, 'validate_deadline'), \
-                 patch.object(module, 'validate_shutdown_records'), \
-                 patch.object(module, 'secure_bytes', return_value=json.dumps(timing).encode()):
-                # Create fake evidence files expected by audit
-                (folder / 'deadline.json').write_text('{"errors": []}')
-                (folder / 'result.json').write_text('{"continuous": true}')
-                (folder / 'shutdown.json').write_text('{"errors": []}')
-                (folder / 'deadline-stop.json').write_text('{"errors": []}')
-                (folder / 'startup-handoff.json').write_text('{"errors": []}')
-                module.audit(folder)
-
-            self.assertNotIn('polymarket-btc-infrastructure.service', stopped_units,
-                             "Audit must NEVER stop static unit")
-            self.assertNotIn(self.u_repl, stopped_units,
-                             "Audit must NEVER stop replacement unit")
+            with patch.object(m, 'trial_metadata', return_value=data), \
+                 patch.object(m, 'monotonic_now', return_value=100), \
+                 patch.object(m, 'secure_bytes', side_effect=ValueError('corrupt timing')), \
+                 patch.object(m, 'cancel_invocations', return_value=([], [])) as cleanup, \
+                 patch.object(m, 'unit_evidence', return_value={}), \
+                 patch.object(m, 'stop_units', return_value=([], [])) as stop, \
+                 patch.object(m.subprocess, 'run'):
+                self.assertEqual(m.deadline(folder), 1)
+                cleanup.assert_called_once_with(folder, data)
+                for call in stop.call_args_list:
+                    self.assertTrue(set(call.args[0]) <= set(data['units']))
+                self.assertTrue(json.loads((folder / 'deadline.json').read_text())['errors'])
 
 
 if __name__ == '__main__':
     unittest.main()
-
-

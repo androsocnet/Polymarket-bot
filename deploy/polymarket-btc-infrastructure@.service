@@ -16,13 +16,17 @@ Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONPATH=/opt/polymarket-btc/src
 Environment=MODE=PAPER_ONLY
+ExecStartPre=!/opt/polymarket-btc/.venv/bin/python /opt/polymarket-btc/deploy/infrastructure-trial.py register --unit %n
 ExecStart=/opt/polymarket-btc/.venv/bin/python -m polymarket_bot.linux_mvp ingest
+RuntimeMaxSec=2040
+RuntimeRandomizedExtraSec=0
 Restart=no
 KillSignal=SIGTERM
 KillMode=control-group
 TimeoutStopSec=30
 UMask=0077
-ReadWritePaths=/var/lib/polymarket-btc-infrastructure/data
+# Evidence stays root:root 0700; only root ExecStartPre can traverse/write it.
+ReadWritePaths=/var/lib/polymarket-btc-infrastructure/data /var/lib/polymarket-btc-infrastructure/evidence
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

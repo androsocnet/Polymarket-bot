@@ -42,7 +42,7 @@ class TimingTests(unittest.TestCase):
                     value = self.service[args[-1]]
                     return 't ' + ('2040000000' if value == '34min' else value)
                 return json.dumps(raw)
-            with patch.object(n, 'boot_id', return_value='boot'), patch.object(n.time, 'monotonic', return_value=now), patch.object(n.time, 'clock_gettime', return_value=now), patch.object(n, 'command', side_effect=system_command) as command, patch.object(n, 'properties', return_value={'ActiveState': 'active'}):
+            with patch.object(n, 'boot_id', return_value='boot'), patch.object(n.time, 'monotonic', return_value=now), patch.object(n.time, 'clock_gettime', return_value=now), patch.object(n, 'command', side_effect=system_command) as command, patch.object(n, 'properties', return_value={'ActiveState': 'active'}), patch.object(n, 'registered_identity', return_value={'unit': n.UNIT, 'invocation_id': 'inv', 'invocation_cgroup': self.service['ControlGroup']}):
                 result = n.start_observation_timing(folder, self.data, self.service)
                 self.assertEqual(json.loads((folder / 'timing.json').read_text()), result)
                 calls = command.call_args_list
@@ -115,8 +115,10 @@ class LifecycleTests(TimingTests):
                               snapshot={'trading': {}, 'observations': 1}, connect=DB(), fresh_run=True,
                               read_host={}, memory_events={}, hash_due=False,
                               ingestion={'count': 1, 'last_received_us': 100000000}, command='',
-                              stop_units=([], []))
+                              stop_units=([], []), terminate_invocation=None,
+                              registered_identity={'unit': 'unused', 'invocation_id': 'inv', 'invocation_cgroup': self.service['ControlGroup']}, unit_evidence={'properties': {'MainPID': '0', 'ControlPID': '0', 'ActiveState': 'inactive'}, 'pids': []})
                 for name, value in values.items(): stack.enter_context(patch.object(n, name, return_value=value))
+                stack.enter_context(patch.object(n, 'registered_identity', side_effect=lambda f, d, r: {'unit': json.loads((f / (r + '-intent.json')).read_text())['unit'], 'invocation_id': 'inv', 'invocation_cgroup': self.service['ControlGroup']}))
                 stack.enter_context(patch.object(n, 'properties', side_effect=props))
                 stack.enter_context(patch.object(n, 'wait_run', side_effect=['first', 'run']))
                 stack.enter_context(patch.object(n, 'boot_id', return_value='boot'))
@@ -128,7 +130,7 @@ class LifecycleTests(TimingTests):
                 stack.enter_context(patch.object(n, 'connect', side_effect=lambda *a: DB()))
                 DB.fetchone = lambda self: ('run', int(now[0] * 1e6), 'RUNNING')
                 stack.enter_context(patch.object(n.time, 'sleep', side_effect=sleep))
-                stack.enter_context(patch.object(n, 'runtime_bound', side_effect=lambda name='RuntimeMaxUSec': 2040000000 if name == 'RuntimeMaxUSec' else 0))
+                stack.enter_context(patch.object(n, 'runtime_bound', side_effect=lambda name='RuntimeMaxUSec', unit=None: 2040000000 if name == 'RuntimeMaxUSec' else 0))
                 stack.enter_context(patch.object(n, 'arm_timer', return_value={'verified': True}))
                 stack.enter_context(patch.object(n, 'stop_main', return_value={'errors': [], 'units': []}))
                 code = n.observe(folder)
@@ -170,7 +172,7 @@ class LifecycleTests(TimingTests):
                            continuous_run_id='run', second=self.service)
             (folder / 'restart-verification.json').write_text(json.dumps(restart))
             base_timing = timing
-            with patch.object(n, 'secure_bytes', side_effect=lambda p: p.read_bytes()), patch.object(n, 'boot_id', return_value='boot'), patch.object(n, 'unit_evidence', return_value=pre), patch.object(n.time, 'monotonic', side_effect=[2005, 2007]), patch.object(n.time, 'clock_gettime', side_effect=[2005, 2007]), patch.object(n, 'stop_units', return_value=([], evidence)):
+            with patch.object(n, 'secure_bytes', side_effect=lambda p: p.read_bytes()), patch.object(n, 'boot_id', return_value='boot'), patch.object(n, 'registered_identity', return_value=base_timing), patch.object(n, 'terminate_invocation'), patch.object(n, 'unit_evidence', side_effect=[pre, evidence[0]]), patch.object(n.time, 'monotonic', side_effect=[2005, 2007]), patch.object(n.time, 'clock_gettime', side_effect=[2005, 2007]), patch.object(n, 'stop_units', return_value=([], evidence)):
                 proof = n.stop_main(folder, self.data, base_timing)
                 self.assertEqual(proof['errors'], [])
                 self.assertEqual(proof['quiescence_mono'], 2007)
@@ -194,7 +196,7 @@ class LifecycleTests(TimingTests):
                     current_pre['properties'].update(InvocationID='other')
                 if change == 'empty-timing': current_timing['invocation_id'] = ''
                 if change == 'post-invocation': bad[0]['properties']['InvocationID'] = 'other'
-                with self.subTest(change=change), patch.object(n, 'secure_bytes', side_effect=lambda p: p.read_bytes()), patch.object(n, 'boot_id', return_value='boot'), patch.object(n, 'unit_evidence', return_value=current_pre), patch.object(n.time, 'monotonic', side_effect=[2005, now]), patch.object(n.time, 'clock_gettime', side_effect=[2005, now]), patch.object(n, 'stop_units', return_value=([], bad)):
+                with self.subTest(change=change), patch.object(n, 'secure_bytes', side_effect=lambda p: p.read_bytes()), patch.object(n, 'boot_id', return_value='boot'), patch.object(n, 'registered_identity', return_value=current_timing), patch.object(n, 'terminate_invocation'), patch.object(n.time, 'perf_counter', side_effect=[0, 10]), patch.object(n, 'unit_evidence', side_effect=[current_pre, bad[0]]), patch.object(n.time, 'monotonic', side_effect=[2005, now]), patch.object(n.time, 'clock_gettime', side_effect=[2005, now]), patch.object(n, 'stop_units', return_value=([], bad)):
                     self.assertTrue(n.stop_main(folder, self.data, current_timing)['errors'])
 
     def test_late_deadline_fails_despite_valid_completed_shutdown(self):

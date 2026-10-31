@@ -62,7 +62,10 @@ def run_stop_main(prestop, poststop, timing_contract=None, requested=2005., comp
         with patch.object(n, 'secure_bytes', side_effect=lambda p: p.read_bytes()), \
              patch.object(n, 'cgroup_pids', return_value=list(remaining_pids)), \
              patch.object(n, 'boot_id', return_value='boot'), \
-             patch.object(n, 'unit_evidence', side_effect=prestop), \
+             patch.object(n, 'unit_evidence', side_effect=(lambda *a: prestop.pop(0) if prestop else poststop) if isinstance(prestop, list) else [prestop, poststop]), \
+             patch.object(n.time, 'perf_counter', side_effect=[0, 10]), \
+             patch.object(n, 'terminate_invocation', side_effect=(lambda identity: stop_effects([identity['unit']])) if stop_effects else None), \
+             patch.object(n, 'registered_identity', return_value=timing_contract or timing()), \
              patch.object(n.time, 'monotonic', side_effect=[requested, completed]), \
              patch.object(n.time, 'clock_gettime', side_effect=[requested, completed]), \
              patch.object(n, 'stop_units', side_effect=stop_effects or
@@ -87,6 +90,9 @@ def observe_full_window(folder):
                  'Result': 'success', 'ControlGroup': 'g',
                  'ActiveEnterTimestampMonotonic': '200000000'}
         states = iter([dict(state, ActiveState='inactive'), dict(state, InvocationID='first')])
+        terminated = set()
+        stack.enter_context(patch.object(n, 'registered_identity', side_effect=lambda f, d, r: dict(timing(), unit=json.loads((f / (r + '-intent.json')).read_text())['unit'])))
+        stack.enter_context(patch.object(n, 'terminate_invocation', side_effect=lambda identity: terminated.add(identity['unit'])))
 
         class DB:
             def execute(self, *args): return self
@@ -114,10 +120,10 @@ def observe_full_window(folder):
         stack.enter_context(patch.object(n, 'memory_events',
                                          return_value={'oom': '0', 'oom_kill': '0', 'max': '0'}))
         stack.enter_context(patch.object(n, 'runtime_bound',
-                                         side_effect=lambda name='RuntimeMaxUSec':
+                                         side_effect=lambda name='RuntimeMaxUSec', unit=None:
                                              2040000000 if name == 'RuntimeMaxUSec' else 0))
         stack.enter_context(patch.object(n, 'arm_timer', return_value={'verified': True}))
-        stack.enter_context(patch.object(n, 'unit_evidence', side_effect=lambda u, *a: pre_unit(unit=u)))
+        stack.enter_context(patch.object(n, 'unit_evidence', side_effect=lambda u, *a: post_unit(unit=u) if u in terminated else pre_unit(unit=u)))
         stack.enter_context(patch.object(n, 'secure_bytes', side_effect=lambda p: p.read_bytes()))
         stack.enter_context(patch.object(n, 'cgroup_pids', return_value=[]))
         stop_calls = []
@@ -192,6 +198,7 @@ def run_audit(folder, audit_data=None, stopping=None, heartbeat_before=None,
          patch.object(n, 'boot_id', return_value='boot'), \
          patch.object(n, 'stop_units', side_effect=stopping or
                       (lambda units: helper_evidence(units))), \
+         patch.object(n, 'cancel_invocations', return_value=([], [effect(n.UNIT)])), \
          patch.object(n, 'runtime_identity', return_value=identity):
         code = n.audit(folder)
     return code, json.loads((folder / 'cleanup.json').read_text())
@@ -382,7 +389,9 @@ class TestFDeadlineNeverStopsHeartbeat(unittest.TestCase):
             with patch.object(n, 'trial_metadata', return_value=trial_data()), \
                  patch.object(n, 'monotonic_now', side_effect=[2066., 2066.1, 2067.]), \
                  patch.object(n, 'secure_bytes', side_effect=lambda p: p.read_bytes()), \
-                 patch.object(n, 'unit_evidence', return_value=pre_unit()), \
+                 patch.object(n, 'unit_evidence', side_effect=lambda u: post_unit(unit=u) if u in stopped else pre_unit(unit=u)), \
+                 patch.object(n, 'registered_identity', return_value=timing()), \
+                 patch.object(n, 'terminate_invocation', side_effect=lambda identity: stopped.append(identity['unit'])), \
                  patch.object(n, 'cgroup_pids', return_value=[]), \
                  patch.object(n, 'stop_units', side_effect=stopping), \
                  patch.object(n.subprocess, 'run', return_value=None):

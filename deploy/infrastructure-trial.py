@@ -10,6 +10,8 @@ import os
 from pathlib import Path
 import re
 import secrets
+import select
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -144,7 +146,13 @@ def invocation_unit(trial_id: str, role: str) -> str:
 def require_service_policy(unit=None):
     inspection = unit or INSPECTION_UNIT
     policy = dict(line.split('=', 1) for line in command('systemctl', 'show', inspection,
-                  '--property=ExecStart,Restart,KillMode,MemoryMax,CPUQuotaPerSecUSec,TasksMax,User').splitlines())
+                  '--property=ExecStart,ExecStartPreEx,Restart,KillMode,MemoryMax,CPUQuotaPerSecUSec,TasksMax,User').splitlines())
+    hook = policy.get('ExecStartPreEx', '')
+    hook_command = str(ROOT / '.venv/bin/python') + ' ' + str(ROOT / 'deploy/infrastructure-trial.py') + ' register --unit ' + inspection
+    if (hook.count('{ path=') != 1 or '{ path=' + str(ROOT / '.venv/bin/python') + ' ;' not in hook
+            or 'argv[]=' + hook_command + ' ;' not in hook
+            or 'flags=no-setuid ;' not in hook):
+        raise ValueError('required root registration hook missing or changed')
     expected_command = str(ROOT / '.venv/bin/python') + ' -m polymarket_bot.linux_mvp ingest'
     env_files = command('systemctl', 'show', inspection, '--property=EnvironmentFiles', '--value').strip()
     require_environment_files(env_files)
@@ -165,25 +173,99 @@ def runtime_bound(property_name='RuntimeMaxUSec', unit=None):
     return int(raw[1])
 
 
-def invocation_cgroup_kill(cgroup: str, invocation_id: str, timing: dict) -> None:
-    """Kill all processes in `cgroup` after verifying both IDs and path match `timing`.
+def terminate_invocation(identity):
+    """Signal pinned processes only; never send a systemd unit-name stop.
 
-    Fails closed if invocation ID or cgroup path differs from timing, or if cgroup is empty.
-    Treats absent cgroup as already-dead (safe no-op).
-    Does NOT substitute for the independent deadline timer; called before stop_units
-    to guarantee the exact pre-stop invocation is targeted even under PID reuse.
+    Recheck InvocationID after opening pidfds. A restart after that check cannot
+    retarget those descriptors. Recheck before every rescan to catch new children.
     """
-    if not cgroup:
-        raise ValueError('empty cgroup path; refuse cgroup kill')
-    if invocation_id != timing.get('invocation_id', ''):
-        raise ValueError('invocation identity mismatch; refuse cgroup kill')
-    if cgroup != timing.get('invocation_cgroup', ''):
-        raise ValueError('cgroup path mismatch against timing record; refuse cgroup kill')
-    kill_path = CGROUP_ROOT / cgroup.lstrip('/') / 'cgroup.kill'
+    unit = identity.get('unit', '')
+    invocation = identity.get('invocation_id', '')
+    group = identity.get('invocation_cgroup', '')
+    if not unit or not invocation or not group.startswith('/') or '..' in Path(group).parts:
+        raise ValueError('invocation identity incomplete')
+
+    def check():
+        state = properties(unit)
+        if state.get('InvocationID') != invocation or state.get('ControlGroup') != group:
+            raise ValueError('invocation identity changed; refuse signaling')
+        return state
+
+    state = check()
+    started = time.monotonic()
+    while True:
+        try:
+            directory = os.open(CGROUP_ROOT / group.lstrip('/'), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            break
+        except FileNotFoundError:
+            state = properties(unit)
+            if state.get('ActiveState') in ('inactive', 'failed') and not state.get('InvocationID'):
+                return
+            check()
+            if time.monotonic() - started >= 35:
+                raise TimeoutError('original invocation cgroup unavailable')
+            time.sleep(.1)
     try:
-        kill_path.write_text('1')
-    except FileNotFoundError:
-        pass  # cgroup already removed; process already dead — safe no-op
+        while True:
+            check()
+            descriptors = []
+            try:
+                with os.fdopen(os.open('cgroup.procs', os.O_RDONLY, dir_fd=directory)) as stream:
+                    pids = {int(pid) for pid in stream.read().split()}
+                for pid in pids:
+                    try:
+                        descriptor = os.pidfd_open(pid)
+                        try:
+                            poller = select.poll()
+                            poller.register(descriptor, select.POLLIN)
+                            if poller.poll(0):
+                                os.close(descriptor)
+                                continue
+                            membership = Path(f'/proc/{pid}/cgroup').read_text().splitlines()
+                            if '0::' + group not in membership:
+                                raise ValueError('process cgroup identity changed')
+                            descriptors.append(descriptor)
+                        except BaseException:
+                            os.close(descriptor)
+                            raise
+                    except (ProcessLookupError, FileNotFoundError):
+                        pass  # Exited after pidfd_open; continue pinning surviving members.
+                # No signals before this check, including when a PID was reused.
+                check()
+                elapsed = time.monotonic() - started
+                for descriptor in descriptors:
+                    try:
+                        signal.pidfd_send_signal(descriptor, signal.SIGKILL if elapsed >= 30 else signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                if not descriptors:
+                    state = properties(unit)
+                    with os.fdopen(os.open('cgroup.procs', os.O_RDONLY, dir_fd=directory)) as stream:
+                        empty = not stream.read().strip()
+                    if empty and state.get('ActiveState') != 'activating':
+                        return
+                    check()
+                    if elapsed >= 35:
+                        raise TimeoutError('original invocation still activating')
+                    time.sleep(.1)
+                    continue
+                poller = select.poll()
+                for descriptor in descriptors:
+                    poller.register(descriptor, select.POLLIN)
+                if len(poller.poll(100)) == len(descriptors):
+                    # A final rescan includes descendants forked before TERM.
+                    with os.fdopen(os.open('cgroup.procs', os.O_RDONLY, dir_fd=directory)) as stream:
+                        if not stream.read().strip():
+                            state = properties(unit)
+                            if state.get('ActiveState') != 'activating':
+                                return
+                if elapsed >= 35:
+                    raise TimeoutError('original invocation did not quiesce')
+            finally:
+                for descriptor in descriptors:
+                    os.close(descriptor)
+    finally:
+        os.close(directory)
 
 
 def verify_pilot(approval, evidence_root):
@@ -454,7 +536,7 @@ def runtime_identity():
     manifest = json.loads(secure_bytes(ROOT / 'runtime-manifest.json'))
     verify_host_runtime(manifest['host_python'])
     effective = command('systemctl', 'show', INSPECTION_UNIT, '--property=ExecStart,Environment,EnvironmentFiles,'
-                        'User,Group,WorkingDirectory,Restart,RuntimeMaxUSec,KillMode,TimeoutStopUSec,'
+                        'ExecStartPre,User,Group,WorkingDirectory,Restart,RuntimeMaxUSec,RuntimeRandomizedExtraUSec,KillMode,TimeoutStopUSec,'
                         'MemoryMax,CPUQuotaPerSecUSec,TasksMax,FragmentPath,DropInPaths')
     identity = fingerprint(ROOT, manifest, ENV.read_bytes(), command('systemctl', 'cat', TEMPLATE_UNIT), stable_effective_unit(effective))
     return identity, manifest
@@ -483,6 +565,86 @@ def check_approval(path, phase, seconds):
     if phase == 'soak':
         verify_pilot(approval, EVIDENCE)
     return identity, approval
+
+
+def prepare_invocation(folder, data, role, unit):
+    expected = rf'{re.escape(TEMPLATE_BASE)}@{re.escape(data["trial_id"])}-{role}-[0-9a-f]{{8}}\.service'
+    if role not in ('verify', 'main') or not re.fullmatch(expected, unit):
+        raise ValueError('invalid invocation intent')
+    require_service_policy(unit)
+    if (command('systemctl', 'cat', unit) != command('systemctl', 'cat', TEMPLATE_UNIT)
+            or runtime_bound(unit=unit) != (data['seconds'] + RUNTIME_MAX_PADDING) * 1000000
+            or runtime_bound('RuntimeRandomizedExtraUSec', unit=unit) != 0):
+        raise ValueError('actual invocation configuration/runtime differs')
+    write_once_json(folder / (role + '-intent.json'), {
+        'unit': unit, 'trial_id': data['trial_id'], 'boot_id': data['boot_id'],
+        'fingerprint': data['fingerprint'], 'runtime_usec': (data['seconds'] + RUNTIME_MAX_PADDING) * 1000000})
+
+
+def register_invocation(unit):
+    """Root ExecStartPre: durable, exclusive identity before ingest can execute."""
+    import fcntl
+    match = re.fullmatch(re.escape(TEMPLATE_BASE) + r'@((?:pilot|soak)-\d{8}T\d{6}Z)-(verify|main)-[0-9a-f]{8}\.service', unit)
+    if not match or os.geteuid() != 0:
+        raise ValueError('root template registration required')
+    trial, role = match.groups()
+    folder = EVIDENCE / trial
+    intent = json.loads(secure_bytes(folder / (role + '-intent.json')))
+    with (folder / 'invocations.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if (folder / 'cancelled.json').exists():
+            raise ValueError('trial cancelled before service start')
+        if intent['unit'] != unit or intent['boot_id'] != boot_id() or intent['trial_id'] != trial:
+            raise ValueError('invocation intent mismatch')
+        invocation = os.environ.get('INVOCATION_ID', '')
+        state = properties(unit)
+        if (not re.fullmatch('[0-9a-f]{32}', invocation) or state.get('InvocationID') != invocation
+                or not state.get('ControlGroup')):
+            raise ValueError('systemd invocation identity unavailable')
+        # Save identity even if policy fails, so cleanup can identify this failed start.
+        write_once_json(folder / (role + '-identity.json'), dict(intent,
+            invocation_id=invocation, invocation_cgroup=state['ControlGroup']))
+        require_service_policy(unit)
+        if command('systemctl', 'cat', unit) != command('systemctl', 'cat', TEMPLATE_UNIT):
+            raise ValueError('instance configuration differs from fingerprinted template')
+        if (runtime_bound(unit=unit) != intent['runtime_usec']
+                or runtime_bound('RuntimeRandomizedExtraUSec', unit=unit) != 0):
+            raise ValueError('actual invocation runtime policy mismatch')
+    return 0
+
+
+def registered_identity(folder, data, role):
+    intent = json.loads(secure_bytes(folder / (role + '-intent.json')))
+    identity = json.loads(secure_bytes(folder / (role + '-identity.json')))
+    expected = rf'{re.escape(TEMPLATE_BASE)}@{re.escape(data["trial_id"])}-{role}-[0-9a-f]{{8}}\.service'
+    if (not re.fullmatch(expected, intent['unit']) or any(identity.get(k) != v for k, v in intent.items())
+            or intent['trial_id'] != data['trial_id'] or intent['boot_id'] != data['boot_id']
+            or intent['fingerprint'] != data['fingerprint'] or boot_id() != data['boot_id']
+            or not re.fullmatch('[0-9a-f]{32}', identity.get('invocation_id', ''))):
+        raise ValueError('registered invocation identity mismatch')
+    return identity
+
+
+def cancel_invocations(folder, data):
+    """Prevent pending registrations, then clean only registered original processes."""
+    import fcntl
+    with (folder / 'invocations.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not (folder / 'cancelled.json').exists():
+            write_once_json(folder / 'cancelled.json', {'trial_id': data['trial_id'], 'boot_id': data['boot_id']})
+    errors, evidence = [], []
+    for role in ('verify', 'main'):
+        if not (folder / (role + '-intent.json')).exists():
+            continue
+        try:
+            identity = registered_identity(folder, data, role)
+            state = properties(identity['unit'])
+            if not quiescent(state, cgroup_pids(state.get('ControlGroup', ''))):
+                terminate_invocation(identity)
+            evidence.append(unit_evidence(identity['unit']))
+        except Exception as exc:
+            errors.append(role + ' registered cleanup: ' + str(exc))
+    return errors, evidence
 
 
 def stop_units(units):
@@ -568,16 +730,20 @@ def start_observation_timing(folder, data, service, unit=None):
     activation = int(service['ActiveEnterTimestampMonotonic']) / 1e6
     runtime = (data['seconds'] + RUNTIME_MAX_PADDING)
     expiry = baseline + data['seconds'] + DEADLINE_AFTER_SECONDS
+    target_unit = unit or service.get('unit') or UNIT
     invocation_cgroup = service.get('ControlGroup', '')
     if not invocation_cgroup:
         raise ValueError('activation cgroup path unavailable; cannot arm invocation-bound shutdown')
     if (activation <= 0 or activation > baseline or baseline - data['launch_mono'] >= STARTUP_SECONDS
-            or runtime_bound() != runtime * 1000000
-            or runtime_bound('RuntimeRandomizedExtraUSec') != 0
+            or runtime_bound(unit=target_unit) != runtime * 1000000
+            or runtime_bound('RuntimeRandomizedExtraUSec', unit=target_unit) != 0
             or activation + runtime - expiry < MIN_STOP_WINDOW):
         raise ValueError('activation/runtime/startup timing margin unavailable')
+    registered = registered_identity(folder, data, 'main')
+    if (registered['unit'] != target_unit or registered['invocation_id'] != service['InvocationID']
+            or registered['invocation_cgroup'] != invocation_cgroup):
+        raise ValueError('main registration differs from started invocation')
     effective = arm_timer(data, data['units'][2], expiry, 'deadline', folder)
-    target_unit = unit or service.get('unit') or UNIT
     timing = {'fingerprint': data['fingerprint'], 'boot_id': data['boot_id'],
               'unit': target_unit,
               'activation_mono': activation, 'baseline_mono': baseline, 'deadline_mono': expiry,
@@ -680,23 +846,29 @@ def record_main_shutdown(folder, data, timing):
     run_id = None
     try:
         run_id = validate_run_identity(folder, data, timing)
+        registered = registered_identity(folder, data, 'main')
+        if any(timing.get(k) != registered.get(k) for k in ('unit', 'invocation_id', 'invocation_cgroup')):
+            raise ValueError('timing/registration identity mismatch')
     except Exception as exc:
         errors.append('pre-stop run identity unavailable: ' + str(exc))
     pre_proof = {'trial_id': data['trial_id'], 'boot_id': data['boot_id'],
                  'at_mono': requested, 'run_id': run_id, 'units': pre_states, 'errors': errors.copy()}
     write_once_json(folder / 'shutdown-pre.json', pre_proof)
-    # Invocation-bound cgroup kill: targets the exact pre-stop cgroup before stop_units,
-    # guaranteeing that a replacement invocation in a distinct cgroup is never touched.
-    # Only executes when pre-stop identity is fully verified (no errors so far).
     if not errors:
         try:
-            pre_cgroup = pre_states[0]['properties'].get('ControlGroup', '') if pre_states else ''
-            pre_invocation = pre_states[0]['properties'].get('InvocationID', '') if pre_states else ''
-            invocation_cgroup_kill(pre_cgroup, pre_invocation, timing)
-        except (ValueError, OSError) as exc:
-            errors.append('invocation cgroup kill: ' + str(exc))
-    stop_errors, evidence = stop_units([unit])
-    errors.extend(stop_errors)
+            terminate_invocation(timing)
+        except (ValueError, OSError, TimeoutError, subprocess.SubprocessError) as exc:
+            errors.append('invocation shutdown: ' + str(exc))
+    evidence = []
+    try:
+        until = time.perf_counter() + 5
+        while True:
+            evidence = [unit_evidence(unit)]
+            if errors or quiescent(evidence[0]['properties'], evidence[0]['pids']) or time.perf_counter() >= until:
+                break
+            time.sleep(.1)
+    except (OSError, subprocess.SubprocessError) as exc:
+        errors.append('post-stop evidence: ' + str(exc))
     # systemd may clear ControlGroup after stop; inspect the captured target too.
     if pre_states and evidence:
         group = pre_states[0]['properties'].get('ControlGroup', '')
@@ -760,6 +932,9 @@ def validate_deadline(timing, proof, shutdown=None):
 def startup_timeout(folder):
     data = trial_metadata(folder)
     errors, evidence = stop_units([data['units'][1], data['units'][0], data['units'][6]])
+    main_errors, main_evidence = cancel_invocations(folder, data)
+    errors.extend(main_errors)
+    evidence.extend(main_evidence)
     write_json(folder / 'startup-stop.json', {'trigger_mono': time.monotonic(), 'units': evidence,
                                            'errors': ['startup watchdog expired', *errors]})
     return 1
@@ -780,22 +955,9 @@ def deadline(folder):
         errors.extend(proof['errors'])
     except Exception as exc:
         errors.append('deadline timing/shutdown evidence: ' + str(exc))
-        unit = timing.get('unit', '') if isinstance(timing, dict) else ''
-        if unit and timing.get('invocation_cgroup') and timing.get('invocation_id'):
-            try:
-                invocation_cgroup_kill(
-                    timing.get('invocation_cgroup', ''),
-                    timing.get('invocation_id', ''),
-                    timing,
-                )
-            except (ValueError, OSError, KeyError) as ckg_exc:
-                errors.append('deadline fallback cgroup kill: ' + str(ckg_exc))
-            stop_errors, main_evidence = stop_units([unit])
-            errors.extend(stop_errors)
-            proof = {'errors': errors.copy(), 'units': main_evidence}
-        else:
-            errors.append('deadline fallback refused: timing identity missing or corrupt')
-            proof = {'errors': errors.copy(), 'units': []}
+        stop_errors, main_evidence = cancel_invocations(folder, data)
+        errors.extend(stop_errors)
+        proof = {'errors': errors.copy(), 'units': main_evidence}
         # Do not reassign timing: original (possibly valid) timing used by downstream validate_timing.
         # validate_timing will fail on the incomplete synthetic proof dict, which is correct behavior.
     # Heartbeat helper (units[0]) keeps its full required lifetime (expiry =
@@ -1051,11 +1213,11 @@ def audit(folder):
             pass
 
     units_to_stop = [u for u in data['units'] if u != data['units'][5]]
-    if main_unit:
-        units_to_stop.insert(0, main_unit)
-
     stop_errors, evidence = stop_units(units_to_stop)
     errors.extend(stop_errors)
+    invocation_errors, invocation_evidence = cancel_invocations(folder, data)
+    errors.extend(invocation_errors)
+    evidence.extend(invocation_evidence)
     for item in evidence:
         if item['unit'].endswith('.timer') and item['properties']['ActiveState'] != 'inactive':
             errors.append(item['unit'] + ': timer not inactive')
@@ -1124,7 +1286,12 @@ def launch(phase, approval_path, reset_stop=False):
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     for previous in EVIDENCE.glob('*/launch.json'):
         metadata = json.loads(previous.read_text())
-        for unit in metadata['units']:
+        prior_units = list(metadata['units'])
+        for role in ('verify', 'main'):
+            intent_path = previous.parent / (role + '-intent.json')
+            if intent_path.exists():
+                prior_units.append(json.loads(secure_bytes(intent_path))['unit'])
+        for unit in prior_units:
             info = unit_evidence(unit)
             if not quiescent(info['properties'], info['pids']) or (unit.endswith('.timer') and info['properties']['ActiveState'] != 'inactive'):
                 raise ValueError('previous trial jobs still active: ' + unit)
@@ -1212,6 +1379,7 @@ def observe(folder, reset_stop=False):
         require_service_policy()
         verify_unit = invocation_unit(data['trial_id'], 'verify')
         first_start_us = time.time_ns() // 1000
+        prepare_invocation(folder, data, 'verify', verify_unit)
         command('systemctl', 'start', verify_unit, timeout=45)
         started_unit = verify_unit
         started = True
@@ -1220,7 +1388,15 @@ def observe(folder, reset_stop=False):
         if initial['ActiveState'] != 'active' or int(initial['MainPID']) <= 0:
             raise ValueError('service failed startup')
         first = initial
-        restart_errors, stopped = stop_units([verify_unit])
+        terminate_invocation(registered_identity(folder, data, 'verify'))
+        stopped = [unit_evidence(verify_unit)]
+        restart_errors = []
+        until = time.monotonic() + 5
+        while not quiescent(stopped[0]['properties'], stopped[0]['pids']) and time.monotonic() < until:
+            time.sleep(.1)
+            stopped = [unit_evidence(verify_unit)]
+        if not quiescent(stopped[0]['properties'], stopped[0]['pids']):
+            restart_errors.append('verify invocation not quiescent')
         started_unit = None
         started = False
         if restart_errors:
@@ -1229,6 +1405,7 @@ def observe(folder, reset_stop=False):
         require_service_policy()
         main_unit = invocation_unit(data['trial_id'], 'main')
         continuous_start_us = time.time_ns() // 1000
+        prepare_invocation(folder, data, 'main', main_unit)
         command('systemctl', 'start', main_unit, timeout=45)
         started_unit = main_unit
         started = True
@@ -1316,11 +1493,11 @@ def observe(folder, reset_stop=False):
                     result['terminal_service'] = proof['units']
                 except Exception as exc:
                     errors.append('shutdown evidence: ' + str(exc))
-                    stop_errors, evidence = stop_units([started_unit])
+                    stop_errors, evidence = cancel_invocations(folder, data)
                     errors.extend(stop_errors)
                     result['terminal_service'] = evidence
             else:
-                stop_errors, evidence = stop_units([started_unit])
+                stop_errors, evidence = cancel_invocations(folder, data)
                 errors.extend(stop_errors)
                 result['terminal_service'] = evidence
         if db_path is not None:
@@ -1352,12 +1529,17 @@ def observe(folder, reset_stop=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=('fingerprint', 'launch', 'observe', 'deadline', 'audit', 'inspect-cleanup', 'snapshot', 'startup-timeout'))
+    parser.add_argument('action', choices=('fingerprint', 'launch', 'observe', 'deadline', 'audit', 'inspect-cleanup', 'snapshot', 'startup-timeout', 'register'))
+    parser.add_argument('--unit')
     parser.add_argument('--phase', choices=('pilot', 'soak'), default='pilot')
     parser.add_argument('--approval', type=Path)
     parser.add_argument('--folder', type=Path)
     parser.add_argument('--reset-stop', action='store_true')
     args = parser.parse_args()
+    if args.action == 'register':
+        if not args.unit:
+            parser.error('--unit required')
+        return register_invocation(args.unit)
     if args.action == 'fingerprint':
         identity, manifest = runtime_identity()
         print(json.dumps({'fingerprint': identity, 'git_sha': manifest['git_sha'], 'scope': 'INFRASTRUCTURE_ONLY'}, indent=2))

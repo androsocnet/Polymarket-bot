@@ -96,6 +96,12 @@ class TestObserverShutdownDefect(unittest.TestCase):
             with patch.object(native, 'trial_metadata', return_value=data), \
                  patch.object(native, 'check_approval'), \
                  patch.object(native, 'require_service_policy'), \
+                 patch.multiple(native,
+                     prepare_invocation=MagicMock(side_effect=lambda f, d, r, u: (f / (r + '-test-unit')).write_text(u)),
+                     registered_identity=MagicMock(side_effect=lambda f, d, r: {'unit': (f / (r + '-test-unit')).read_text()}),
+                     terminate_invocation=MagicMock(),
+                     unit_evidence=MagicMock(return_value={'properties': {'ActiveState': 'inactive', 'MainPID': '0', 'ControlPID': '0'}, 'pids': []}),
+                     cancel_invocations=MagicMock(side_effect=lambda f, d: ([stop_calls.append([p.read_text()]) for p in f.glob('*-test-unit')] and [], []))), \
                  patch.object(native, 'environment', return_value={'MVP_DB_PATH': str(source), 'MVP_BOT_ID': 'bot', 'MVP_STATE_DIR': str(folder)}), \
                  patch.object(native, 'snapshot', return_value=snapshot_data), \
                  patch.object(native, 'properties', side_effect=states), \
@@ -326,6 +332,12 @@ class TestStaleDiagnosticsTimestampSafety(unittest.TestCase):
             with patch.object(native, 'trial_metadata', return_value=data), \
                  patch.object(native, 'check_approval'), \
                  patch.object(native, 'require_service_policy'), \
+                 patch.multiple(native,
+                     prepare_invocation=MagicMock(side_effect=lambda f, d, r, u: (f / (r + '-test-unit')).write_text(u)),
+                     registered_identity=MagicMock(side_effect=lambda f, d, r: {'unit': (f / (r + '-test-unit')).read_text()}),
+                     terminate_invocation=MagicMock(),
+                     unit_evidence=MagicMock(return_value={'properties': {'ActiveState': 'inactive', 'MainPID': '0', 'ControlPID': '0'}, 'pids': []}),
+                     cancel_invocations=MagicMock(side_effect=lambda f, d: ([stop_calls.append([p.read_text()]) for p in f.glob('*-test-unit')] and [], []))), \
                  patch.object(native, 'environment', return_value={'MVP_DB_PATH': str(source), 'MVP_BOT_ID': 'bot', 'MVP_STATE_DIR': str(folder)}), \
                  patch.object(native, 'snapshot', return_value=snapshot_data), \
                  patch.object(native, 'properties', side_effect=states), \
@@ -422,6 +434,12 @@ class TestStartupEarlyCleanup(unittest.TestCase):
             with patch.object(native, 'trial_metadata', return_value=data), \
                  patch.object(native, 'check_approval'), \
                  patch.object(native, 'require_service_policy'), \
+                 patch.multiple(native,
+                     prepare_invocation=MagicMock(side_effect=lambda f, d, r, u: (f / (r + '-test-unit')).write_text(u)),
+                     registered_identity=MagicMock(side_effect=lambda f, d, r: {'unit': (f / (r + '-test-unit')).read_text()}),
+                     terminate_invocation=MagicMock(),
+                     unit_evidence=MagicMock(return_value={'properties': {'ActiveState': 'inactive', 'MainPID': '0', 'ControlPID': '0'}, 'pids': []}),
+                     cancel_invocations=MagicMock(side_effect=lambda f, d: ([stop_calls.append([p.read_text()]) for p in f.glob('*-test-unit')] and [], []))), \
                  patch.object(native, 'environment', return_value={'MVP_DB_PATH': str(source), 'MVP_BOT_ID': 'bot', 'MVP_STATE_DIR': str(folder)}), \
                  patch.object(native, 'snapshot', return_value=snapshot_data), \
                  patch.object(native, 'properties', side_effect=states), \
@@ -469,6 +487,12 @@ class TestStartupEarlyCleanup(unittest.TestCase):
             with patch.object(native, 'trial_metadata', return_value=data), \
                  patch.object(native, 'check_approval'), \
                  patch.object(native, 'require_service_policy'), \
+                 patch.multiple(native,
+                     prepare_invocation=MagicMock(side_effect=lambda f, d, r, u: (f / (r + '-test-unit')).write_text(u)),
+                     registered_identity=MagicMock(side_effect=lambda f, d, r: {'unit': (f / (r + '-test-unit')).read_text()}),
+                     terminate_invocation=MagicMock(),
+                     unit_evidence=MagicMock(return_value={'properties': {'ActiveState': 'inactive', 'MainPID': '0', 'ControlPID': '0'}, 'pids': []}),
+                     cancel_invocations=MagicMock(side_effect=lambda f, d: ([stop_calls.append([p.read_text()]) for p in f.glob('*-test-unit')] and [], []))), \
                  patch.object(native, 'environment', return_value={'MVP_DB_PATH': str(source), 'MVP_BOT_ID': 'bot', 'MVP_STATE_DIR': str(folder)}), \
                  patch.object(native, 'snapshot', return_value=snapshot_data), \
                  patch.object(native, 'properties', side_effect=states), \
@@ -519,6 +543,12 @@ class TestStartupEarlyCleanup(unittest.TestCase):
             with patch.object(native, 'trial_metadata', return_value=data), \
                  patch.object(native, 'check_approval'), \
                  patch.object(native, 'require_service_policy'), \
+                 patch.multiple(native,
+                     prepare_invocation=MagicMock(side_effect=lambda f, d, r, u: (f / (r + '-test-unit')).write_text(u)),
+                     registered_identity=MagicMock(side_effect=lambda f, d, r: {'unit': (f / (r + '-test-unit')).read_text()}),
+                     terminate_invocation=MagicMock(),
+                     unit_evidence=MagicMock(return_value={'properties': {'ActiveState': 'inactive', 'MainPID': '0', 'ControlPID': '0'}, 'pids': []}),
+                     cancel_invocations=MagicMock(side_effect=lambda f, d: ([stop_calls.append([p.read_text()]) for p in f.glob('*-test-unit')] and [], []))), \
                  patch.object(native, 'environment', return_value={'MVP_DB_PATH': str(source), 'MVP_BOT_ID': 'bot', 'MVP_STATE_DIR': str(folder)}), \
                  patch.object(native, 'snapshot', return_value=snapshot_data), \
                  patch.object(native, 'properties', return_value=state), \
