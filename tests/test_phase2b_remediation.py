@@ -249,7 +249,7 @@ class TestPostExitAuditContract(unittest.TestCase):
             folder = Path(directory)
             data = {'trial_id': 'pilot-20261027T000000Z', 'units': native.owned('pilot-20261027T000000Z')}
             (folder / 'cleanup.json').write_text('{"errors": []}')
-            state = dict(ActiveState='inactive', SubState='dead', MainPID='0', ControlPID='0', Result='success', ExecMainStatus='0')
+            state = dict(ActiveState='inactive', SubState='dead', MainPID='0', ControlPID='0', Result='success', ExecMainStatus='0', ExecMainCode='1', LoadState='loaded')
             with patch.object(native, 'trial_metadata', return_value=data), \
                  patch.object(native, 'unit_evidence', side_effect=lambda u: {'unit': u, 'properties': state, 'pids': []}), \
                  patch.object(native, 'command', return_value='0 jobs listed.\n'):

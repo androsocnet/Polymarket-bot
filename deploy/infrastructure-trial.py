@@ -23,7 +23,8 @@ TRADING = ('orders', 'positions', 'settlements', 'decisions', 'equity')
 PROPERTIES = ('LoadState,ActiveState,SubState,MainPID,ControlPID,Result,NRestarts,InvocationID,'
               'ControlGroup,Restart,RuntimeMaxUSec,MemoryCurrent,MemoryPeak,MemoryMax,'
               'CPUUsageNSec,CPUQuotaPerSecUSec,TasksMax,ExecMainCode,ExecMainStatus,ActiveEnterTimestampMonotonic,'
-              'InactiveEnterTimestampMonotonic,RuntimeRandomizedExtraUSec')
+              'InactiveEnterTimestampMonotonic,RuntimeRandomizedExtraUSec,ExecMainPID,'
+              'ExecMainStartTimestampMonotonic,ExecMainExitTimestampMonotonic')
 
 # Phase durations (seconds) — separate approval required when these change.
 PILOT_SECONDS = 1800
@@ -489,7 +490,11 @@ def monotonic_now(data):
 
 
 def helper_options():
-    return ['--property=Restart=no', '--property=KillMode=control-group', '--property=RemainAfterExit=no',
+    # RemainAfterExit=yes: systemd retains the terminal state (Result, ExecMainCode/Status)
+    # of a successful transient helper after exit instead of garbage-collecting the unit;
+    # stopped/failed units retain state until stopped/reset-failed, giving audit() and
+    # post-exit inspect-cleanup a genuine exited-process proof (no journal-only evidence).
+    return ['--property=Restart=no', '--property=KillMode=control-group', '--property=RemainAfterExit=yes',
             '--property=TimeoutStopSec=10', '--setenv=PYTHONDONTWRITEBYTECODE=1',
             '--setenv=PYTHONPATH=' + str(ROOT / 'src'), '--property=MemoryMax=256M', '--property=CPUQuota=50%']
 
@@ -716,6 +721,22 @@ def deadline(folder):
     # launch + startup + seconds + 120; helper RuntimeMaxSec adds exit margin):
     # it self-terminates at coverage; stopping it here would truncate host
     # continuity before T+seconds+120 and fail host continuity evidence.
+    # Observer terminal evidence must be captured BEFORE this stop: stopping a
+    # successful retained transient unloads it, and the audit (which runs later)
+    # can only resolve the observer through this persisted, trial-bound snapshot.
+    try:
+        observer_exit = unit_evidence(data['units'][1])
+    except Exception as exc:
+        observer_exit = None
+        errors.append('observer terminal evidence unavailable: ' + str(exc))
+    try:
+        write_json(folder / 'deadline-stop.json', {'trial_id': data['trial_id'],
+                   'boot_id': data.get('boot_id'), 'at': timestamps(time.time()),
+                   'trigger_mono': trigger,
+                   'helper_exits': [observer_exit] if observer_exit is not None else [],
+                   'errors': [*errors, 'deadline stop incomplete']})
+    except Exception as exc:
+        errors.append('observer terminal evidence persistence: ' + str(exc))
     stop_errors, evidence = stop_units([data['units'][1], data['units'][2],
                                         *data['units'][6:]])
     errors.extend(stop_errors)
@@ -725,7 +746,9 @@ def deadline(folder):
         validate_shutdown_records(folder, data, timing, result, proof)
     except Exception as exc:
         errors.append(str(exc))
-    write_json(folder / 'deadline-stop.json', {'at': timestamps(time.time()), 'trigger_mono': trigger,
+    write_json(folder / 'deadline-stop.json', {'trial_id': data['trial_id'],
+               'boot_id': data.get('boot_id'), 'at': timestamps(time.time()), 'trigger_mono': trigger,
+               'helper_exits': [observer_exit] if observer_exit is not None else [],
                'units': evidence, 'shutdown': proof, 'errors': errors})
     try:
         # Whole snapshot subprocess includes integrity/digests/hash under one hard timeout.
@@ -738,6 +761,15 @@ def deadline(folder):
 
 
 def validate_helper_exits(data, evidence, include_audit=False):
+    """Verify successful terminal helper results from the PRE-STOP unit snapshot.
+
+    `evidence` must be captured before any systemctl stop: stopping unloads a
+    successful transient unit, so post-stop evidence can never prove success.
+    A retained (RemainAfterExit=yes) successful helper shows ActiveState=active,
+    SubState=exited, ExecMainCode=1 (exited normally), ExecMainStatus=0 and an
+    empty cgroup. An unloaded unit lists only placeholder properties that never
+    prove a genuine successful exit and is rejected for required helpers.
+    """
     main = next((item for item in evidence if item['unit'] == UNIT), None)
     if (main is None or main['properties'].get('ActiveState') != 'inactive'
             or main['properties'].get('Result') != 'success'
@@ -751,15 +783,74 @@ def validate_helper_exits(data, evidence, include_audit=False):
         unit, state = item['unit'], item['properties']
         if not unit.endswith('.service') or unit == UNIT:
             continue
-        if state.get('LoadState') == 'not-found' and unit not in required:
+        if state.get('LoadState') == 'not-found':
+            if unit in required:
+                raise ValueError(unit + ': successful terminal helper evidence missing')
             continue  # Canceled/unstarted optional transient helper.
-        if (state.get('ActiveState') != 'inactive' or state.get('Result') != 'success'
+        terminated = ((state.get('ActiveState') == 'inactive' and state.get('SubState') == 'dead')
+                      or (state.get('ActiveState') == 'active' and state.get('SubState') == 'exited'))
+        if (not terminated or state.get('Result') != 'success'
+                or state.get('ExecMainCode') != '1'
                 or state.get('ExecMainStatus') != '0'
                 or not quiescent(state, item['pids'])):
             raise ValueError(unit + ': successful terminal helper result unavailable')
         seen.add(unit)
     if not required <= seen:
-        raise ValueError('required terminal helper evidence missing')
+        raise ValueError('successful terminal helper evidence missing for required helpers')
+
+
+def bound_helper_records(folder, data):
+    """Trial-bound pre-stop terminal snapshots persisted by controller helpers.
+
+    Deadline and audit stop successful retained transient helpers, and systemd
+    unloads such a unit on stop, erasing its properties. The journal is not used
+    as evidence; instead each controller step persists the pre-stop `systemctl
+    show` snapshot (bound to the exact trial ID and boot ID) before its stops.
+    """
+    records = {}
+    for name in ('cleanup.json', 'deadline-stop.json'):
+        try:
+            record = json.loads((folder / name).read_text())
+        except (OSError, ValueError):
+            continue
+        if (record.get('trial_id') != data['trial_id']
+                or record.get('boot_id') != data['boot_id']):
+            continue
+        allowed = {data['units'][1]} if name == 'deadline-stop.json' else {
+            data['units'][0], data['units'][3]}
+        for item in record.get('helper_exits') or []:
+            unit = item.get('unit') if isinstance(item, dict) else None
+            if unit not in allowed:
+                continue
+            state = item.get('properties', {})
+            try:
+                start = int(state['ExecMainStartTimestampMonotonic']) / 1e6
+                end = int(state['ExecMainExitTimestampMonotonic']) / 1e6
+                bound = (state['LoadState'] == 'loaded' and state['InvocationID']
+                         and int(state['ExecMainPID']) > 0
+                         and data['launch_mono'] <= start <= end
+                         <= data['audit_expiry_mono'] + 600)
+            except (KeyError, TypeError, ValueError):
+                bound = False
+            if bound and unit not in records:
+                records[unit] = item
+    return records
+
+
+def resolve_helper_exits(folder, data, helper_exits, units):
+    """Substitute unloaded required helpers with their persisted pre-stop snapshots."""
+    records = bound_helper_records(folder, data)
+    resolved = list(helper_exits)
+    audit_verified = []
+    for unit in units:
+        index = next((i for i, item in enumerate(resolved) if item['unit'] == unit), None)
+        if index is None:
+            continue
+        if (resolved[index]['properties'].get('LoadState') == 'not-found'
+                and unit in records):
+            resolved[index] = records[unit]
+            audit_verified.append(unit)
+    return resolved, audit_verified
 
 
 def inspect_cleanup(folder):
@@ -772,15 +863,18 @@ def inspect_cleanup(folder):
         props = item['properties']
         if not quiescent(props, item['pids']) or (item['unit'].endswith('.timer') and props['ActiveState'] != 'inactive'):
             errors.append(item['unit'] + ': not cleaned')
+    resolved, audit_verified = resolve_helper_exits(
+        folder, data, evidence, (data['units'][0], data['units'][1], data['units'][3]))
     try:
-        validate_helper_exits(data, evidence, include_audit=True)
+        validate_helper_exits(data, resolved, include_audit=True)
     except ValueError as exc:
         errors.append(str(exc))
     jobs = command('systemctl', 'list-jobs', '--no-legend', '--plain')
     for unit in [UNIT, *data['units']]:
         if unit in jobs.split():
             errors.append(unit + ': pending job')
-    return {'trial_id': data['trial_id'], 'at': timestamps(time.time()), 'units': evidence,
+    return {'trial_id': data['trial_id'], 'boot_id': boot_id(), 'at': timestamps(time.time()),
+            'audit_verified_helpers': audit_verified, 'units': evidence,
             'errors': errors, 'verdict': 'BLOCKED' if errors else 'PENDING_REVIEW'}
 
 
@@ -815,27 +909,61 @@ def heartbeat_coverage_error(folder, data):
 
 def audit(folder):
     data = trial_metadata(folder)
-    errors, heartbeat_before = [], None
+    errors, helper_exits = [], []
+    # Terminal helper evidence must exist BEFORE stopping: systemctl stop unloads a
+    # successful transient helper (RemainAfterExit retention keeps it inspectable),
+    # so pre-stop snapshots are the only durable terminal-state proof.
+    for unit in data['units']:
+        if unit == data['units'][5]:
+            continue  # The running audit service is validated post-exit by inspection.
+        try:
+            helper_exits.append(unit_evidence(unit))
+        except Exception as exc:
+            errors.append('helper terminal evidence unavailable for ' + unit + ': ' + str(exc))
+    helper_exits, audit_verified = resolve_helper_exits(
+        folder, data, helper_exits, (data['units'][0], data['units'][1], data['units'][3]))
+    heartbeat_before = next((item for item in helper_exits if item['unit'] == data['units'][0]),
+                            None)
     try:
-        heartbeat_before = unit_evidence(data['units'][0])
+        if heartbeat_before is None:
+            raise ValueError('unit evidence unavailable')
         state = heartbeat_before['properties']
-        if (state.get('LoadState') == 'not-found' or state.get('ActiveState') != 'inactive'
+        terminated = ((state.get('ActiveState') == 'inactive' and state.get('SubState') == 'dead')
+                      or (state.get('ActiveState') == 'active' and state.get('SubState') == 'exited'))
+        if (state.get('LoadState') == 'not-found' or not terminated
                 or state.get('Result') != 'success' or state.get('ExecMainCode') != '1'
                 or state.get('ExecMainStatus') != '0'
                 or not quiescent(state, heartbeat_before['pids'])):
             errors.append('heartbeat did not self-terminate successfully before audit')
     except Exception as exc:
         errors.append('heartbeat pre-cleanup evidence unavailable: ' + str(exc))
+    try:
+        write_json(folder / 'cleanup.json', {'trial_id': data['trial_id'],
+                   'boot_id': boot_id(), 'at': timestamps(time.time()),
+                   'helper_exits': helper_exits, 'errors': [*errors, 'audit cleanup incomplete']})
+    except Exception as exc:
+        errors.append('helper terminal evidence persistence: ' + str(exc))
     stop_errors, evidence = stop_units([UNIT, *(u for u in data['units'] if u != data['units'][5])])
     errors.extend(stop_errors)
     for item in evidence:
         if item['unit'].endswith('.timer') and item['properties']['ActiveState'] != 'inactive':
             errors.append(item['unit'] + ': timer not inactive')
+    # Runtime identity is recomputed and reported independently of helper checks:
+    # a failure above must never suppress the final fingerprint evaluation, and a
+    # fingerprint mismatch must not change the BLOCKED verdict either way.
+    final_identity = {'expected_fingerprint': data['fingerprint'], 'fingerprint': None,
+                      'matches_launch': False}
     try:
-        validate_helper_exits(data, evidence)
         identity, _ = runtime_identity()
+        final_identity.update(fingerprint=identity, matches_launch=identity == data['fingerprint'])
         if identity != data['fingerprint']:
             errors.append('final runtime fingerprint changed')
+    except Exception as exc:
+        final_identity['error'] = str(exc)
+        errors.append('final runtime identity recompute: ' + str(exc))
+    try:
+        shown_main = [item for item in evidence if item['unit'] == UNIT]
+        validate_helper_exits(data, shown_main + helper_exits)
         if not (folder / 'deadline.json').exists():
             errors.append('independent deadline evidence missing')
         elif json.loads((folder / 'deadline.json').read_text())['errors']:
@@ -856,9 +984,11 @@ def audit(folder):
     coverage_error = heartbeat_coverage_error(folder, data)
     if coverage_error:
         errors.append(coverage_error)
-    write_json(folder / 'cleanup.json', {'at': timestamps(time.time()), 'units': evidence,
-                                       'heartbeat_before_cleanup': heartbeat_before,
-                                       'errors': errors, 'verdict': 'BLOCKED' if errors else 'PENDING_REVIEW'})
+    write_json(folder / 'cleanup.json', {'trial_id': data['trial_id'], 'boot_id': boot_id(),
+              'at': timestamps(time.time()), 'helper_exits': helper_exits,
+              'audit_verified_helpers': audit_verified, 'units': evidence,
+              'heartbeat_before_cleanup': heartbeat_before, 'final_runtime_identity': final_identity,
+              'errors': errors, 'verdict': 'BLOCKED' if errors else 'PENDING_REVIEW'})
     return 1 if errors else 0
 
 

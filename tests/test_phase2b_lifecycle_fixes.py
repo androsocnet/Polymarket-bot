@@ -177,16 +177,50 @@ def write_host_records(folder, coverage_mono=1868., raw=None):
     return records
 
 
-def run_audit(folder, audit_data=None, stopping=None, heartbeat_before=None):
-    heartbeat = heartbeat_before or helper_evidence([trial_data()['units'][0]])[1][0]
-    with patch.object(n, 'unit_evidence', return_value=heartbeat), \
+def run_audit(folder, audit_data=None, stopping=None, heartbeat_before=None,
+              identity=('hash', {}), evidence_effect=None):
+    if evidence_effect is not None:
+        effect = evidence_effect
+    elif heartbeat_before is not None:
+        effect = lambda u: heartbeat_before if u == trial_data()['units'][0] else \
+            helper_evidence([u])[1][0]
+    else:
+        effect = lambda u: helper_evidence([u])[1][0]
+    with patch.object(n, 'unit_evidence', side_effect=effect), \
          patch.object(n, 'trial_metadata', return_value=audit_data or trial_data()), \
          patch.object(n, 'secure_bytes', side_effect=lambda p: p.read_bytes()), \
+         patch.object(n, 'boot_id', return_value='boot'), \
          patch.object(n, 'stop_units', side_effect=stopping or
                       (lambda units: helper_evidence(units))), \
-         patch.object(n, 'runtime_identity', return_value=('hash', {})):
+         patch.object(n, 'runtime_identity', return_value=identity):
         code = n.audit(folder)
     return code, json.loads((folder / 'cleanup.json').read_text())
+
+
+AUDIT_SERVICE = 5   # Owned-units index of the running audit.service.
+OBSERVER = 1
+DEADLINE_SERVICE = 3
+HEARTBEAT = 0
+
+
+def running_audit_service(unit):
+    """Real audit-service state while audit() executes (cannot capture itself)."""
+    return {'unit': unit, 'properties': dict(
+        LoadState='loaded', ActiveState='active', SubState='running', MainPID='99',
+        ControlPID='0', Result='', ExecMainCode='0', ExecMainStatus='0',
+        InvocationID='audit-service-inv'), 'pids': []}
+
+
+def bind_deadline_observer_record(folder, data, state=None, trial_id=None, boot_id='boot',
+                                  include_binding=True):
+    """Persist bound observer pre-stop snapshot into deadline-stop.json (as deadline() does)."""
+    proof = json.loads((folder / 'deadline-stop.json').read_text())
+    if include_binding:
+        proof['trial_id'] = trial_id if trial_id is not None else data['trial_id']
+        proof['boot_id'] = boot_id
+    proof['helper_exits'] = [state or retained_success(data['units'][OBSERVER])]
+    (folder / 'deadline-stop.json').write_text(json.dumps(proof))
+    return proof
 
 
 def full_audit_folder(folder, coverage_mono=2385., prestop=True, shutdown_errors=False):
@@ -308,11 +342,20 @@ class TestFDeadlineNeverStopsHeartbeat(unittest.TestCase):
             write_host_records(folder, coverage_mono=1868.)
             stopped = []
             def stopping(units):
+                record_path = folder / 'deadline-stop.json'
+                self.assertTrue(record_path.exists(), 'observer proof must be durable before stop')
+                record = json.loads(record_path.read_text())
+                self.assertEqual(record['helper_exits'][0]['unit'], trial_data()['units'][1])
+                self.assertEqual(record['trial_id'], TRIAL)
+                self.assertTrue(record['errors'], 'in-progress deadline must not appear successful')
                 stopped.append(list(units))
                 return helper_evidence(units)
             with patch.object(n, 'trial_metadata', return_value=trial_data()), \
                  patch.object(n, 'monotonic_now', return_value=2066.), \
                  patch.object(n, 'secure_bytes', side_effect=lambda p: p.read_bytes()), \
+                 patch.object(n, 'unit_evidence',
+                              side_effect=lambda u: retained_success(u)), \
+                 patch.object(n, 'boot_id', return_value='boot'), \
                  patch.object(n, 'stop_units', side_effect=stopping), \
                  patch.object(n.subprocess, 'run', return_value=None):
                 self.assertEqual(n.deadline(folder), 0)
@@ -320,6 +363,11 @@ class TestFDeadlineNeverStopsHeartbeat(unittest.TestCase):
             self.assertNotIn(heartbeat, [u for call in stopped for u in call])
             persisted = json.loads((folder / 'deadline-stop.json').read_text())
             self.assertNotIn(heartbeat, [item['unit'] for item in persisted['units']])
+            # FIX 3: deadline persists the observer pre-stop snapshot, bound to trial/boot.
+            self.assertEqual(persisted['helper_exits'][0]['unit'],
+                             trial_data()['units'][1])
+            self.assertEqual(persisted['helper_exits'][0]['properties']['ExecMainCode'], '1')
+            self.assertEqual(persisted['trial_id'], TRIAL)
 
     def test_deadline_stops_active_main_without_observer_shutdown(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -357,6 +405,9 @@ class TestFDeadlineNeverStopsHeartbeat(unittest.TestCase):
             with patch.object(n, 'trial_metadata', return_value=trial_data()), \
                  patch.object(n, 'monotonic_now', return_value=2066.), \
                  patch.object(n, 'secure_bytes', side_effect=lambda p: p.read_bytes()), \
+                 patch.object(n, 'unit_evidence',
+                              side_effect=lambda u: retained_success(u)), \
+                 patch.object(n, 'boot_id', return_value='boot'), \
                  patch.object(n, 'stop_units', side_effect=lambda units: helper_evidence(units)), \
                  patch.object(n.subprocess, 'run', return_value=None):
                 self.assertEqual(n.deadline(folder), 0)
@@ -428,7 +479,9 @@ class TestIAuditEvaluatesAllHelpers(unittest.TestCase):
                 return helper_evidence(units, override=lambda u, s:
                                        dict(s, ActiveState='failed', Result='failed',
                                             ExecMainCode='1', ExecMainStatus='1') if u == heartbeat else s)
-            code, report = run_audit(folder, stopping=failing)
+            def failing_prestop(u):
+                return failing([u])[1][0]
+            code, report = run_audit(folder, stopping=failing, evidence_effect=failing_prestop)
             self.assertEqual(code, 1)
             self.assertTrue(any('terminal helper result unavailable' in e for e in report['errors']))
 
@@ -450,6 +503,7 @@ class TestIAuditEvaluatesAllHelpers(unittest.TestCase):
             self.assertIsNone(n.heartbeat_coverage_error(folder, data))
             with patch.object(n, 'trial_metadata', return_value=data), \
                  patch.object(n, 'unit_evidence', side_effect=lambda u: timed_out([u])[1][0]), \
+                 patch.object(n, 'stop_units', return_value=([], [])), \
                  patch.object(n, 'command', return_value=''):
                 inspected = n.inspect_cleanup(folder)
             self.assertEqual(inspected['verdict'], 'BLOCKED')
@@ -532,6 +586,331 @@ class TestJHistoricalRegressionFixture(unittest.TestCase):
             full_audit_folder(folder, coverage_mono=2385., prestop=True, shutdown_errors=False)
             code, report = run_audit(folder)
             self.assertEqual(code, 0, report['errors'])
+
+
+def retained_success(unit, invocation='helper-inv'):
+    """Terminal state a successful transient helper leaves under RemainAfterExit=yes retention."""
+    state = dict(LoadState='loaded', ActiveState='active', SubState='exited', MainPID='0',
+                 ControlPID='0', Result='success', ExecMainCode='1', ExecMainStatus='0',
+                 NRestarts='0', InvocationID=invocation, ControlGroup='', ExecMainPID='123',
+                 ExecMainStartTimestampMonotonic='100000000',
+                 ExecMainExitTimestampMonotonic='2000000000',
+                 ActiveEnterTimestampMonotonic='100000000',
+                 InactiveEnterTimestampMonotonic='0')
+    return {'unit': unit, 'properties': state, 'pids': []}
+
+
+def gc_placeholder(unit):
+    """Post-garbage-collection 'show' output: unit unloaded, properties are defaults."""
+    state = dict(LoadState='not-found', ActiveState='inactive', SubState='dead', MainPID='0',
+                 ControlPID='0', Result='success', ExecMainCode='0', ExecMainStatus='0',
+                 NRestarts='0', InvocationID='', ControlGroup='')
+    return {'unit': unit, 'properties': state, 'pids': []}
+
+
+class TestKTerminalRetentionValidation(unittest.TestCase):
+    """FIX 3: systemd-backed terminal retention is the only accepted successful-helper proof."""
+
+    def test_retained_successful_helper_accepted(self):
+        data = trial_data()
+        evidence = [post_unit()] + [retained_success(u) for u in data['units']]
+        n.validate_helper_exits(data, evidence)
+
+    def test_unloaded_successful_helper_fails(self):
+        data = trial_data()
+        evidence = [post_unit()] + [gc_placeholder(u) for u in data['units']]
+        with self.assertRaisesRegex(ValueError, 'successful terminal helper evidence missing'):
+            n.validate_helper_exits(data, evidence)
+
+    def test_sigterm_killed_helper_fails(self):
+        data = trial_data()
+        evidence = [post_unit()] + [retained_success(u) for u in data['units']]
+        heartbeat = data['units'][0]
+        item = next(i for i in evidence if i['unit'] == heartbeat)
+        item['properties'].update(ExecMainCode='2', ExecMainStatus='15', Result='signal')
+        with self.assertRaisesRegex(ValueError, 'successful terminal helper result unavailable'):
+            n.validate_helper_exits(data, evidence)
+
+    def test_runtime_limit_helper_fails(self):
+        data = trial_data()
+        evidence = [post_unit()] + [retained_success(u) for u in data['units']]
+        heartbeat = data['units'][0]
+        item = next(i for i in evidence if i['unit'] == heartbeat)
+        item['properties'].update(ActiveState='failed', SubState='failed',
+                                  Result='timeout', ExecMainCode='2', ExecMainStatus='15')
+        with self.assertRaisesRegex(ValueError, 'successful terminal helper result unavailable'):
+            n.validate_helper_exits(data, evidence)
+
+    def test_residual_cgroup_pids_fails(self):
+        data = trial_data()
+        evidence = [post_unit()] + [retained_success(u) for u in data['units']]
+        heartbeat = data['units'][0]
+        item = next(i for i in evidence if i['unit'] == heartbeat)
+        item['pids'] = [4242]
+        with self.assertRaisesRegex(ValueError, 'successful terminal helper result unavailable'):
+            n.validate_helper_exits(data, evidence)
+
+    def test_contradictory_exit_status_fails(self):
+        data = trial_data()
+        evidence = [post_unit()] + [retained_success(u) for u in data['units']]
+        heartbeat = data['units'][0]
+        item = next(i for i in evidence if i['unit'] == heartbeat)
+        item['properties']['ExecMainStatus'] = '1'  # Result=success claimed but exit code nonzero.
+        with self.assertRaisesRegex(ValueError, 'successful terminal helper result unavailable'):
+            n.validate_helper_exits(data, evidence)
+
+    def test_wrong_unit_snapshot_fails(self):
+        data = trial_data()
+        evidence = [post_unit()] + [retained_success(u) for u in data['units']
+                                    if u != data['units'][0]]
+        with self.assertRaisesRegex(ValueError, 'successful terminal helper evidence missing'):
+            n.validate_helper_exits(data, evidence)
+
+
+def post_pilot_units(u):
+    """Realistic post-pilot state: audit.service still running, observer already
+    stopped/unloaded by deadline(), timers elapsed, helpers retained-success."""
+    data = trial_data()
+    timers = {data['units'][2], data['units'][4], data['units'][6]}
+    if u == n.UNIT:
+        return post_unit()
+    if u == data['units'][5]:
+        return running_audit_service(u)
+    if u in timers or u in (data['units'][OBSERVER], data['units'][7]):
+        return gc_placeholder(u)
+    return retained_success(u)
+
+
+class TestLAuditUsesPreStopTerminalSnapshot(unittest.TestCase):
+    """FIX 3: audit validates the pre-stop terminal snapshot, persisted in cleanup.json."""
+
+    def test_audit_accepts_real_completed_pilot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            full_audit_folder(folder, coverage_mono=2385.)
+            data = trial_data()
+            bind_deadline_observer_record(folder, data)
+            def stopping(units):
+                record_path = folder / 'cleanup.json'
+                self.assertTrue(record_path.exists(), 'helper proof must be durable before stop')
+                record = json.loads(record_path.read_text())
+                self.assertTrue(record['errors'], 'in-progress audit must stay blocked')
+                return [], [gc_placeholder(u) for u in units]
+            code, report = run_audit(folder, stopping=stopping,
+                                     evidence_effect=post_pilot_units)
+            self.assertEqual(code, 0, report['errors'])
+            self.assertEqual(report['verdict'], 'PENDING_REVIEW')
+            exit_units = [item['unit'] for item in report['helper_exits']]
+            self.assertNotIn(data['units'][5], exit_units)  # Running audit.service never captured.
+            # Only helpers unloaded before audit resolve through persisted records.
+            self.assertEqual(report['audit_verified_helpers'], [data['units'][1]])
+            self.assertEqual(report['trial_id'], TRIAL)
+            self.assertEqual(report['boot_id'], 'boot')
+
+    def test_missing_deadline_observer_record_blocks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            full_audit_folder(folder, coverage_mono=2385.)
+            data = trial_data()
+            bind_deadline_observer_record(folder, data, include_binding=False)
+            def stopping(units):
+                return [], [gc_placeholder(u) for u in units]
+            code, report = run_audit(folder, stopping=stopping,
+                                     evidence_effect=post_pilot_units)
+            self.assertEqual(code, 1, report['errors'])
+            self.assertEqual(report['verdict'], 'BLOCKED')
+            self.assertIn(data['units'][OBSERVER] + ': successful terminal helper evidence missing',
+                          report['errors'])
+
+    def test_wrong_trial_deadline_record_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            full_audit_folder(folder, coverage_mono=2385.)
+            data = trial_data()
+            bind_deadline_observer_record(folder, data, trial_id='soak-20250101T000000Z')
+            def stopping(units):
+                return [], [gc_placeholder(u) for u in units]
+            code, report = run_audit(folder, stopping=stopping,
+                                     evidence_effect=post_pilot_units)
+            self.assertEqual(code, 1)
+            self.assertTrue(any('successful terminal helper evidence missing' in e
+                                for e in report['errors']))
+
+    def test_stale_or_unbound_deadline_record_rejected(self):
+        for field, value in (('InvocationID', ''), ('ExecMainPID', '0'),
+                             ('ExecMainStartTimestampMonotonic', '1'),
+                             ('ExecMainExitTimestampMonotonic', '0')):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                folder = Path(directory)
+                full_audit_folder(folder)
+                data = trial_data()
+                observer = retained_success(data['units'][OBSERVER])
+                observer['properties'][field] = value
+                bind_deadline_observer_record(folder, data, state=observer)
+                code, report = run_audit(folder, evidence_effect=post_pilot_units)
+                self.assertEqual(code, 1, report)
+
+    def test_contradictory_deadline_record_rejected(self):
+        """Observer snapshot that cannot prove genuine success makes audit fail."""
+        for mutation in (lambda state: state['properties'].update(
+                             ExecMainCode='2', ExecMainStatus='15', ActiveState='active',
+                             SubState='exited'),
+                         lambda state: state['properties'].update(
+                             ActiveState='active', SubState='running', MainPID='7')):
+            with self.subTest(), tempfile.TemporaryDirectory() as directory:
+                folder = Path(directory)
+                full_audit_folder(folder, coverage_mono=2385.)
+                data = trial_data()
+                observer = retained_success(data['units'][OBSERVER])
+                mutation(observer)
+                bind_deadline_observer_record(folder, data, state=observer)
+                def stopping(units):
+                    return [], [gc_placeholder(u) for u in units]
+                code, report = run_audit(folder, stopping=stopping,
+                                         evidence_effect=post_pilot_units)
+                self.assertEqual(code, 1)
+                self.assertEqual(report['verdict'], 'BLOCKED')
+
+    def test_audit_blocks_when_heartbeat_gc_before_audit(self):
+        """Reproduce pilot-20261030T200555Z: unretained helper gone when audit runs."""
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            full_audit_folder(folder, coverage_mono=2385.)
+            data = trial_data()
+            bind_deadline_observer_record(folder, data)
+            def evidence_effect(u):
+                if u == n.UNIT:
+                    return post_unit()
+                if u == data['units'][5]:
+                    return running_audit_service(u)
+                item = post_pilot_units(u)
+                if u == data['units'][0]:
+                    item = gc_placeholder(u)
+                return item
+            def stopping(units):
+                return [], [gc_placeholder(u) for u in units]
+            code, report = run_audit(folder, stopping=stopping, evidence_effect=evidence_effect)
+            self.assertEqual(code, 1)
+            self.assertEqual(report['verdict'], 'BLOCKED')
+            self.assertIn('heartbeat did not self-terminate successfully before audit',
+                          report['errors'])
+
+    def test_audit_recomputes_identity_despite_helper_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            full_audit_folder(folder)
+            data = trial_data()
+            heartbeat = data['units'][0]
+            def evidence_effect(u):
+                item = retained_success(u)
+                if u == heartbeat:
+                    item['properties'].update(Result='timeout', ExecMainCode='2',
+                                              ExecMainStatus='15', ActiveState='failed',
+                                              SubState='failed')
+                return item
+            identity = 'mismatched-fingerprint'
+            code, report = run_audit(folder, identity=(identity, {}),
+                                     evidence_effect=evidence_effect)
+            self.assertEqual(code, 1)
+            self.assertIn('heartbeat did not self-terminate successfully before audit',
+                          report['errors'])
+            self.assertIn('final runtime fingerprint changed', report['errors'])
+            self.assertEqual(report['final_runtime_identity']['fingerprint'], identity)
+            self.assertFalse(report['final_runtime_identity']['matches_launch'])
+
+    def test_audit_reports_identity_unavailable_despite_helper_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            full_audit_folder(folder)
+            data = trial_data()
+            heartbeat = data['units'][0]
+            def evidence_effect(u):
+                item = retained_success(u)
+                if u == heartbeat:
+                    item['properties'].update(Result='timeout', ExecMainCode='2',
+                                              ExecMainStatus='15', ActiveState='failed',
+                                              SubState='failed')
+                return item
+            with patch.object(n, 'trial_metadata', return_value=data), \
+                 patch.object(n, 'unit_evidence', side_effect=evidence_effect), \
+                 patch.object(n, 'secure_bytes', side_effect=lambda p: p.read_bytes()), \
+                 patch.object(n, 'stop_units', side_effect=lambda units: helper_evidence(units)), \
+                 patch.object(n, 'runtime_identity',
+                              side_effect=ValueError('systemctl unavailable')):
+                code = n.audit(folder)
+            report = json.loads((folder / 'cleanup.json').read_text())
+            self.assertEqual(code, 1)
+            self.assertTrue(any('final runtime identity recompute' in e for e in report['errors']))
+            self.assertTrue(any('heartbeat did not self-terminate' in e for e in report['errors']))
+
+
+class TestMInspectCleanupPostExit(unittest.TestCase):
+    """FIX 3: post-exit inspection read-only: retained audit-service success + audit-verified helpers."""
+
+    def inspect(self, folder, audit_service_success=True, wrong_trial=False):
+        data = trial_data()
+        timer_units = {data['units'][2], data['units'][4], data['units'][6]}
+        gone_units = {data['units'][0], data['units'][1], data['units'][3]}  # Stopped by audit.
+        record = {'trial_id': TRIAL if not wrong_trial else 'pilot-20250101T000000Z',
+                  'boot_id': 'boot', 'errors': [], 'verdict': 'PENDING_REVIEW',
+                  'helper_exits': [retained_success(u) for u in
+                                   [data['units'][0], data['units'][1], data['units'][3]]]}
+        (folder / 'cleanup.json').write_text(json.dumps(record))
+        bind_deadline_observer_record(folder, data,
+                                      trial_id=record['trial_id'])
+        def evidence_effect(u):
+            if u == n.UNIT:
+                return {'unit': n.UNIT, 'properties': dict(
+                    LoadState='loaded', ActiveState='inactive', SubState='dead', MainPID='0',
+                    ControlPID='0', Result='success', ExecMainCode='0', ExecMainStatus='0',
+                    InvocationID='', ControlGroup=''), 'pids': []}
+            if u in timer_units or u in gone_units:
+                return gc_placeholder(u)
+            if u == data['units'][5] and not audit_service_success:
+                return gc_placeholder(u)
+            return retained_success(u)
+        with patch.object(n, 'trial_metadata', return_value=data), \
+             patch.object(n, 'unit_evidence', side_effect=evidence_effect), \
+             patch.object(n, 'secure_bytes', side_effect=lambda p: p.read_bytes()), \
+             patch.object(n, 'command', return_value=''), \
+             patch.object(n, 'boot_id', return_value='boot'):
+            result = n.inspect_cleanup(folder)
+        return result
+
+    def test_retained_audit_service_and_audit_verified_helpers_accepted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            full_audit_folder(folder)
+            result = self.inspect(folder)
+            self.assertEqual(result['verdict'], 'PENDING_REVIEW', result['errors'])
+            self.assertEqual(result['errors'], [])
+            data = trial_data()
+            self.assertEqual(result['audit_verified_helpers'],
+                             [data['units'][0], data['units'][1], data['units'][3]])
+            self.assertEqual(sorted(p.name for p in folder.iterdir()),
+                             sorted(['cleanup.json', 'deadline-stop.json', 'deadline.json',
+                                     'restart-verification.json', 'result.json', 'shutdown.json',
+                                     'shutdown-pre.json', 'startup-handoff.json', 'timing.json',
+                                     'host.json.jsonl']),
+                             'post-exit inspection must remain read-only')
+
+    def test_wrong_trial_binding_rejected_as_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            full_audit_folder(folder)
+            result = self.inspect(folder, wrong_trial=True)
+            self.assertEqual(result['verdict'], 'BLOCKED')
+            self.assertTrue(any('successful terminal helper evidence missing' in e
+                                for e in result['errors']))
+
+    def test_audit_service_state_unavailable_blocks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            full_audit_folder(folder)
+            result = self.inspect(folder, audit_service_success=False)
+            self.assertEqual(result['verdict'], 'BLOCKED')
+            self.assertTrue(any('successful terminal helper evidence missing' in e
+                                for e in result['errors']))
 
 
 def terminal_heartbeat(expiry):

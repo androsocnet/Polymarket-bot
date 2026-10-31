@@ -212,8 +212,10 @@ class NativeEvidenceRegressions(unittest.TestCase):
             self.assertEqual([c[1] for c in commands], ['--unit=' + data['units'][0], '--unit=' + data['units'][1]])
             self.assertEqual([c.args[1] for c in timers.call_args_list], [data['units'][4], data['units'][6]])
             for call in commands:
-                self.assertIn('--property=RemainAfterExit=no', call)
-                self.assertNotIn('--remain-after-exit=no', call)
+                # FIX 3: systemd-backed terminal-state retention keeps the successful
+                # exited helper inspectable for the independent audit (was 'no').
+                self.assertIn('--property=RemainAfterExit=yes', call)
+                self.assertNotIn('--remain-after-exit=yes', call)
             self.assertEqual(data['seconds'], seconds)
             self.assertEqual(data['deadline_after_seconds'], seconds + 60)
             self.assertAlmostEqual(data['audit_expiry_mono'] - data['launch_mono'], seconds + 840)
@@ -286,7 +288,7 @@ class NativeEvidenceRegressions(unittest.TestCase):
         from unittest.mock import patch
         data = {'trial_id': 'pilot-20261027T000000Z', 'units': self.native.owned('pilot-20261027T000000Z')}
         def item(unit):
-            return {'unit': unit, 'properties': {'ActiveState': 'inactive', 'SubState': 'dead', 'MainPID': '0', 'ControlPID': '0', 'Result': 'success', 'ExecMainStatus': '0'}, 'pids': []}
+            return {'unit': unit, 'properties': {'ActiveState': 'inactive', 'SubState': 'dead', 'MainPID': '0', 'ControlPID': '0', 'Result': 'success', 'ExecMainStatus': '0', 'ExecMainCode': '1', 'LoadState': 'loaded'}, 'pids': []}
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory)
             (folder / 'cleanup.json').write_text('{"errors": []}')
@@ -492,10 +494,10 @@ class NativeEvidenceRegressions(unittest.TestCase):
                 return [], [{'unit': u, 'properties': {'ActiveState': 'inactive', 'SubState': 'dead', 'MainPID': '0', 'ControlPID': '0', 'Result': 'success', 'ExecMainStatus': '0'}, 'pids': []} for u in units]
             heartbeat = helper_evidence([data['units'][0]])[1][0]
             self.addCleanup(patch.stopall)
-            patch.object(self.native, 'unit_evidence', return_value=heartbeat).start()
+            patch.object(self.native, 'unit_evidence', side_effect=lambda u: helper_evidence([u])[1][0]).start()
             shutdown = json.loads((folder / 'shutdown.json').read_text())
             (folder / 'deadline-stop.json').write_text(json.dumps(dict(errors=[], trigger_mono=2066, shutdown=shutdown)))
-            with patch.object(self.native, 'secure_bytes', side_effect=lambda p: p.read_bytes()), patch.object(self.native, 'validate_timing'), patch.object(self.native, 'trial_metadata', return_value=data), patch.object(self.native, 'stop_units', side_effect=stop), patch.object(self.native, 'runtime_identity', return_value=('hash', {})):
+            with patch.object(self.native, 'secure_bytes', side_effect=lambda p: p.read_bytes()), patch.object(self.native, 'validate_timing'), patch.object(self.native, 'trial_metadata', return_value=data), patch.object(self.native, 'boot_id', return_value='boot'), patch.object(self.native, 'stop_units', side_effect=stop), patch.object(self.native, 'runtime_identity', return_value=('hash', {})):
                 self.assertEqual(self.native.audit(folder), 0)
             self.assertEqual(stopped, [self.native.UNIT, *(u for u in data['units'] if u != data['units'][5])])
             self.assertEqual(json.loads((folder / 'cleanup.json').read_text())['errors'], [])
@@ -519,7 +521,7 @@ class NativeEvidenceRegressions(unittest.TestCase):
             def backup(*args, **kwargs):
                 self.assertTrue((folder / 'deadline-stop.json').exists())
                 raise subprocess.TimeoutExpired('snapshot', 60)
-            with patch.object(self.native, 'trial_metadata', return_value=data), patch.object(self.native, 'stop_units', return_value=([], [])), patch.object(self.native, 'monotonic_now', return_value=1961), patch.object(self.native, 'secure_bytes', return_value=b'{"deadline_mono": 1960, "runtime_expiry_mono": 2135}'), patch.object(self.native, 'stop_main', return_value={'errors': [], 'units': []}), patch.object(self.native, 'validate_timing'), patch.object(self.native, 'validate_shutdown_records'), patch.object(self.native.subprocess, 'run', side_effect=backup):
+            with patch.object(self.native, 'trial_metadata', return_value=data), patch.object(self.native, 'stop_units', return_value=([], [])), patch.object(self.native, 'unit_evidence', side_effect=lambda u: {'unit': u, 'properties': {}, 'pids': []}), patch.object(self.native, 'monotonic_now', return_value=1961), patch.object(self.native, 'secure_bytes', return_value=b'{"deadline_mono": 1960, "runtime_expiry_mono": 2135}'), patch.object(self.native, 'stop_main', return_value={'errors': [], 'units': []}), patch.object(self.native, 'validate_timing'), patch.object(self.native, 'validate_shutdown_records'), patch.object(self.native.subprocess, 'run', side_effect=backup):
                 self.assertEqual(self.native.deadline(folder), 1)
             self.assertTrue((folder / 'deadline-stop.json').exists())
             self.assertIn('deadline backup', json.loads((folder / 'deadline.json').read_text())['errors'][0])
@@ -529,7 +531,7 @@ class NativeEvidenceRegressions(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory)
             data = {'trial_id': 'pilot-20261027T000000Z', 'units': self.native.owned('pilot-20261027T000000Z')}
-            with patch.object(self.native, 'trial_metadata', return_value=data), patch.object(self.native, 'stop_units', return_value=(['stop failed'], [])), patch.object(self.native, 'environment', return_value={'MVP_DB_PATH': '/unused'}), patch.object(self.native, 'monotonic_now', return_value=1961), patch.object(self.native, 'secure_bytes', return_value=b'{"deadline_mono": 1960, "runtime_expiry_mono": 2135}'), patch.object(self.native, 'stop_main', return_value={'errors': [], 'units': []}), patch.object(self.native, 'validate_timing'), patch.object(self.native, 'validate_shutdown_records'), patch.object(self.native.subprocess, 'run', return_value=None):
+            with patch.object(self.native, 'trial_metadata', return_value=data), patch.object(self.native, 'stop_units', return_value=(['stop failed'], [])), patch.object(self.native, 'environment', return_value={'MVP_DB_PATH': '/unused'}), patch.object(self.native, 'unit_evidence', side_effect=lambda u: {'unit': u, 'properties': {}, 'pids': []}), patch.object(self.native, 'monotonic_now', return_value=1961), patch.object(self.native, 'secure_bytes', return_value=b'{"deadline_mono": 1960, "runtime_expiry_mono": 2135}'), patch.object(self.native, 'stop_main', return_value={'errors': [], 'units': []}), patch.object(self.native, 'validate_timing'), patch.object(self.native, 'validate_shutdown_records'), patch.object(self.native.subprocess, 'run', return_value=None):
                 self.assertEqual(self.native.deadline(folder), 1)
             self.assertEqual(json.loads((folder / 'deadline.json').read_text())['errors'], ['stop failed'])
 

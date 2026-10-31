@@ -214,7 +214,7 @@ class LifecycleTests(TimingTests):
                               run_id='run', at_mono=2006, units=shutdown['pre_states'], errors=[])}
                 for name, value in values.items():
                     (folder / name).write_text(json.dumps(value))
-                with patch.object(n, 'trial_metadata', return_value=self.data), patch.object(n, 'monotonic_now', return_value=trigger), patch.object(n, 'secure_bytes', side_effect=lambda p: p.read_bytes()), patch.object(n, 'stop_units', return_value=([], [])), patch.object(n.subprocess, 'run', return_value=None):
+                with patch.object(n, 'trial_metadata', return_value=self.data), patch.object(n, 'monotonic_now', return_value=trigger), patch.object(n, 'secure_bytes', side_effect=lambda p: p.read_bytes()), patch.object(n, 'unit_evidence', side_effect=lambda u: {'unit': u, 'properties': dict(ActiveState='inactive', SubState='dead', MainPID='0', ControlPID='0', Result='success', ExecMainCode='1', ExecMainStatus='0', LoadState='loaded'), 'pids': []}), patch.object(n, 'stop_units', return_value=([], [])), patch.object(n.subprocess, 'run', return_value=None):
                     self.assertEqual(n.deadline(folder), expected)
                 proof = json.loads((folder / 'deadline-stop.json').read_text())
                 self.assertEqual(proof['trigger_mono'], trigger)
@@ -222,7 +222,7 @@ class LifecycleTests(TimingTests):
     def test_deadline_missing_timing_still_stops_main_and_records_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory)
-            with patch.object(n, 'trial_metadata', return_value=self.data), patch.object(n, 'monotonic_now', return_value=2100), patch.object(n, 'secure_bytes', side_effect=FileNotFoundError('missing timing')), patch.object(n, 'stop_units', return_value=([], [])) as stop, patch.object(n.subprocess, 'run', return_value=None):
+            with patch.object(n, 'trial_metadata', return_value=self.data), patch.object(n, 'monotonic_now', return_value=2100), patch.object(n, 'secure_bytes', side_effect=FileNotFoundError('missing timing')), patch.object(n, 'unit_evidence', side_effect=lambda u: {'unit': u, 'properties': dict(ActiveState='inactive', SubState='dead', MainPID='0', ControlPID='0', Result='success', ExecMainCode='1', ExecMainStatus='0', LoadState='loaded'), 'pids': []}), patch.object(n, 'stop_units', return_value=([], [])) as stop, patch.object(n.subprocess, 'run', return_value=None):
                 code = n.deadline(folder)
             self.assertEqual(code, 1)
             self.assertTrue(any(n.UNIT in c.args[0] for c in stop.call_args_list))
@@ -242,13 +242,13 @@ class LifecycleTests(TimingTests):
                 folder = Path(directory)
                 (folder / 'cleanup.json').write_text('{"errors": []}')
                 def evidence(unit):
-                    state = dict(ActiveState='inactive', SubState='dead', MainPID='0', ControlPID='0', Result='success', ExecMainStatus='0', LoadState='loaded')
+                    state = dict(ActiveState='inactive', SubState='dead', MainPID='0', ControlPID='0', Result='success', ExecMainStatus='0', ExecMainCode='1', LoadState='loaded')
                     if unit == self.data['units'][0]:
                         state.update(ExecMainCode='1', ExecMainStatus='0')  # Heartbeat self-exits successfully.
                     if unit == failed:
                         state.update(ActiveState='failed', SubState='failed', Result='timeout')
                     return {'unit': unit, 'properties': state, 'pids': []}
-                with patch.object(n, 'trial_metadata', return_value=self.data), patch.object(n, 'unit_evidence', side_effect=evidence), patch.object(n, 'command', return_value=''):
+                with patch.object(n, 'trial_metadata', return_value=self.data), patch.object(n, 'unit_evidence', side_effect=evidence), patch.object(n, 'command', return_value=''), patch.object(n, 'stop_units', return_value=([], [])):
                     report = n.inspect_cleanup(folder)
                 self.assertEqual(report['verdict'], 'BLOCKED' if failed else 'PENDING_REVIEW')
 
