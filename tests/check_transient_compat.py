@@ -14,7 +14,10 @@ import argparse
 import json
 import os
 from pathlib import Path
-import pwd
+try:
+    import pwd
+except ImportError:
+    pwd = None
 import re
 import select
 import signal
@@ -23,7 +26,7 @@ import sys
 import time
 import uuid
 
-UNIT_RE = re.compile(r'p2b-transient-[0-9a-f]{32}-(?:orig|repl|canary)\.service\Z')
+UNIT_RE = re.compile(r'p2b-transient-([0-9a-f]{32})-(?:orig|repl|canary)\.service\Z')
 PROPS = ('LoadState,ActiveState,SubState,Result,MainPID,ControlPID,ControlGroup,ExecMainStatus,'
          'User,Group,NoNewPrivileges,CapabilityBoundingSet,RestrictNamespaces,KillMode,Restart,'
          'ProtectSystem,ProtectHome,ProtectControlGroups,PrivateTmp,RestrictSUIDSGID,LockPersonality,'
@@ -60,7 +63,7 @@ def cgroup_empty(path):
 def empty(unit, retained_group=None):
     state = properties(unit)
     for group in {state.get('ControlGroup'), retained_group} - {None, ''}:
-        path = Path('/sys/fs/cgroup' + group)
+        path = Path('/sys/fs/cgroup') / group.lstrip('/')
         try:
             if not cgroup_empty(path):
                 return False
@@ -72,12 +75,29 @@ def empty(unit, retained_group=None):
                  or (state['ActiveState'] == 'active' and state['SubState'] == 'exited')))
 
 
-def emergency_stop(unit, expected_token=None):
+def read_fifo(fifo_path, timeout=10):
+    """Non-blocking FIFO read with select timeout. Raises TimeoutError if writer never comes."""
+    fd = os.open(str(fifo_path), os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        r, _, _ = select.select([fd], [], [], timeout)
+        if not r:
+            raise TimeoutError(f'timeout waiting for payload on {fifo_path}')
+        with open(fd, 'r', closefd=False) as f:
+            line = f.readline()
+        if not line:
+            raise RuntimeError(f'empty read from {fifo_path}')
+        return json.loads(line)
+    finally:
+        os.close(fd)
+
+
+def emergency_stop(unit, expected_token: str) -> None:
     """Emergency shutdown of a specific transient unit. Fails closed on invalid identity."""
-    if not UNIT_RE.fullmatch(unit):
+    m = UNIT_RE.fullmatch(unit)
+    if not m:
         raise ValueError(f'refuse non-disposable or invalid unit name: {unit}')
-    if expected_token is not None and expected_token not in unit:
-        raise ValueError(f'identity mismatch: token {expected_token} not in unit {unit}')
+    if m.group(1) != expected_token:
+        raise ValueError(f'identity mismatch: token {expected_token!r} != {m.group(1)!r}')
     try:
         run('systemctl', 'stop', unit)
     except subprocess.CalledProcessError as exc:
@@ -194,8 +214,7 @@ def coordinator(wsl=False):
         run('systemd-run', '--quiet', f'--unit={units["orig"]}',
             *('--property=' + p for p in base_props), '--',
             '/usr/bin/python3', '-I', '-B', str(script), '--payload', str(fifo_orig), 'orig')
-        with open(fifo_orig, 'r') as f:
-            reports['orig'] = json.loads(f.readline())
+        reports['orig'] = read_fifo(fifo_orig)
         orig_props = properties(units['orig'])
         groups[units['orig']] = orig_props.get('ControlGroup')
         assert orig_props['ActiveState'] == 'active'
@@ -208,8 +227,7 @@ def coordinator(wsl=False):
         run('systemd-run', '--quiet', f'--unit={units["repl"]}',
             *('--property=' + p for p in base_props), '--',
             '/usr/bin/python3', '-I', '-B', str(script), '--payload', str(fifo_repl), 'repl')
-        with open(fifo_repl, 'r') as f:
-            reports['repl'] = json.loads(f.readline())
+        reports['repl'] = read_fifo(fifo_repl)
         repl_props = properties(units['repl'])
         groups[units['repl']] = repl_props.get('ControlGroup')
         assert repl_props['ActiveState'] == 'active'

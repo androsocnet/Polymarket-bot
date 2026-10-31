@@ -68,6 +68,48 @@ class TransientSafetyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             m.emergency_stop('p2b-transient-wrong-name.service', expected_token='valid_token')
 
+    def test_emergency_stop_none_token_raises(self):
+        if not SCRIPT.exists():
+            self.skipTest('probe not implemented yet')
+        m = self.load()
+        with self.assertRaises((TypeError, ValueError)):
+            m.emergency_stop('p2b-transient-' + 'a' * 32 + '-orig.service', expected_token=None)
+
+    def test_emergency_stop_substring_token_raises(self):
+        if not SCRIPT.exists():
+            self.skipTest('probe not implemented yet')
+        m = self.load()
+        with self.assertRaises(ValueError):
+            m.emergency_stop('p2b-transient-' + 'a' * 32 + '-orig.service', expected_token='orig')
+
+    def test_read_fifo_timeout_raises(self):
+        import os
+        if not SCRIPT.exists():
+            self.skipTest('probe not implemented yet')
+        m = self.load()
+        with tempfile.TemporaryDirectory() as d:
+            fifo = Path(d) / 'test.fifo'
+            os.mkfifo(fifo)
+            with self.assertRaises(TimeoutError):
+                m.read_fifo(fifo, timeout=0.1)
+
+    def test_pwd_import_guarded(self):
+        if not SCRIPT.exists():
+            self.skipTest('probe not implemented yet')
+        # Module source must not have bare 'import pwd' at module level
+        source = SCRIPT.read_text()
+        self.assertIn('try:', source)
+        self.assertIn('import pwd', source)
+        # Confirm it's inside a try block (not at column 0 alone)
+        lines = source.splitlines()
+        for i, line in enumerate(lines):
+            if line.strip() == 'import pwd':
+                # Must be indented (inside try block) or guarded
+                self.assertTrue(line.startswith('    ') or
+                                any('try' in lines[j] for j in range(max(0, i-3), i)),
+                                'import pwd must be inside a try block')
+                break
+
 
 if __name__ == '__main__':
     unittest.main()
