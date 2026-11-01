@@ -17,15 +17,16 @@ ENABLE=0 # No boot enablement, even on repeat install.
 if [[ "${EUID}" -ne 0 ]]; then echo 'run as root (sudo)' >&2; exit 1; fi
 command -v uv >/dev/null || { echo 'uv required for frozen hash-verified dependencies' >&2; exit 1; }
 python3 -c 'import sys; assert sys.version_info >= (3,12)'
-if systemctl list-units --all --plain --no-legend 'polymarket-btc-infrastructure@*' | grep -Eq ' (active|activating|deactivating) '; then
-    echo 'infrastructure service must be inactive' >&2; exit 1
+APPROVED_BASE=69079bbce0c4a02ed1a7f81f3c5128b430841aab
+HARNESS_TREE="$(git -C "${SOURCE_DIR}" ls-tree "${SHA}" -- tests/check_phase2b_vps.py)" || exit 1
+if ! git -C "${SOURCE_DIR}" merge-base --is-ancestor "${APPROVED_BASE}" "${SHA}" ||
+   ! git -C "${SOURCE_DIR}" diff --quiet "${APPROVED_BASE}" "${SHA}" -- deploy/infrastructure-trial.py deploy/polymarket-btc-infrastructure@.service ||
+   [[ -n "${HARNESS_TREE}" ]]; then
+    echo 'unapproved release lineage/controller/template or harness release base' >&2; exit 1
 fi
-if systemctl is-active --quiet polymarket-btc-infrastructure.service; then
-    echo 'legacy static infrastructure service must be inactive' >&2; exit 1
-fi
-if systemctl list-units --all --plain --no-legend 'infra-*' | grep -Eq ' (active|activating|deactivating) '; then
-    echo 'infrastructure trial jobs still active' >&2; exit 1
-fi
+# Includes legacy polymarket-btc-infrastructure.service; no active-unit cleanup.
+# Read-only admission must precede account, ownership, marker and configuration changes.
+PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -I -B "${SOURCE_DIR}/deploy/infrastructure-install-guard.py"
 if [[ -L "${APP_DIR}" || -e "${APP_DIR}" ]]; then
     echo "release already exists: ${APP_DIR}; verify manifest, do not overwrite" >&2; exit 1
 fi
