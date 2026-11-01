@@ -106,6 +106,111 @@ class DescriptorShutdown(unittest.TestCase):
 
 
 class ReviewRegressions(unittest.TestCase):
+    def test_main_launch_after_hook_empty_scan_is_still_terminated(self):
+        hook = subprocess.Popen(['sleep', '0.1'])
+        main = None
+        waiter = None
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                group = Path(td) / 'original.service'
+                group.mkdir()
+                procs = group / 'cgroup.procs'
+                procs.write_text(str(hook.pid))
+                identity = dict(unit='original.service', invocation_id='original', invocation_cgroup='/original.service')
+                calls = 0
+                def state(unit):
+                    nonlocal calls, main, waiter
+                    calls += 1
+                    if calls == 3:
+                        hook.wait(timeout=2)
+                        procs.write_text('')
+                    if calls == 4:
+                        main = subprocess.Popen(['sleep', '60'])
+                        procs.write_text(str(main.pid))
+                        def reap():
+                            main.wait()
+                            try:
+                                procs.write_text('')
+                            except FileNotFoundError:
+                                pass  # Failed assertion already removed temporary cgroup.
+                        waiter = threading.Thread(target=reap)
+                        waiter.start()
+                    return dict(InvocationID='original', ControlGroup='/original.service',
+                                ActiveState='active' if calls >= 4 else 'activating')
+                with patch.object(m, 'CGROUP_ROOT', Path(td)), patch.object(m, 'properties', side_effect=state), \
+                     patch.object(Path, 'read_text', fake_membership):
+                    m.terminate_invocation(identity)
+                self.assertIsNotNone(main)
+                self.assertIsNotNone(main.poll(), 'successful hook exit must not hide later main launch')
+                waiter.join(timeout=2)
+        finally:
+            for child in (hook, main):
+                if child is not None:
+                    if child.poll() is None:
+                        child.terminate()
+                    child.wait()
+            if waiter is not None:
+                waiter.join(timeout=2)
+
+    def test_nested_member_terminated_without_signaling_sibling_canary(self):
+        child = subprocess.Popen(['sleep', '60'])
+        canary = subprocess.Popen(['sleep', '60'])
+        waiter = None
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                group = Path(td) / 'original.service'
+                nested = group / 'nested' / 'leaf'
+                nested.mkdir(parents=True)
+                for folder in (group, nested.parent):
+                    (folder / 'cgroup.procs').write_text('')
+                procs = nested / 'cgroup.procs'
+                procs.write_text(str(child.pid))
+                sibling = Path(td) / 'original.service-replacement'
+                sibling.mkdir()
+                (sibling / 'cgroup.procs').write_text(str(canary.pid))
+                def reap():
+                    child.wait()
+                    try:
+                        procs.write_text('')
+                    except FileNotFoundError:
+                        pass  # Failed assertion already removed temporary cgroup.
+                waiter = threading.Thread(target=reap)
+                waiter.start()
+                def membership(path, *args, **kwargs):
+                    if str(path) == f'/proc/{child.pid}/cgroup':
+                        return '0::/original.service/nested/leaf\n'
+                    return real_read_text(path, *args, **kwargs)
+                identity = dict(unit='original.service', invocation_id='original', invocation_cgroup='/original.service')
+                state = dict(InvocationID='original', ControlGroup='/original.service', ActiveState='active')
+                with patch.object(m, 'CGROUP_ROOT', Path(td)), patch.object(m, 'properties', return_value=state), \
+                     patch.object(Path, 'read_text', membership):
+                    m.terminate_invocation(identity)
+                self.assertIsNotNone(child.poll(), 'nested original member survived shutdown')
+                self.assertIsNone(canary.poll())
+                waiter.join(timeout=2)
+        finally:
+            for process in (child, canary):
+                if process.poll() is None:
+                    process.terminate()
+                process.wait()
+            if waiter is not None:
+                waiter.join(timeout=2)
+
+    def test_cancel_reports_nonquiescent_registered_target(self):
+        with tempfile.TemporaryDirectory() as td:
+            folder = Path(td)
+            (folder / 'main-intent.json').write_text('{}')
+            identity = dict(unit='original.service', invocation_id='original', invocation_cgroup='/original.service')
+            state = dict(ActiveState='active', SubState='running', MainPID='123', ControlPID='0', Result='success')
+            item = {'unit': 'original.service', 'properties': state, 'pids': [123]}
+            with patch.object(m, 'registered_identity', return_value=identity), \
+                 patch.object(m, 'properties', return_value=state), patch.object(m, 'cgroup_pids', return_value=[123]), \
+                 patch.object(m, 'terminate_invocation'), patch.object(m, 'unit_evidence', return_value=item), \
+                 patch.object(m.time, 'perf_counter', side_effect=[0, 10]):
+                errors, evidence = m.cancel_invocations(folder, {'trial_id': 'trial', 'boot_id': 'boot'})
+            self.assertTrue(errors, 'cleanup must not report success with registered processes alive')
+            self.assertEqual(evidence[0]['pids'], [123])
+
     def test_empty_activating_group_not_treated_as_terminated(self):
         child = subprocess.Popen(['sleep', '60'])
         try:

@@ -205,13 +205,23 @@ def terminate_invocation(identity):
             if time.monotonic() - started >= 35:
                 raise TimeoutError('original invocation cgroup unavailable')
             time.sleep(.1)
+    def members():
+        pids = set()
+        # Walk relative to pinned root, never a reused pathname or symlink subtree.
+        for _, _, _, current in os.fwalk('.', dir_fd=directory, follow_symlinks=False):
+            try:
+                with os.fdopen(os.open('cgroup.procs', os.O_RDONLY | os.O_NOFOLLOW, dir_fd=current)) as stream:
+                    pids.update(int(pid) for pid in stream.read().split())
+            except FileNotFoundError:
+                pass  # Nested cgroup disappeared during enumeration.
+        return pids
+
     try:
         while True:
             check()
             descriptors = []
             try:
-                with os.fdopen(os.open('cgroup.procs', os.O_RDONLY, dir_fd=directory)) as stream:
-                    pids = {int(pid) for pid in stream.read().split()}
+                pids = members()
                 for pid in pids:
                     try:
                         descriptor = os.pidfd_open(pid)
@@ -222,7 +232,8 @@ def terminate_invocation(identity):
                                 os.close(descriptor)
                                 continue
                             membership = Path(f'/proc/{pid}/cgroup').read_text().splitlines()
-                            if '0::' + group not in membership:
+                            if not any(line == '0::' + group or line.startswith('0::' + group + '/')
+                                       for line in membership):
                                 raise ValueError('process cgroup identity changed')
                             descriptors.append(descriptor)
                         except BaseException:
@@ -240,8 +251,7 @@ def terminate_invocation(identity):
                         pass
                 if not descriptors:
                     state = properties(unit)
-                    with os.fdopen(os.open('cgroup.procs', os.O_RDONLY, dir_fd=directory)) as stream:
-                        empty = not stream.read().strip()
+                    empty = not members()
                     if empty and state.get('ActiveState') != 'activating':
                         return
                     check()
@@ -254,11 +264,9 @@ def terminate_invocation(identity):
                     poller.register(descriptor, select.POLLIN)
                 if len(poller.poll(100)) == len(descriptors):
                     # A final rescan includes descendants forked before TERM.
-                    with os.fdopen(os.open('cgroup.procs', os.O_RDONLY, dir_fd=directory)) as stream:
-                        if not stream.read().strip():
-                            state = properties(unit)
-                            if state.get('ActiveState') != 'activating':
-                                return
+                    state = properties(unit)
+                    if state.get('ActiveState') != 'activating' and not members():
+                        return
                 if elapsed >= 35:
                     raise TimeoutError('original invocation did not quiesce')
             finally:
@@ -641,7 +649,15 @@ def cancel_invocations(folder, data):
             state = properties(identity['unit'])
             if not quiescent(state, cgroup_pids(state.get('ControlGroup', ''))):
                 terminate_invocation(identity)
-            evidence.append(unit_evidence(identity['unit']))
+            until = time.perf_counter() + 5
+            while True:
+                item = unit_evidence(identity['unit'], identity['invocation_cgroup'])
+                if quiescent(item['properties'], item['pids']) or time.perf_counter() >= until:
+                    break
+                time.sleep(.1)
+            evidence.append(item)
+            if not quiescent(item['properties'], item['pids']):
+                raise ValueError('registered invocation not quiescent after shutdown')
         except Exception as exc:
             errors.append(role + ' registered cleanup: ' + str(exc))
     return errors, evidence

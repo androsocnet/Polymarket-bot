@@ -92,7 +92,14 @@ def main():
         until = time.monotonic() + 5
         while len(m.cgroup_pids(original['invocation_cgroup'])) < 2 and time.monotonic() < until:
             time.sleep(.05)
-        assert len(m.cgroup_pids(original['invocation_cgroup'])) >= 2
+        pids = m.cgroup_pids(original['invocation_cgroup'])
+        assert len(pids) >= 2
+        # Root probe moves original child into nested cgroup; ingest cannot do this.
+        nested = m.CGROUP_ROOT / original['invocation_cgroup'].lstrip('/') / 'probe-child'
+        nested.mkdir()
+        child_pid = next(pid for pid in pids if str(pid) != m.properties(units[0])['MainPID'])
+        (nested / 'cgroup.procs').write_text(str(child_pid))
+        assert child_pid in m.cgroup_pids(original['invocation_cgroup'])
         m.startup_timeout(folder)
         until = time.monotonic() + 5
         while m.properties(units[0]).get('ActiveState') not in ('inactive', 'failed') and time.monotonic() < until:
