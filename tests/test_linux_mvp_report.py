@@ -30,7 +30,7 @@ class ReportTests(unittest.TestCase):
 
     def test_counts_accounting_and_per_window(self):
         report = build_report(self.path, now_us=us(START))
-        self.assertEqual(report['schema'], 'mvp-report-v1')
+        self.assertEqual(report['schema'], 'mvp-report-v2')
         self.assertEqual(report['mode'], 'PAPER_ONLY')
         self.assertEqual(report['execution'], 'HYPOTHETICAL_PAPER_ONLY')
         self.assertEqual(report['settlement'], 'UNKNOWN_NOT_INFERRED')

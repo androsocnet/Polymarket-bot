@@ -58,11 +58,11 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(order['status'], 'FILLED')
         self.assertEqual(order['side'], 'BUY')
         self.assertEqual(order['outcome'], 'UP')
-        self.assertEqual(order['quantity'], Decimal('9.99'))
-        self.assertEqual(order['filled'], Decimal('9.99'))
-        self.assertEqual(order['notional'], Decimal('9.99') * Decimal('0.38'))
-        self.assertEqual(order['fee'], order['notional'] * Decimal('10') / Decimal('10000'))
-        self.assertEqual(self.store.position(BOT, MARKET_ID, 'UP')['quantity'], Decimal('9.99'))
+        self.assertEqual(order['quantity'], Decimal('9.82'))
+        self.assertEqual(order['filled'], Decimal('9.82'))
+        self.assertEqual(order['notional'], Decimal('9.82') * Decimal('0.38'))
+        self.assertEqual(order['fee'], Decimal('0.16195'))
+        self.assertEqual(self.store.position(BOT, MARKET_ID, 'UP')['quantity'], Decimal('9.82'))
         self.assertEqual(self.store.cash(BOT), Decimal('100') - order['notional'] - order['fee'])
         self.assertEqual(self.store.decision(BOT, MARKET_ID, MARKET_ID + ':2')['signal'], 'UP')
         self.assertEqual(Decimal(self.decisions()[2]['momentum']), Decimal('0.04'))
@@ -203,7 +203,7 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(len(self.decisions()), 4)
         self.assertEqual(len(self.store.orders(BOT)), 1)
         self.assertEqual(self.store.orders(BOT)[0]['status'], 'FILLED')
-        self.assertEqual(self.store.position(BOT, MARKET_ID, 'UP')['quantity'], Decimal('9.99'))
+        self.assertEqual(self.store.position(BOT, MARKET_ID, 'UP')['quantity'], Decimal('9.82'))
 
     def test_restart_after_window_end_abandons_window(self):
         engine = self.engine([snapshot(slot=449)])
@@ -223,7 +223,7 @@ class EngineTests(unittest.TestCase):
         row = self.store.equity_rows(BOT)[-1]
         self.assertEqual(row['missing_marks'], 1)
         self.assertIsNone(row['unrealized'])
-        self.assertEqual(self.store.position(BOT, MARKET_ID, 'UP')['quantity'], Decimal('9.99'))
+        self.assertEqual(self.store.position(BOT, MARKET_ID, 'UP')['quantity'], Decimal('9.82'))
 
     def test_holdings_sell_on_holding_period(self):
         falling = [snapshot(slot=n, up_bid=str(Decimal('0.50') - Decimal('0.02') * n),

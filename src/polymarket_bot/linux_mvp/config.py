@@ -77,6 +77,8 @@ class Settings:
     def from_env(cls, env: Mapping[str, str] | None = None, *, base: Path | None = None) -> 'Settings':
         env = os.environ if env is None else env
         base = Path.cwd() if base is None else Path(base)
+        if 'MVP_FEE_BPS' in env:
+            raise ConfigError('MVP_FEE_BPS obsolete; forward PAPER requires market fee metadata')
         mode = _text(env, 'MODE', MODE)
         if mode != MODE:
             raise ConfigError(f'MODE must be {MODE}; live or unknown modes are refused')

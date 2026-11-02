@@ -8,6 +8,7 @@ import time
 
 from ..market_data.models import MarketDataError
 from .config import Settings
+from .fees import STATUS as FEE_STATUS, fee_evidence, reserve_per_share
 from .store import ARITHMETIC, SAFETY_STOPS, ZERO, MvpStore
 
 UP, DOWN = 'UP', 'DOWN'
@@ -138,6 +139,9 @@ class PaperEngine:
 
         slot_index = int((validated - start_us) // (self.settings.sample_seconds * 1_000_000))
         slot_id = f'{market.market_id}:{slot_index}'
+        fees = fee_evidence(market, observed_us=validated)
+        fees['observed_us'] = at
+        fees['snapshot_validated_us'] = validated
         fresh = {}
         stale = False
         one_sided = False
@@ -157,7 +161,7 @@ class PaperEngine:
             else:
                 fresh[outcome] = book
 
-        self._execute_pending(market.market_id, slot_index, fresh, at)
+        self._execute_pending(market.market_id, slot_index, fresh, at, fees)
         day_start = (at // 86_400_000_000) * 86_400_000_000
         if self.store.realized(self.bot_id, since_us=day_start) <= -self.settings.max_daily_loss:
             self._mark(market.market_id, fresh, at)
@@ -170,13 +174,13 @@ class PaperEngine:
             return StepResult('DUPLICATE_SLOT', market.market_id, slot_index, reason='SLOT_ALREADY_DECIDED')
 
         reason = 'ONE_SIDED_BOOK' if one_sided else 'STALE_PAIR' if stale else ''
-        result = self._decide(market, snapshot, slot_index, slot_id, fresh, reason, at)
+        result = self._decide(market, snapshot, slot_index, slot_id, fresh, reason, at, fees)
         self._mark(market.market_id, fresh, at)
         self._beat(at, market.market_id, 'RUNNING', None)
         return StepResult('OK', market.market_id, slot_index, result[0], result[1])
 
     # -- decisions -----------------------------------------------------------
-    def _decide(self, market, snapshot, slot_index, slot_id, fresh, stale_reason, at):
+    def _decide(self, market, snapshot, slot_index, slot_id, fresh, stale_reason, at, fees):
         positions = self.store.positions(self.bot_id, market.market_id)
         open_positions = self.store.open_positions(self.bot_id)
         total_exposure = sum((p['cost_basis'] for p in open_positions), ZERO)
@@ -214,6 +218,8 @@ class PaperEngine:
             pending = self.store.pending_order(self.bot_id)
             if pending is not None:
                 decision['reason'] = 'PENDING_EXECUTION'
+            elif fees['status'] != FEE_STATUS:
+                decision['reason'] = 'FEE_UNVERIFIED'
             elif owned is not None:
                 entry = self.store.entry_order(self.bot_id, market.market_id, owned)
                 held_age = self._held_age(market.market_id, entry)
@@ -226,9 +232,10 @@ class PaperEngine:
             elif other_open:
                 decision['reason'] = 'POSITION_LIMIT'
             elif signal != 'HOLD':
-                quantity = ((self.settings.max_order / (1 + self.settings.fee_bps / 10000))
+                ceiling = reserve_per_share(fees)
+                quantity = ((self.settings.max_order / ceiling)
                             / Decimal('0.01')).to_integral_value(rounding=ROUND_FLOOR) * Decimal('0.01')
-                reserve = quantity * (1 + self.settings.fee_bps / 10000)
+                reserve = quantity * ceiling
                 if self.store.trade_count(self.bot_id, market.market_id) >= self.settings.max_trades_per_window:
                     decision['reason'] = 'WINDOW_TRADE_LIMIT'
                 elif quantity <= 0:
@@ -241,6 +248,7 @@ class PaperEngine:
                     decision['action'] = 'BUY ' + signal
                     order = dict(outcome=signal, side='BUY', quantity=quantity, reason='SIGNAL_' + signal)
 
+        decision['inputs']['fee_evidence'] = fees
         with self.store.transaction():
             self.store.require_safe(self.bot_id)
             inserted = self.store.decide(**decision)
@@ -249,7 +257,7 @@ class PaperEngine:
                 order_id = f'{self.bot_id}:{market.market_id}:{slot_index}:{order["side"]}:{order["outcome"]}'
                 self.store.queue_order(order_id, self.bot_id, self.run_id, market.market_id, token_id,
                                        order['outcome'], order['side'], order['quantity'], slot_id,
-                                       order['reason'], at)
+                                       order['reason'], at, fee_evidence=fees)
         return decision['action'], decision['reason']
 
     def _held_age(self, market_id: str, entry: dict | None) -> int:
@@ -262,7 +270,7 @@ class PaperEngine:
                    if row['slot_index'] > entry_slot)
 
     # -- execution / marks ---------------------------------------------------
-    def _execute_pending(self, market_id: str, slot_index: int, fresh: dict, at: int) -> None:
+    def _execute_pending(self, market_id: str, slot_index: int, fresh: dict, at: int, fees: dict) -> None:
         pending = self.store.pending_order(self.bot_id)
         if pending is None:
             return
@@ -277,7 +285,7 @@ class PaperEngine:
             return
         if pending['outcome'] not in fresh:
             return
-        result = self.store.execute_pending(self.bot_id, fresh, self.settings.fee_bps, at_us=at)
+        result = self.store.execute_pending(self.bot_id, fresh, fees, at_us=at)
         if result is not None:
             detail = {k: str(v) for k, v in result.items()}
             detail.update(signal_to_terminal_us=at - pending['created_us'],

@@ -41,7 +41,6 @@ class SettingsTests(unittest.TestCase):
             'MVP_LOOKBACK': '4',
             'MVP_HOLDING_PERIOD': '1',
             'MVP_THRESHOLD': '0.05',
-            'MVP_FEE_BPS': '0',
             'MVP_MAX_SOURCE_AGE_SECONDS': '2.5',
             'MVP_MAX_CONSECUTIVE_ERRORS': '3',
             'MVP_POLL_SECONDS': '5',
@@ -58,7 +57,7 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(s.lookback, 4)
         self.assertEqual(s.holding_period, 1)
         self.assertEqual(s.threshold, Decimal('0.05'))
-        self.assertEqual(s.fee_bps, Decimal('0'))
+        self.assertEqual(s.fee_bps, Decimal('10'))  # retained legacy config field, never executed
         self.assertEqual(s.max_source_age_seconds, 2.5)
         self.assertEqual(s.max_consecutive_errors, 3)
         self.assertEqual(s.poll_seconds, 5)

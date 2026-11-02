@@ -108,7 +108,8 @@ def parse_market(event: dict[str, object], market: dict[str, object], *, now: da
         prices = [None, None]
         warnings.append("Gamma outcomePrices unavailable or malformed; book pricing is unaffected.")
     mapped = {label: TokenOutcome(label.title(), token, price) for label, token, price in zip(labels, tokens, prices)}
-    metadata = {k: market[k] for k in ("version", "positionIds", "outcomePrices", "startDate") if k in market}
+    metadata = {k: market[k] for k in ("version", "positionIds", "outcomePrices", "startDate",
+                                                      "feesEnabled", "feeType", "feeSchedule", "updatedAt") if k in market}
     def flag(name):
         value = market.get(name)
         return value if type(value) is bool else None

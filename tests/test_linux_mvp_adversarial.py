@@ -76,7 +76,7 @@ class AdversarialPaperTradingTests(unittest.TestCase):
         self.assertEqual(order['status'], 'PARTIAL')
         self.assertEqual(order['filled'], Decimal('3.00'))
         self.assertEqual(order['notional'], Decimal('3.00') * Decimal('0.38'))
-        expected_fee = order['notional'] * Decimal('10') / Decimal('10000')
+        expected_fee = Decimal('0.04947')
         self.assertEqual(order['fee'], expected_fee)
         # Position updated only to filled quantity
         pos = self.store.position(BOT, MARKET_ID, 'UP')
@@ -144,7 +144,7 @@ class AdversarialPaperTradingTests(unittest.TestCase):
         self.assertEqual(w1['status'], 'UNKNOWN_SETTLEMENT')
         # Position in old window still exists and is untouched
         pos = self.store.position(BOT, MARKET_ID, 'UP')
-        self.assertEqual(pos['quantity'], Decimal('9.99'))
+        self.assertEqual(pos['quantity'], Decimal('9.82'))
         # Open positions query still returns it
         open_pos = self.store.open_positions(BOT)
         self.assertEqual(len(open_pos), 1)

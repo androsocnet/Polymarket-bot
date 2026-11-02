@@ -25,7 +25,9 @@ def descriptor(*, market_id=MARKET_ID, start=START, up=UP_TOKEN, down=DOWN_TOKEN
         market_id, 'slug-' + market_id, 'BTC Up or Down?', condition, start,
         start + timedelta(seconds=900), True, False,
         True if pricing_ready else None, True if pricing_ready else None,
-        TokenOutcome('Up', up), TokenOutcome('Down', down), {}, ())
+        TokenOutcome('Up', up), TokenOutcome('Down', down),
+        {'version': 'v1', 'feesEnabled': True, 'feeType': 'crypto_fees_v2',
+         'feeSchedule': {'rate': '0.07', 'exponent': 1, 'takerOnly': True}}, ())
 
 
 def book(token, *, bid='0.30', ask='0.32', condition=CONDITION, at=None, size='100'):

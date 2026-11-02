@@ -6,15 +6,19 @@ from contextlib import closing
 from decimal import Decimal, localcontext
 from .store import ARITHMETIC
 import sqlite3
+import json
+from .fees import STATUS as FEE_STATUS
 import time
 from pathlib import Path
 
 ZERO = Decimal(0)
-SCHEMA = 'mvp-report-v1'
+SCHEMA = 'mvp-report-v2'
 
 ASSUMPTIONS = (
     'paper fills walk visible book depth at the next fresh slot; queue position is not modelled',
-    'fees are the configured constant assumption, not exchange-confirmed',
+    'market fees use persisted taker schedules and level prices; floor5 per visible level is a PAPER policy, not verified exchange rounding',
+    'legacy flat-notional fees remain recorded estimates, never retroactively corrected',
+    'operating costs and rebates excluded; profitability remains unverified',
     'latency is the accepted snapshot cycle, not measured order-path latency',
     'settlement is never inferred; open positions are marked at the last fresh bid when available',
     'the report aggregates one paper account across service runs; run_id selects the run header',
@@ -69,6 +73,20 @@ def _build_report(db_path: Path, *, run_id: str | None, now_us: int | None) -> d
                                       'WHERE bot_id=?', (bot_id,)).fetchall()
         equity_rows = conn.execute('SELECT cash, exposure, unrealized, missing_marks, at_us FROM equity '
                                    'WHERE bot_id=? ORDER BY id', (bot_id,)).fetchall()
+        fee_rows = []
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='order_fees'").fetchone():
+            fee_rows = conn.execute('SELECT o.order_id, o.status, f.evidence_json, f.execution_evidence_json, f.fills_json '
+                                    'FROM orders o LEFT JOIN order_fees f ON f.order_id=o.order_id '
+                                    'WHERE o.bot_id=?', (bot_id,)).fetchall()
+        fee_evidence = [dict(order_id=r[0], status=r[1],
+                             queued=None if r[2] is None else json.loads(r[2]),
+                             executed=None if r[3] is None else json.loads(r[3]),
+                             fills=[] if r[4] is None else json.loads(r[4])) for r in fee_rows]
+        filled_count = sum(r[1] in ('FILLED', 'PARTIAL') for r in orders)
+        covered = sum(r['status'] in ('FILLED', 'PARTIAL') and r['executed'] is not None
+                      and r['executed'].get('status') == FEE_STATUS for r in fee_evidence)
+        fee_status = ('LEGACY_ESTIMATE_UNVERIFIED' if filled_count > covered else
+                      FEE_STATUS if covered else 'UNVERIFIED_NO_FILLS')
         columns = {r[1] for r in conn.execute('PRAGMA table_info(settlements)')}
         settlements_rows = []
         if columns:
@@ -181,7 +199,11 @@ def _build_report(db_path: Path, *, run_id: str | None, now_us: int | None) -> d
             'unknown_settlement': len(unresolved_positions),
             'items': open_positions,
         },
+        'fee_accounting': dict(status=fee_status, market_schedule_fills=covered,
+                               legacy_or_unverified_fills=filled_count - covered,
+                               evidence=fee_evidence),
         'performance': {
+            'profitability_verified': False,
             'realized_pnl': str(total_realized),
             'unrealized_pnl': None if last_unrealized is None else str(last_unrealized),
             'drawdown': None if drawdown is None else str(drawdown),
@@ -236,6 +258,7 @@ def render(report: dict) -> str:
         f"equity: points={equity['points']} peak_net={equity['peak_net']} "
         f"drawdown={equity['drawdown']} missing_marks_last={equity['missing_marks_last']}",
         f"settlement={report['settlement']}",
+        f"fee_accounting={report['fee_accounting']['status']} profitability_verified=False",
     ]
     for row in report['per_window']:
         lines.append(f"window {row['market_id']} [{row['status']}] decisions={row['decisions']} "

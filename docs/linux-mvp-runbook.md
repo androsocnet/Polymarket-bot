@@ -9,6 +9,11 @@ holds no keys, has no wallet access, and never infers settlement.
 This runbook does not claim that Linux resource enforcement has passed. The unit file is statically
 tested on Windows; the host checks in §10 are a separate acceptance gate.
 
+Forward PAPER now requires explicit market fee metadata; `MVP_FEE_BPS` overrides
+are refused. Missing/unsupported schedules block execution, not zero-fee fallback.
+See [market fee model and historical limits](paper-market-fees.md). Existing terminal
+latches remain intact; this change grants no deployment or reset authorization.
+
 ## 1. What Phase 1 does and does not do
 
 Each cycle (default every 2 seconds):

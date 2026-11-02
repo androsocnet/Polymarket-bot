@@ -15,6 +15,7 @@ import httpx
 from polymarket_bot.linux_mvp.collector import CollectionStopped, LiveCollector
 from polymarket_bot.linux_mvp.config import Settings
 from polymarket_bot.linux_mvp.engine import PaperEngine
+from polymarket_bot.linux_mvp.fees import fee_evidence
 from polymarket_bot.linux_mvp.report import build_report
 from polymarket_bot.linux_mvp.store import MvpStore
 from tests.linux_mvp_support import (CONDITION, MARKET_ID, START, Collector, descriptor,
@@ -131,7 +132,9 @@ class SettlementTests(unittest.TestCase):
     def test_sell_loss_stops_before_new_decision_same_cycle(self):
         self.buy(quantity='30')
         self.store.queue_order('sell', BOT, RUN, MARKET_ID, '111111', 'UP', 'SELL',
-                               Decimal('30'), MARKET_ID + ':1', 'TEST', us(START))
+                               Decimal('30'), MARKET_ID + ':1', 'TEST', us(START),
+                               fee_evidence=fee_evidence(
+                                   snapshot(slot=2).market, observed_us=us(START)))
         engine = PaperEngine(self.store, Collector([snapshot(slot=2, up_bid='.01')]), self.settings,
                              run_id=RUN, now_us=lambda: us(START))
         self.assertEqual(engine.step().status, 'RISK_STOPPED')
