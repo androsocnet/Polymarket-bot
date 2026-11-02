@@ -30,31 +30,55 @@ def safe_path(path, regular=False):
     return path.resolve()
 
 
-def fingerprint(path, reader_metadata=False):
+def fingerprint(path, reader_metadata=False, wal=False):
     if not path.exists():
         if path.is_symlink():
             raise ValueError("symlink refused")
         return None
     path = safe_path(path, regular=True)
+    def xattrs():
+        # Linux exposes POSIX ACLs through system.posix_acl_* xattrs too.
+        return {name: os.getxattr(path, name).hex() for name in sorted(os.listxattr(path))}
+
+    attributes = xattrs() if wal else None
     before = path.stat()
     with path.open("rb") as stream:
         digest = hashlib.file_digest(stream, "sha256").hexdigest()
     after = path.stat()
-    fields = lambda s: [s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns, s.st_mode]
-    if not reader_metadata and fields(before) != fields(after):
+
+    def fields(s):
+        return [s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns,
+                s.st_mode, s.st_uid, s.st_gid, s.st_nlink]
+
+    def comparable(s):
+        values = fields(s)
+        # SQLite WAL opens can change ctime alone; keep explicit metadata checks.
+        return values[:4] + values[5:] if wal else values
+
+    if (not reader_metadata and comparable(before) != comparable(after)) or (wal and attributes != xattrs()):
         raise ValueError("file changed while hashing")
-    return {"stat": fields(after), "sha256": digest}
+    result = {"stat": fields(after), "sha256": digest}
+    if wal:
+        result["xattrs"] = attributes
+    return result
 
 
 def families(paths):
-    return [{suffix: fingerprint(Path(str(path) + suffix), reader_metadata=suffix == "-shm")
+    return [{suffix: fingerprint(Path(str(path) + suffix), reader_metadata=suffix == "-shm",
+                                 wal=suffix == "-wal")
              for suffix in ("", "-wal", "-journal", "-shm")} for path in paths]
 
 
 def stable(before, after):
-    return all({k: v for k, v in a.items() if k != "-shm"} ==
-               {k: v for k, v in b.items() if k != "-shm"}
-               for a, b in zip(before, after))
+    def comparable(family):
+        result = {k: v for k, v in family.items() if k != "-shm"}
+        wal = result.get("-wal")
+        # Legacy six-field manifests lack explicit ownership/link checks: strict.
+        if wal is not None and len(wal["stat"]) == 9 and "xattrs" in wal:
+            result["-wal"] = {**wal, "stat": wal["stat"][:4] + wal["stat"][5:]}
+        return result
+
+    return all(comparable(a) == comparable(b) for a, b in zip(before, after))
 
 
 def inventory(path):
@@ -162,11 +186,15 @@ def unique_object(pairs):
 
 
 def valid_fingerprint(value):
-    if not isinstance(value, dict) or set(value) != {"stat", "sha256"}:
+    if not isinstance(value, dict) or set(value) not in ({"stat", "sha256"}, {"stat", "sha256", "xattrs"}):
+        return False
+    if "xattrs" in value and (not isinstance(value["xattrs"], dict) or not all(
+            isinstance(k, str) and isinstance(v, str) and len(v) % 2 == 0 and
+            all(c in "0123456789abcdef" for c in v) for k, v in value["xattrs"].items())):
         return False
     fields, digest = value["stat"], value["sha256"]
-    return (isinstance(fields, list) and len(fields) == 6 and
-            all(type(n) is int for n in fields) and all(n >= 0 for n in fields[:3]) and
+    return (isinstance(fields, list) and len(fields) in (6, 9) and
+            all(type(n) is int for n in fields) and all(n >= 0 for n in fields[:3] + fields[6:]) and
             stat.S_ISREG(fields[5]) and isinstance(digest, str) and len(digest) == 64 and
             all(c in "0123456789abcdef" for c in digest))
 
@@ -194,7 +222,7 @@ def verify(bundle: Path, scratch: Path):
                str(Path(p)) == p for p in manifest["sources"]) or len(set(manifest["sources"])) != 3:
         raise ValueError("invalid source paths")
     if not all(isinstance(f, dict) and set(f) == {"", "-wal", "-journal", "-shm"}
-               for f in manifest["before"] + manifest["after"]) or not stable(manifest["before"], manifest["after"]):
+               for f in manifest["before"] + manifest["after"]):
         raise ValueError("unstable source inventory")
     for phase in ("before", "after"):
         families = manifest[phase]
@@ -203,6 +231,8 @@ def verify(bundle: Path, scratch: Path):
             raise ValueError("invalid source fingerprint")
         if len({tuple(f[""]["stat"][:2]) for f in families}) != 3:
             raise ValueError("aliased source fingerprints")
+    if not stable(manifest["before"], manifest["after"]):
+        raise ValueError("unstable source inventory")
     if {p.name for p in bundle.iterdir()} != {*NAMES, "COMPLETE.json"}:
         raise ValueError("unexpected bundle contents")
     for entry, name in zip(entries, NAMES):

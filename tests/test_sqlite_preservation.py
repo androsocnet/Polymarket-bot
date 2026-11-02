@@ -163,6 +163,145 @@ class PreservationTests(unittest.TestCase):
                 self.helper.backup(self.paths, self.bundle)
         self.assertFalse(self.complete().exists())
 
+    def test_benign_wal_reader_ctime_bump_does_not_fail_backup(self):
+        # Some SQLite readers/libc stacks (reproduced on Python 3.12.3, SQLite
+        # 3.40.1) move WAL st_ctime_ns with mtime/size/sha256 untouched and no
+        # committed write. That is reader interference, not source mutation.
+        real_connect = self.helper.sqlite3.connect
+        source_opens = 0
+
+        def connect(*args, **kwargs):
+            nonlocal source_opens
+            conn = real_connect(*args, **kwargs)
+            if args[0] in {p.as_uri() + "?mode=ro" for p in self.paths}:
+                source_opens += 1
+                if source_opens == 3:
+                    wal = Path(str(self.paths[0]) + "-wal")
+                    meta = wal.stat()
+                    os.utime(wal, ns=(meta.st_atime_ns, meta.st_mtime_ns))  # ctime bumps, mtime kept
+            return conn
+
+        with patch.object(self.helper.sqlite3, "connect", side_effect=connect):
+            self.helper.backup(self.paths, self.bundle)
+        self.assertTrue(self.complete().exists())
+        self.assertEqual(source_opens, 3)
+        self.helper.verify(self.bundle, self.scratch)
+        self.assertTrue((self.scratch / "VERIFIED.json").exists())
+
+    def test_wal_ctime_tolerance_keeps_all_other_fingerprint_checks(self):
+        import copy
+        before = self.helper.families(self.paths)
+        for suffix in ("", "-wal", "-journal"):
+            baseline = copy.deepcopy(before)
+            if suffix == "-journal":
+                baseline[0][suffix] = copy.deepcopy(before[0]["-wal"])
+            for field in range(9):
+                with self.subTest(suffix=suffix, field=field):
+                    after = copy.deepcopy(baseline)
+                    after[0][suffix]["stat"][field] += 1
+                    self.assertEqual(self.helper.stable(baseline, after),
+                                     suffix == "-wal" and field == 4)
+            after = copy.deepcopy(baseline)
+            after[0][suffix]["sha256"] = "0" * 64
+            self.assertFalse(self.helper.stable(baseline, after))
+            after = copy.deepcopy(baseline)
+            after[0][suffix] = None
+            self.assertFalse(self.helper.stable(baseline, after))
+        after = copy.deepcopy(before)
+        after[0]["-journal"] = copy.deepcopy(before[0]["-wal"])
+        self.assertFalse(self.helper.stable(before, after))
+
+    def test_legacy_manifest_and_malformed_wal_fingerprints(self):
+        import copy
+        self.helper.backup(self.paths, self.bundle)
+        original = json.loads(self.complete().read_text())
+        legacy = copy.deepcopy(original)
+        for phase in ("before", "after"):
+            for family in legacy[phase]:
+                for value in family.values():
+                    if value is not None:
+                        value["stat"] = value["stat"][:6]
+                        value.pop("xattrs", None)
+        # A successful legacy capture required identical WAL ctime endpoints.
+        for before, after in zip(legacy["before"], legacy["after"]):
+            after["-wal"]["stat"][4] = before["-wal"]["stat"][4]
+        self.complete().write_text(json.dumps(legacy))
+        self.helper.verify(self.bundle, self.root / "legacy")
+        legacy["after"][0]["-wal"]["stat"][4] += 1
+        self.complete().write_text(json.dumps(legacy))
+        with self.assertRaises(ValueError):
+            self.helper.verify(self.bundle, self.root / "legacy-ctime")
+        for index, invalid in enumerate(({}, [], 1, {"stat": None, "sha256": "0" * 64})):
+            with self.subTest(invalid=invalid):
+                manifest = copy.deepcopy(original)
+                manifest["before"][0]["-wal"] = invalid
+                self.complete().write_text(json.dumps(manifest))
+                with self.assertRaises(ValueError):
+                    self.helper.verify(self.bundle, self.root / f"invalid-wal-{index}")
+
+    def test_wal_metadata_read_failure_blocks_publication(self):
+        for operation in ("listxattr", "getxattr"):
+            with self.subTest(operation=operation):
+                wal = Path(str(self.paths[0]) + "-wal")
+                os.setxattr(wal, "user.preservation", b"readable")
+                bundle = self.root / operation
+                with patch.object(self.helper.os, operation, side_effect=PermissionError("denied")):
+                    with self.assertRaises(PermissionError):
+                        self.helper.backup(self.paths, bundle)
+                self.assertFalse((bundle / "COMPLETE.json").exists())
+
+    def test_wal_xattr_or_acl_change_during_backup_fails_closed(self):
+        import struct
+        for attribute, value in (
+            ("user.preservation", b"changed"),
+            ("system.posix_acl_access", struct.pack("<I", 2) + b"".join(
+                struct.pack("<HHI", tag, permissions, identity)
+                for tag, permissions, identity in (
+                    (1, 6, 0xffffffff), (2, 6, 12345), (4, 6, 0xffffffff),
+                    (16, 6, 0xffffffff), (32, 0, 0xffffffff)))),
+        ):
+            with self.subTest(attribute=attribute):
+                wal = Path(str(self.paths[0]) + "-wal")
+                wal.chmod(0o660)
+                real_inventory = self.helper.inventory
+                calls = 0
+
+                def inspect(path):
+                    nonlocal calls
+                    result = real_inventory(path)
+                    calls += 1
+                    if calls == 3:
+                        meta = wal.stat()
+                        os.setxattr(wal, attribute, value)
+                        self.assertEqual(wal.stat().st_mode, meta.st_mode)
+                        self.assertEqual(wal.stat().st_mtime_ns, meta.st_mtime_ns)
+                    return result
+
+                bundle = self.root / attribute.replace(".", "-")
+                with patch.object(self.helper, "inventory", side_effect=inspect):
+                    with self.assertRaises(ValueError):
+                        self.helper.backup(self.paths, bundle)
+                self.assertFalse((bundle / "COMPLETE.json").exists())
+                os.removexattr(wal, attribute)
+
+    def test_wal_permission_change_during_backup_fails_closed(self):
+        real_inventory = self.helper.inventory
+        calls = 0
+
+        def inspect(path):
+            nonlocal calls
+            result = real_inventory(path)
+            calls += 1
+            if calls == 3:
+                wal = Path(str(self.paths[0]) + "-wal")
+                wal.chmod(stat.S_IMODE(wal.stat().st_mode) ^ stat.S_IXUSR)
+            return result
+
+        with patch.object(self.helper, "inventory", side_effect=inspect):
+            with self.assertRaises(ValueError):
+                self.helper.backup(self.paths, self.bundle)
+        self.assertFalse(self.complete().exists())
+
     def test_verify_rejects_rehashed_corruption_and_inventory_mismatch(self):
         self.helper.backup(self.paths, self.bundle)
         manifest = json.loads(self.complete().read_text())
