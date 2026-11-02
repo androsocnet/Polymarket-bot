@@ -62,6 +62,9 @@ def _run_service(args, *, engine_factory=None) -> int:
     except InstanceLockError as exc:
         print(f'service refused: {exc}', file=sys.stderr)
         return 3
+    except (sqlite3.Error, OSError) as exc:
+        print(f'safety state refused: {exc}; operator review required', file=sys.stderr)
+        return 75
     print(f'finished: {status}')
     return 75 if status == 'FAILED_STOP' else 0
 

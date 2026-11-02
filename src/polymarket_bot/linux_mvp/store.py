@@ -10,6 +10,13 @@ import sqlite3
 SCHEMA = 'mvp-v1'
 ARITHMETIC = Context(prec=512, rounding=ROUND_HALF_EVEN)
 ZERO = Decimal(0)
+SAFETY_STOPS = ('FAILED_STOP', 'RISK_STOPPED')
+
+
+class SafetyStopError(sqlite3.IntegrityError):
+    """Persistent safety state refuses admission; requires reviewed offline reset."""
+
+
 WINDOW_STATUSES = ('ACTIVE', 'CLOSED', 'ABORTED', 'UNKNOWN_SETTLEMENT', 'SETTLED')
 
 _SCHEMA_SQL = """
@@ -169,12 +176,12 @@ class MvpStore:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(path), isolation_level=None, timeout=10)
-        conn.execute('PRAGMA journal_mode=WAL')
-        conn.execute('PRAGMA synchronous=FULL')
-        conn.execute('PRAGMA busy_timeout=10000')
-        conn.execute('PRAGMA foreign_keys=ON')
-        conn.executescript(_SCHEMA_SQL)
         try:
+            conn.execute('PRAGMA journal_mode=WAL')
+            conn.execute('PRAGMA synchronous=FULL')
+            conn.execute('PRAGMA busy_timeout=10000')
+            conn.execute('PRAGMA foreign_keys=ON')
+            conn.executescript(_SCHEMA_SQL)
             conn.execute('BEGIN IMMEDIATE')
             sql = conn.execute("SELECT sql FROM sqlite_master WHERE name='windows'").fetchone()[0]
             if "'SETTLED'" not in sql:
@@ -190,8 +197,7 @@ class MvpStore:
                 conn.execute('ALTER TABLE settlements ADD COLUMN position_count INTEGER')
             conn.execute('COMMIT')
         except BaseException:
-            conn.execute('ROLLBACK')
-            conn.close()
+            conn.close()  # SQLite rolls back any open migration transaction on close.
             raise
         return cls(path, conn)
 
@@ -231,15 +237,44 @@ class MvpStore:
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")]
 
     # -- runs / account ------------------------------------------------------
+    def safety_state(self, bot_id: str) -> dict | None:
+        """Missing state is safe only for a genuinely new account, never an old run."""
+        heartbeat = self.heartbeat_row(bot_id)
+        runs = self._conn.execute('SELECT run_id FROM runs WHERE bot_id=?', (bot_id,)).fetchall()
+        account = self._conn.execute('SELECT 1 FROM accounts WHERE bot_id=?', (bot_id,)).fetchone()
+        if heartbeat is None:
+            tables = ('windows', 'observations', 'decisions', 'orders', 'positions',
+                      'equity', 'events', 'settlements', 'resolution_attempts')
+            if runs or account or any(self._conn.execute(
+                    f'SELECT 1 FROM {table} WHERE bot_id=? LIMIT 1', (bot_id,)).fetchone()
+                    for table in tables):
+                raise SafetyStopError('missing safety heartbeat; operator review required')
+            return None
+        allowed = ('RUNNING', 'ERROR', 'STOPPED', 'STOPPED_BY_SIGNAL', *SAFETY_STOPS)
+        if (not account or heartbeat['run_id'] not in {r[0] for r in runs}
+                or heartbeat['status'] not in allowed
+                or not isinstance(heartbeat['cycles'], int) or heartbeat['cycles'] < 0
+                or not isinstance(heartbeat['at_us'], int) or heartbeat['at_us'] < 0):
+            raise SafetyStopError('inconsistent safety heartbeat; operator review required')
+        return heartbeat
+
+    def require_safe(self, bot_id: str) -> None:
+        previous = self.safety_state(bot_id)
+        if previous is not None and previous['status'] in SAFETY_STOPS:
+            raise SafetyStopError(f"{previous['status']} latched; operator review required")
+
     def start_run(self, run_id: str, bot_id: str, *, initial_cash: Decimal, config: dict,
                   started_us: int, mode: str = 'PAPER_ONLY') -> None:
         with self.transaction() as conn:
+            self.require_safe(bot_id)
             conn.execute('INSERT INTO runs(run_id, bot_id, started_us, mode, initial_cash, config_json, schema) '
                          'VALUES(?,?,?,?,?,?,?)',
                          (run_id, bot_id, started_us, mode, str(initial_cash),
                           json.dumps(config, sort_keys=True, default=str), SCHEMA))
             conn.execute('INSERT OR IGNORE INTO accounts(bot_id, initial_cash, created_us) VALUES(?,?,?)',
                          (bot_id, str(initial_cash), started_us))
+            self.heartbeat(bot_id, run_id, at_us=started_us, market_id=None,
+                           status='RUNNING', cycles=0, last_error=None)
 
     # -- windows -------------------------------------------------------------
     def ensure_window(self, bot_id: str, run_id: str, *, market_id: str, condition_id: str,
@@ -544,6 +579,7 @@ class MvpStore:
         abandoned, never retried) and an empty book is a terminal REJECTED with no position change.
         """
         with self.transaction() as conn, localcontext(ARITHMETIC):
+            self.require_safe(bot_id)
             self.reconcile(bot_id)
             row = conn.execute("SELECT order_id FROM orders WHERE bot_id=? AND status='PENDING' "
                                'ORDER BY created_us, order_id LIMIT 1', (bot_id,)).fetchone()
@@ -638,11 +674,14 @@ class MvpStore:
 
     def heartbeat(self, bot_id: str, run_id: str, *, at_us: int, market_id: str | None,
                   status: str, cycles: int, last_error: str | None) -> None:
-        self._conn.execute('INSERT INTO heartbeat(bot_id, run_id, at_us, market_id, status, cycles, last_error) '
+        changed = self._conn.execute('INSERT INTO heartbeat(bot_id, run_id, at_us, market_id, status, cycles, last_error) '
                            'VALUES(?,?,?,?,?,?,?) ON CONFLICT(bot_id) DO UPDATE SET run_id=excluded.run_id, '
                            'at_us=excluded.at_us, market_id=excluded.market_id, status=excluded.status, '
-                           'cycles=excluded.cycles, last_error=excluded.last_error',
-                           (bot_id, run_id, at_us, market_id, status, cycles, last_error))
+                           "cycles=excluded.cycles, last_error=excluded.last_error "
+                           "WHERE heartbeat.status NOT IN ('FAILED_STOP','RISK_STOPPED')",
+                           (bot_id, run_id, at_us, market_id, status, cycles, last_error)).rowcount
+        if not changed:
+            raise SafetyStopError('terminal heartbeat latched; operator review required')
 
     def heartbeat_row(self, bot_id: str) -> dict | None:
         cur = self._conn.execute('SELECT * FROM heartbeat WHERE bot_id=?', (bot_id,))

@@ -132,6 +132,8 @@ class IngestTests(unittest.TestCase):
         self.assertEqual(len(self.store.observations_for_market(BOT, '1002')), 2)
 
     def test_restart_reuses_active_window_without_duplicate_books(self):
+        self.store.start_run('run-1', BOT, initial_cash=Decimal('100'), config={},
+                             started_us=us(START))
         first = self.engine(Collector([snap(0, 0)]), run_id='run-1')
         self.assertEqual(first.step().status, 'OK')
         window_before = self.store.window(BOT, '1001')

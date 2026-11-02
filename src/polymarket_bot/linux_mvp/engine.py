@@ -8,7 +8,7 @@ import time
 
 from ..market_data.models import MarketDataError
 from .config import Settings
-from .store import ARITHMETIC, ZERO, MvpStore
+from .store import ARITHMETIC, SAFETY_STOPS, ZERO, MvpStore
 
 UP, DOWN = 'UP', 'DOWN'
 
@@ -50,10 +50,9 @@ class PaperEngine:
     def step(self) -> StepResult:
         at = self.now_us()
         self.cycles += 1
-        heartbeat = self.store.heartbeat_row(self.bot_id) or {}
-        if (heartbeat.get('status') == 'FAILED_STOP'
-                and heartbeat.get('run_id') == self.run_id):
-            return StepResult('FAILED_STOP', reason=heartbeat.get('last_error') or 'FAILED_STOP')
+        heartbeat = self.store.safety_state(self.bot_id) or {}
+        if heartbeat.get('status') in SAFETY_STOPS:
+            return StepResult(heartbeat['status'], reason=heartbeat.get('last_error') or heartbeat['status'])
 
         if self.settings.stop_path.exists():
             if heartbeat.get('status') != 'STOPPED':
@@ -243,6 +242,7 @@ class PaperEngine:
                     order = dict(outcome=signal, side='BUY', quantity=quantity, reason='SIGNAL_' + signal)
 
         with self.store.transaction():
+            self.store.require_safe(self.bot_id)
             inserted = self.store.decide(**decision)
             if inserted and order is not None:
                 token_id = market.up.token_id if order['outcome'] == UP else market.down.token_id

@@ -135,8 +135,13 @@ checks the stop predicate before each bounded HTTP phase (each request has a 10-
 A `STOP` file left in place intentionally keeps the service stopped across restarts.
 
 `FAILED_STOP` exits with code `75`, and the unit sets `RestartPreventExitStatus=75`, so systemd
-does **not** restart a data-exhaustion failure. The start-rate limit remains a second guard against
-crash loops.
+does **not** restart a data-exhaustion failure. `FAILED_STOP` and `RISK_STOPPED` are also latched
+in the SQLite heartbeat: a new process, run ID, UTC day, or reboot does not rearm them. Startup
+refuses either latch or unreadable/inconsistent safety state with exit `75`, before registering a
+new run or collecting data. An initial `RISK_STOPPED` still exits cleanly. Removing `STOP` alone
+does not clear either latch. Rearming requires a separately approved, reviewed offline operator
+procedure with the service stopped and the database safely backed up; no reset CLI or automatic
+reset exists. The start-rate limit remains a second guard against crash loops.
 
 ## 7. Rollover, restart, and polling behavior
 

@@ -116,14 +116,15 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(self.collector.calls, 2)
         self.assertEqual([e['kind'] for e in self.store.events(BOT)].count('data_error'), 2)
 
-    def test_failed_stop_is_retried_by_a_new_process_run(self):
+    def test_failed_stop_remains_terminal_for_a_new_process_run(self):
         failing = replace(self.settings, max_consecutive_errors=2)
         engine = self.engine([MarketDataError('transport_error', 'down'),
                               MarketDataError('transport_error', 'down')], settings=failing)
         self.step(engine)
         self.assertEqual(self.step(engine).status, 'FAILED_STOP')
         restarted = self.engine([rising(0)], run_id='run-2')
-        self.assertEqual(self.step(restarted).status, 'OK')
+        self.assertEqual(self.step(restarted).status, 'FAILED_STOP')
+        self.assertEqual(self.collector.calls, 0)
 
     def test_zero_quantity_and_trade_cap_reject_entries(self):
         tiny = replace(self.settings, max_order=Decimal('0.005'), max_exposure=Decimal('10'))
