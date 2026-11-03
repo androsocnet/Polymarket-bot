@@ -701,20 +701,20 @@ class MvpStore:
     # -- marks / events / heartbeat -----------------------------------------
     def equity(self, bot_id: str, run_id: str, *, at_us: int, market_id: str | None, cash: Decimal,
                exposure: Decimal, realized: Decimal, unrealized: Decimal | None,
-               missing_marks: int) -> None:
-        self._conn.execute('INSERT INTO equity(bot_id, run_id, at_us, market_id, cash, exposure, realized, '
+               missing_marks: int) -> int:
+        return self._conn.execute('INSERT INTO equity(bot_id, run_id, at_us, market_id, cash, exposure, realized, '
                            'unrealized, missing_marks) VALUES(?,?,?,?,?,?,?,?,?)',
                            (bot_id, run_id, at_us, market_id, str(cash), str(exposure), str(realized),
-                            None if unrealized is None else str(unrealized), missing_marks))
+                            None if unrealized is None else str(unrealized), missing_marks)).lastrowid
 
     def equity_rows(self, bot_id: str, limit: int = 1000) -> list[dict]:
         cur = self._conn.execute('SELECT * FROM equity WHERE bot_id=? ORDER BY id DESC LIMIT ?', (bot_id, limit))
         columns = [c[0] for c in cur.description]
         return list(reversed([_row(r, columns) for r in cur.fetchall()]))
 
-    def event(self, bot_id: str, run_id: str, *, at_us: int, kind: str, detail: str) -> None:
-        self._conn.execute('INSERT INTO events(bot_id, run_id, at_us, kind, detail) VALUES(?,?,?,?,?)',
-                           (bot_id, run_id, at_us, kind, detail))
+    def event(self, bot_id: str, run_id: str, *, at_us: int, kind: str, detail: str) -> int:
+        return self._conn.execute('INSERT INTO events(bot_id, run_id, at_us, kind, detail) VALUES(?,?,?,?,?)',
+                                  (bot_id, run_id, at_us, kind, detail)).lastrowid
 
     def events(self, bot_id: str) -> list[dict]:
         cur = self._conn.execute('SELECT * FROM events WHERE bot_id=? ORDER BY id', (bot_id,))

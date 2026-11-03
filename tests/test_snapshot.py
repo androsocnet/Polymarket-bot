@@ -45,6 +45,26 @@ class SnapshotTests(unittest.TestCase):
         self.error(gamma,clob,"rollover_exhausted")
         self.assertEqual(len(gamma.slug_calls),2)
 
+    def test_raw_clock_and_wall_receipt_evidence_is_additive(self):
+        from dataclasses import replace
+        from polymarket_bot.market_data.http import _wall_us
+        class TimedClob(FakeClob):
+            def measured(clob, read):
+                return replace(read, started_mono_ns=round(read.started_mono * 1e9),
+                               finished_mono_ns=round(read.finished_mono * 1e9),
+                               started_wall_us=_wall_us(NOW + timedelta(seconds=read.started_mono + 3600)),
+                               finished_wall_us=_wall_us(NOW + timedelta(seconds=read.finished_mono + 3600)))
+            def get_time(clob, **kwargs):
+                return clob.measured(super().get_time(**kwargs))
+            def get_book(clob, token, **kwargs):
+                return clob.measured(super().get_book(token, **kwargs))
+        result = self.collect(FakeGamma(), TimedClob(self.clock))
+        self.assertEqual(result.initial_time.payload, int(NOW.timestamp()))
+        self.assertEqual(result.final_time.finished_mono_ns, 400_000_000)
+        self.assertEqual(result.validated_mono_ns, 400_000_000)
+        self.assertEqual(result.up.timing.finished_wall_us, _wall_us(NOW + timedelta(seconds=3600.2)))
+        self.assertNotEqual(_wall_us(result.up.request_finished_at), result.up.timing.finished_wall_us)
+
     def test_independent_book_timestamps_are_preserved(self):
         result = self.collect(FakeGamma(),FakeClob(self.clock))
         self.assertNotEqual(result.up.book.source_at,result.down.book.source_at)

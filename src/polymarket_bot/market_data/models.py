@@ -2,6 +2,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .http import JsonRead
 
 class MarketDataError(Exception):
     def __init__(self, code: str, message: str, *, http_status: int | None = None,
@@ -86,6 +90,9 @@ class BookObservation:
     book: OutcomeBook
     request_started_at: datetime
     request_finished_at: datetime
+    # Legacy request_* fields use discovery's server projection. PAPER uses measured
+    # timing.*_wall_us receipts and *_mono_ns elapsed times, never those projections.
+    timing: JsonRead | None = None
 
 @dataclass(frozen=True)
 class MarketSnapshot:
@@ -98,3 +105,6 @@ class MarketSnapshot:
     validated_at: datetime
     time_round_trip_seconds: float
     rolled_over: bool
+    initial_time: JsonRead | None = None
+    final_time: JsonRead | None = None
+    validated_mono_ns: int | None = None

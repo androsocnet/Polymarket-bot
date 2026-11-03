@@ -74,7 +74,7 @@ class IngestTests(unittest.TestCase):
                 self.assertEqual(row['ask'], observation.book.best_ask)
                 self.assertEqual(row['midpoint'], observation.book.midpoint)
                 self.assertEqual(row['source_at'], us(observation.book.source_at))
-                self.assertEqual(row['received_us'], us(observation.request_finished_at))
+                self.assertEqual(row['received_us'], observation.timing.finished_wall_us)
         self.assertEqual(self.store.active_window(BOT)['market_id'], '1001')
         for table in TRADING_TABLES:
             with self.subTest(table=table):
@@ -82,6 +82,23 @@ class IngestTests(unittest.TestCase):
         heartbeat = self.store.heartbeat_row(BOT)
         self.assertEqual(heartbeat['status'], 'RUNNING')
         self.assertEqual(heartbeat['cycles'], 1)
+
+    def test_ingest_receipt_is_local_wall_not_legacy_server_projection(self):
+        from dataclasses import replace
+        sample = snap(0, 0)
+        sample = replace(sample, up=replace(sample.up, timing=replace(sample.up.timing,
+                         finished_wall_us=sample.up.timing.finished_wall_us + 3_600_000_000)))
+        self.engine(Collector([sample])).step()
+        row = next(r for r in self.store.observations_for_market(BOT, '1001') if r['outcome'] == 'UP')
+        self.assertEqual(row['received_us'], sample.up.timing.finished_wall_us)
+
+    def test_missing_local_receipt_is_rejected(self):
+        from dataclasses import replace
+        sample = snap(0, 0)
+        sample = replace(sample, up=replace(sample.up, timing=None))
+        result = self.engine(Collector([sample])).step()
+        self.assertEqual(result.reason, 'TIMING_INVALID')
+        self.assertEqual(self.store.observations_for_market(BOT, '1001'), [])
 
     def test_duplicate_slot_is_idempotent(self):
         collector = Collector([snap(0, 0), snap(0, 0)])

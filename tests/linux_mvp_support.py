@@ -1,6 +1,9 @@
 """SYNTHETIC Linux MVP fixtures. Fake market/time only; no network, no live data."""
 from datetime import datetime, timedelta, timezone
+from dataclasses import replace
 from decimal import Decimal
+import time
+from polymarket_bot.market_data.http import JsonRead
 
 from polymarket_bot.market_data.models import (BookLevel, BookObservation, MarketDataError,
                                                MarketDescriptor, MarketSnapshot, OutcomeBook,
@@ -52,7 +55,17 @@ def snapshot(*, slot, start=START, market=None, up_bid='0.30', up_ask='0.32',
     down = BookObservation(market.down, book(market.down.token_id, bid=down_bid, ask=down_ask,
                                              condition=market.condition_id, at=at, size=size), at, at)
     validated = at + timedelta(seconds=lag)
-    return MarketSnapshot(market, 'fast_path', up, down, at, at, validated, 0.01, False)
+    now = time.monotonic_ns()
+    receipt = now - int(lag * 1_000_000_000)
+    def timing(payload, ns, wall):
+        return JsonRead(payload, ns / 1_000_000_000, ns / 1_000_000_000,
+                        b'', ns, ns, us(wall), us(wall))
+    first = timing(int(at.timestamp()) - 1, receipt - 200_000_000, at - timedelta(seconds=.2))
+    final = timing(int(validated.timestamp()) + 1, now, validated)
+    up = replace(up, timing=timing({}, receipt - 1_000_000, at - timedelta(milliseconds=1)))
+    down = replace(down, timing=timing({}, receipt, at))
+    return MarketSnapshot(market, 'fast_path', up, down, at, at, validated, 0.01, False,
+                          first, final, now)
 
 
 def rising(slot, *, start=START, market=None, step='0.02', base='0.30'):
@@ -79,4 +92,20 @@ class Collector:
         sample = self.samples.pop(0)
         if isinstance(sample, BaseException):
             raise sample
+        # Queue preparation is not simulated network/decision latency. Deliver clocks
+        # in current process monotonic domain; keep all measured elapsed times intact.
+        if sample.validated_mono_ns is not None:
+            shift = time.monotonic_ns() - sample.validated_mono_ns
+            def shifted(read):
+                if read is None:
+                    return None
+                return replace(read, started_mono=read.started_mono + shift / 1e9,
+                               finished_mono=read.finished_mono + shift / 1e9,
+                               started_mono_ns=read.started_mono_ns + shift,
+                               finished_mono_ns=read.finished_mono_ns + shift)
+            sample = replace(sample, initial_time=shifted(sample.initial_time),
+                             final_time=shifted(sample.final_time),
+                             validated_mono_ns=sample.validated_mono_ns + shift,
+                             up=replace(sample.up, timing=shifted(sample.up.timing)),
+                             down=replace(sample.down, timing=shifted(sample.down.timing)))
         return sample

@@ -45,6 +45,146 @@ class EngineTests(unittest.TestCase):
     def decisions(self, market_id=MARKET_ID):
         return self.store.decisions_for_market(BOT, market_id)
 
+    def test_missing_clock_evidence_fails_closed_before_window_creation(self):
+        engine = self.engine([replace(rising(0), initial_time=None)])
+        result = self.step(engine)
+        self.assertEqual(result.reason, 'TIMING_INVALID')
+        self.assertEqual(self.decisions(), [])
+        self.assertIsNone(self.store.active_window(BOT))
+
+    def test_malformed_validation_time_fails_closed(self):
+        engine = self.engine([replace(rising(0), validated_at=None)])
+        self.assertEqual(self.step(engine).reason, 'TIMING_INVALID')
+        self.assertEqual(self.decisions(), [])
+
+    def test_freshness_evidence_persisted_with_real_wall_receipts(self):
+        import json
+        engine = self.engine([rising(0)])
+        self.step(engine)
+        evidence = json.loads(self.decisions()[0]['inputs_json'])['freshness']
+        self.assertTrue(evidence['outcomes']['UP']['fresh'])
+        row = self.store.observations_for_market(BOT, MARKET_ID)[0]
+        self.assertEqual(row['received_us'], evidence['outcomes'][row['outcome']]['receipt_wall_us'])
+
+    def test_integer_clock_negative_legacy_lag_does_not_reject_valid_pair(self):
+        sample = rising(0)
+        sample = replace(sample, up=replace(sample.up,
+                         request_finished_at=sample.validated_at + timedelta(seconds=.7)))
+        engine = self.engine([sample])
+        result = self.step(engine)
+        self.assertEqual(result.reason, 'WARMUP')
+
+    def test_fresh_receipt_with_old_source_never_orders(self):
+        sample = rising(0)
+        old = sample.up.book.source_at - timedelta(seconds=20)
+        sample = replace(sample, up=replace(sample.up, book=replace(sample.up.book,
+                         source_at=old, source_timestamp_raw=str(us(old) // 1000))))
+        engine = self.engine([sample])
+        self.assertEqual(self.step(engine).reason, 'STALE_PAIR')
+        self.assertEqual(self.store.orders(BOT), [])
+
+    def test_missing_other_receipt_blocks_pending_fill(self):
+        sample = rising(1)
+        sample = replace(sample, down=replace(sample.down, timing=None))
+        self.store.queue_order('pending-invalid', BOT, RUN, MARKET_ID, '111111', 'UP', 'BUY',
+                               Decimal('1'), MARKET_ID + ':0', 'SIGNAL_UP', us(START))
+        engine = self.engine([sample])
+        self.assertEqual(self.step(engine).reason, 'STALE_PAIR')
+        self.assertEqual(self.store.order('pending-invalid')['status'], 'PENDING')
+
+    def test_delayed_decision_never_executes_pending(self):
+        sample = rising(1)
+        self.store.queue_order('pending-delay', BOT, RUN, MARKET_ID, '111111', 'UP', 'BUY',
+                               Decimal('1'), MARKET_ID + ':0', 'SIGNAL_UP', us(START))
+        collector = mock.Mock()
+        collector.collect.return_value = sample
+        engine = PaperEngine(self.store, collector, self.settings, run_id=RUN,
+                             now_us=lambda: self.now,
+                             monotonic_ns=lambda: sample.validated_mono_ns + 6_000_000_000)
+        self.assertEqual(self.step(engine).reason, 'SLOT_UNCERTAIN')
+        self.assertEqual(self.store.order('pending-delay')['status'], 'PENDING')
+        self.assertEqual(self.decisions(), [])
+
+    def test_rejected_cycles_keep_proof_after_good_heartbeat(self):
+        import json
+        good = rising(0)
+        receipt = good.down.timing.finished_mono_ns
+        wide_first = replace(good.initial_time, payload=good.final_time.payload - 1,
+                             started_mono=(receipt - 400_000_000) / 1e9,
+                             started_mono_ns=receipt - 400_000_000,
+                             started_wall_us=good.down.timing.finished_wall_us - 400_000)
+        wide_final = replace(good.final_time, payload=good.final_time.payload - 1,
+                             started_mono=receipt / 1e9, started_mono_ns=receipt,
+                             started_wall_us=good.down.timing.finished_wall_us)
+        wide_first = replace(wide_first, started_mono=(receipt - 1_010_000_000) / 1e9,
+                             started_mono_ns=receipt - 1_010_000_000,
+                             started_wall_us=good.down.timing.finished_wall_us - 1_010_000)
+        wide_final = replace(wide_final, payload=good.final_time.payload,
+                             started_mono=(receipt + 1_000_000) / 1e9,
+                             started_mono_ns=receipt + 1_000_000,
+                             started_wall_us=good.down.timing.finished_wall_us + 1_000,
+                             finished_mono=(receipt + 800_000_000) / 1e9,
+                             finished_mono_ns=receipt + 800_000_000,
+                             finished_wall_us=good.down.timing.finished_wall_us + 800_000)
+        wide = replace(good, initial_time=wide_first, final_time=wide_final,
+                       validated_mono_ns=receipt + 800_000_000,
+                       validated_at=good.down.request_finished_at + timedelta(seconds=.8))
+        invalid = replace(good, initial_time=None)
+        outside = replace(good, market=replace(good.market,
+                          window_start=good.validated_at, window_end=good.market.window_end))
+        engine = self.engine([invalid, wide, outside, good])
+        for reason in ('TIMING_INVALID', 'SLOT_UNCERTAIN', 'OUT_OF_WINDOW'):
+            self.assertEqual(self.step(engine).reason, reason)
+            self.assertIsNone(self.store.active_window(BOT))
+            self.assertEqual(self.decisions(), [])
+            self.assertEqual(self.store.equity_rows(BOT), [])
+            self.assertEqual(self.store.orders(BOT), [])
+        self.assertEqual(self.step(engine).reason, 'WARMUP')
+        events = [e for e in self.store.events(BOT) if e['kind'] == 'freshness_evaluated']
+        self.assertEqual(len(events), 4)
+        proofs = [json.loads(e['detail']) for e in events]
+        self.assertFalse(proofs[0]['freshness']['valid'])
+        self.assertTrue(proofs[0]['freshness']['error'])
+        self.assertIsNone(proofs[0]['freshness']['captured']['initial_time'])
+        proof = proofs[1]['freshness']
+        self.assertGreater(proof['server_upper_us'] - proof['server_lower_us'], 2_000_000)
+        self.assertFalse(proof['slot_valid'])
+        self.assertEqual([p['cycle'] for p in proofs], [1, 2, 3, 4])
+
+    def test_duplicate_fill_and_mark_link_actual_second_cycle_proof(self):
+        import json
+        stale, fresh = rising(3), rising(3)
+        def old(observation):
+            source = observation.book.source_at - timedelta(seconds=10)
+            return replace(observation, book=replace(observation.book, source_at=source,
+                           source_timestamp_raw=str(us(source) // 1000)))
+        stale = replace(stale, up=old(stale.up), down=old(stale.down))
+        engine = self.engine([stale, fresh])
+        for slot in range(3):
+            self.step(self.engine([rising(slot)]))
+        engine.now_us = lambda: self.now
+        self.assertEqual(self.store.orders(BOT)[0]['status'], 'PENDING')
+        self.assertEqual(engine.step().reason, 'STALE_PAIR')
+        self.assertEqual(engine.step().status, 'DUPLICATE_SLOT')
+        self.assertEqual(self.store.orders(BOT)[0]['status'], 'FILLED')
+        self.assertEqual(self.decisions()[-1]['reason'], 'STALE_PAIR')
+        events = self.store.events(BOT)
+        proofs = [e for e in events if e['kind'] == 'freshness_evaluated'][-2:]
+        self.assertEqual(len(proofs), 2)
+        self.assertEqual(proofs[0]['at_us'], proofs[1]['at_us'])
+        first, second = [json.loads(e['detail']) for e in proofs]
+        self.assertFalse(first['freshness']['outcomes']['UP']['fresh'])
+        self.assertTrue(second['freshness']['outcomes']['UP']['fresh'])
+        observation = next(row for row in self.store.observations_for_market(BOT, MARKET_ID)
+                           if row['slot_index'] == 3 and row['outcome'] == 'UP')
+        self.assertEqual(observation['source_at'], first['freshness']['outcomes']['UP']['source_us'])
+        self.assertNotEqual(observation['source_at'], second['freshness']['outcomes']['UP']['source_us'])
+        execution = json.loads(next(e['detail'] for e in events if e['kind'] == 'order_executed'))
+        self.assertEqual(execution['freshness_event_id'], proofs[1]['id'])
+        mark = json.loads([e for e in events if e['kind'] == 'equity_marked'][-1]['detail'])
+        self.assertEqual(mark['freshness_event_id'], proofs[1]['id'])
+        self.assertEqual(mark['equity_id'], self.store.equity_rows(BOT)[-1]['id'])
+
     def test_warmup_then_buy_then_next_slot_fill(self):
         engine = self.engine([rising(0), rising(1), rising(2), rising(3)])
         results = [self.step(engine) for _ in range(4)]

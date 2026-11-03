@@ -71,6 +71,12 @@ class IngestEngine:
         self.consecutive_errors = 0
 
         market = snapshot.market
+        if any(observation.timing is None
+               or type(observation.timing.finished_wall_us) is not int
+               or observation.timing.finished_wall_us <= 0
+               for observation in (snapshot.up, snapshot.down)):
+            self._beat(at, market.market_id, 'RUNNING', 'TIMING_INVALID')
+            return IngestResult('TIMING_INVALID', market.market_id, reason='TIMING_INVALID')
         start_us, end_us = _us(market.window_start), _us(market.window_end)
         validated = _us(snapshot.validated_at)
         active = self.store.active_window(self.bot_id)
@@ -120,7 +126,7 @@ class IngestEngine:
             if self.store.observe(
                     self.bot_id, self.run_id, market.market_id, slot_index, outcome,
                     observation.outcome.token_id, book.best_bid, book.best_ask, book.midpoint,
-                    _us(book.source_at), _us(observation.request_finished_at)):
+                    _us(book.source_at), observation.timing.finished_wall_us):
                 inserted += 1
 
         self._beat(at, market.market_id, 'RUNNING', None)

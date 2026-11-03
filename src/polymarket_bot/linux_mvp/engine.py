@@ -7,6 +7,7 @@ import json
 import time
 
 from ..market_data.models import MarketDataError
+from ..market_data.freshness import evaluate, wall_us
 from .config import Settings
 from .fees import STATUS as FEE_STATUS, fee_evidence, reserve_per_share
 from .store import ARITHMETIC, SAFETY_STOPS, ZERO, MvpStore
@@ -24,7 +25,7 @@ class StepResult:
 
 
 def _us(moment) -> int:
-    return int(moment.timestamp() * 1_000_000)
+    return wall_us(moment)
 
 
 class PaperEngine:
@@ -36,15 +37,17 @@ class PaperEngine:
     """
 
     def __init__(self, store: MvpStore, collector, settings: Settings, *, run_id: str,
-                 now_us=None):
+                 now_us=None, monotonic_ns=None):
         self.store = store
         self.collector = collector
         self.settings = settings
         self.run_id = run_id
         self.bot_id = settings.bot_id
         self.now_us = now_us or (lambda: time.time_ns() // 1000)
+        self.monotonic_ns = monotonic_ns or time.monotonic_ns
         self.consecutive_errors = 0
         self.cycles = 0
+        self.freshness_event_id = None
         self._loss_event_day = None
 
     # -- cycle ---------------------------------------------------------------
@@ -89,6 +92,14 @@ class PaperEngine:
             return StepResult(status, reason=exc.reason)
         self.consecutive_errors = 0
         at = self.now_us()
+        freshness = evaluate(snapshot, decision_mono_ns=self.monotonic_ns(),
+                             max_age_seconds=self.settings.max_source_age_seconds,
+                             sample_seconds=self.settings.sample_seconds)
+        self.freshness_event_id = self.store.event(
+            self.bot_id, self.run_id, at_us=at, kind='freshness_evaluated',
+            detail=json.dumps(dict(market_id=snapshot.market.market_id, cycle=self.cycles,
+                                   slot_index=freshness.get('slot_index'), freshness=freshness),
+                              sort_keys=True, allow_nan=False))
         if self.settings.stop_path.exists():
             self._beat(at, heartbeat.get('market_id'), 'STOPPED', None)
             return StepResult('STOPPED', reason='EMERGENCY_STOP')
@@ -105,13 +116,21 @@ class PaperEngine:
             self._beat(at, market.market_id, 'FAILED_STOP', 'IDENTITY_CONFLICT')
             return StepResult('FAILED_STOP', market.market_id, reason='IDENTITY_CONFLICT')
         start_us, end_us = _us(market.window_start), _us(market.window_end)
-        validated = _us(snapshot.validated_at)
         active = self.store.active_window(self.bot_id)
-
-        if active is not None and active['market_id'] == market.market_id and validated >= active['end_us']:
+        if not freshness['valid']:
+            self._beat(at, market.market_id, 'RUNNING', 'TIMING_INVALID')
+            return StepResult('TIMING_INVALID', market.market_id, reason='TIMING_INVALID')
+        validated = _us(snapshot.validated_at)
+        if (active is not None and active['market_id'] == market.market_id
+                and freshness['server_lower_us'] >= active['end_us']):
             self._abandon(active, at, 'ABORTED', 'window ended while active', 'window_expired')
             self._beat(at, market.market_id, 'RUNNING', None)
             return StepResult('WINDOW_EXPIRED', market.market_id, reason='WINDOW_EXPIRED')
+
+        if not freshness['window_valid'] or not freshness['slot_valid']:
+            reason = 'OUT_OF_WINDOW' if not freshness['window_valid'] else 'SLOT_UNCERTAIN'
+            self._beat(at, market.market_id, 'RUNNING', reason)
+            return StepResult(reason, market.market_id, reason=reason)
 
         if active is None:
             if self.store.ensure_window(self.bot_id, self.run_id, market_id=market.market_id,
@@ -147,20 +166,23 @@ class PaperEngine:
         one_sided = False
         for outcome, observation in ((UP, snapshot.up), (DOWN, snapshot.down)):
             book = observation.book
-            self.store.observe(
-                self.bot_id, self.run_id, market.market_id, slot_index, outcome,
-                observation.outcome.token_id, book.best_bid, book.best_ask, book.midpoint,
-                _us(book.source_at), _us(observation.request_finished_at))
-            age = (snapshot.validated_at - observation.request_finished_at).total_seconds()
+            timing = freshness['outcomes'][outcome]
+            if 'source_us' in timing:
+                self.store.observe(
+                    self.bot_id, self.run_id, market.market_id, slot_index, outcome,
+                    observation.outcome.token_id, book.best_bid, book.best_ask, book.midpoint,
+                    timing['source_us'], timing['receipt_wall_us'])
             complete = (book.best_bid is not None and book.best_ask is not None
                         and book.best_bid > 0 and book.best_ask > 0)
             if not complete:
                 one_sided = True
-            elif not 0 <= age <= self.settings.max_source_age_seconds:
+            elif not timing['fresh']:
                 stale = True
             else:
                 fresh[outcome] = book
 
+        if any(item['reason'] == 'TIMING_INVALID' for item in freshness['outcomes'].values()):
+            fresh.clear()
         self._execute_pending(market.market_id, slot_index, fresh, at, fees)
         day_start = (at // 86_400_000_000) * 86_400_000_000
         if self.store.realized(self.bot_id, since_us=day_start) <= -self.settings.max_daily_loss:
@@ -174,13 +196,13 @@ class PaperEngine:
             return StepResult('DUPLICATE_SLOT', market.market_id, slot_index, reason='SLOT_ALREADY_DECIDED')
 
         reason = 'ONE_SIDED_BOOK' if one_sided else 'STALE_PAIR' if stale else ''
-        result = self._decide(market, snapshot, slot_index, slot_id, fresh, reason, at, fees)
+        result = self._decide(market, snapshot, slot_index, slot_id, fresh, reason, at, fees, freshness)
         self._mark(market.market_id, fresh, at)
         self._beat(at, market.market_id, 'RUNNING', None)
         return StepResult('OK', market.market_id, slot_index, result[0], result[1])
 
     # -- decisions -----------------------------------------------------------
-    def _decide(self, market, snapshot, slot_index, slot_id, fresh, stale_reason, at, fees):
+    def _decide(self, market, snapshot, slot_index, slot_id, fresh, stale_reason, at, fees, freshness):
         positions = self.store.positions(self.bot_id, market.market_id)
         open_positions = self.store.open_positions(self.bot_id)
         total_exposure = sum((p['cost_basis'] for p in open_positions), ZERO)
@@ -249,6 +271,7 @@ class PaperEngine:
                     order = dict(outcome=signal, side='BUY', quantity=quantity, reason='SIGNAL_' + signal)
 
         decision['inputs']['fee_evidence'] = fees
+        decision['inputs']['freshness'] = freshness
         with self.store.transaction():
             self.store.require_safe(self.bot_id)
             inserted = self.store.decide(**decision)
@@ -289,7 +312,8 @@ class PaperEngine:
         if result is not None:
             detail = {k: str(v) for k, v in result.items()}
             detail.update(signal_to_terminal_us=at - pending['created_us'],
-                          latency_kind='PAPER_DECISION_TO_TERMINAL_WALL_CLOCK')
+                          latency_kind='PAPER_DECISION_TO_TERMINAL_WALL_CLOCK',
+                          freshness_event_id=self.freshness_event_id)
             self.store.event(self.bot_id, self.run_id, at_us=at, kind='order_executed',
                              detail=json.dumps(detail, sort_keys=True))
 
@@ -317,10 +341,14 @@ class PaperEngine:
                     missing += 1
                     continue
                 unrealized += position['quantity'] * book.best_bid - position['cost_basis']
-            self.store.equity(self.bot_id, self.run_id, at_us=at, market_id=market_id,
+            equity_id = self.store.equity(self.bot_id, self.run_id, at_us=at, market_id=market_id,
                               cash=self.store.cash(self.bot_id), exposure=exposure,
                               realized=self.store.realized(self.bot_id),
                               unrealized=None if missing else unrealized, missing_marks=missing)
+            self.store.event(self.bot_id, self.run_id, at_us=at, kind='equity_marked',
+                             detail=json.dumps(dict(equity_id=equity_id,
+                                                    freshness_event_id=self.freshness_event_id),
+                                               sort_keys=True))
 
     def _abandon(self, window: dict, at: int, status: str, note: str, kind: str) -> None:
         self.store.close_window(self.bot_id, window['market_id'], status, at_us=at, note=note)
