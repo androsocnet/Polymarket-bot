@@ -82,6 +82,14 @@ def _identity(value):
     return identity
 
 
+def _order_identity(order):
+    """Identity including side to distinguish buy vs sell for same token."""
+    base = _identity(order)
+    if not isinstance(order.side, str) or order.side not in ('BUY', 'SELL'):
+        raise ValueError('missing or invalid order side')
+    return base + (order.side,)
+
+
 def _book(book, identity):
     if _identity(book) != identity:
         raise ValueError('book identity/session mismatch')
@@ -210,7 +218,7 @@ class Estimator:
                 result.update(status='CANCELLED', reason='CANCELLED_WITH_EVIDENCE_GAP', terminal_ns=stop)
             return result
         book = selected
-        key = identity
+        key = _order_identity(order)
         if key in self._used:
             raise ValueError('selected snapshot reused')
         self._used.add(key)
