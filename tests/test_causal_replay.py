@@ -232,10 +232,30 @@ class CausalReplayTests(unittest.TestCase):
         rows = [cycle(i) for i in range(10)]
         r = self.run_records(records(rows, MVP_HOLDING_PERIOD='1', MVP_MAX_TRADES_PER_WINDOW='4'))
         buy_execs = [e for e in r['estimated_executions'] if e.get('side') == 'BUY' and e.get('filled')]
-        if len(buy_execs) >= 2:
-            received_times = [e['received_ns'] for e in buy_execs]
-            self.assertEqual(len(received_times), len(set(received_times)),
-                             'each BUY execution must use a distinct receipt timestamp')
+        self.assertGreaterEqual(len(buy_execs), 2)
+        received_times = [e['received_ns'] for e in buy_execs]
+        self.assertEqual(len(received_times), len(set(received_times)),
+                         'each BUY execution must use a distinct receipt timestamp')
+
+    def test_two_orders_share_unchanged_depth_causally(self):
+        rows = [cycle(i, bid='.36' if i in (3, 6) else None, size='12')
+                for i in range(7)]
+        env = dict(MVP_HOLDING_PERIOD='1', MVP_MAX_TRADES_PER_WINDOW='4')
+        full = self.run_records(records(rows, **env))
+        prefix = self.run_records(records(rows[:4], **env))
+        buys = [e for e in full['estimated_executions'] if e['side'] == 'BUY']
+        self.assertEqual(len(buys), 2)
+        self.assertNotEqual(buys[0]['order_id'], buys[1]['order_id'])
+        self.assertEqual([e['status'] for e in buys], ['FILLED', 'PARTIAL'])
+        self.assertEqual([e['fills'] for e in buys],
+                         [[['0.38', '9.82']], [['0.38', '2.18']]])
+        self.assertEqual(sum(D(e['filled']) for e in buys), D('12'))
+        self.assertEqual(prefix['estimated_executions'][0], buys[0])
+        for execution, submitted_cycle, receipt_cycle in zip(buys, (2, 5), (3, 6)):
+            self.assertGreater(execution['received_ns'], rows[submitted_cycle]['decision_mono_ns'])
+            self.assertGreaterEqual(execution['received_ns'], execution['ready_ns'])
+            self.assertEqual(execution['received_ns'],
+                             rows[receipt_cycle]['snapshot'].up.timing.finished_mono_ns)
 
     def test_genuine_snapshot_reuse_in_books_list_raises(self):
         """Passing the same receipt twice within a single Estimator.execute() call raises."""
