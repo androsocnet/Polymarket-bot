@@ -211,6 +211,72 @@ class CausalReplayTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.run_records(records([cycle(1), cycle(0)]))
 
+    def test_multiple_round_trips_same_market_allowed(self):
+        """Two complete BUY-SELL round-trips on the same market within one session must both
+        execute without halting on 'selected snapshot reused'."""
+        # 10 cycles on one market, holding_period=1, max_trades_per_window=4 → 2+ round trips
+        rows = [cycle(i) for i in range(10)]
+        r = self.run_records(records(rows, MVP_HOLDING_PERIOD='1', MVP_MAX_TRADES_PER_WINDOW='4'))
+        buys = r['trade_counts']['buys']
+        sells = r['trade_counts']['sells']
+        # At minimum 2 round trips should complete; halted should be absent or not from snapshot reuse.
+        self.assertGreaterEqual(buys, 2, 'expected at least 2 BUY fills in multi-round-trip session')
+        self.assertGreaterEqual(sells, 2, 'expected at least 2 SELL fills in multi-round-trip session')
+        self.assertNotIn('INVALID_OR_MISSING_EXECUTION_EVIDENCE',
+                         (r['halted'] or {}).get('reason', ''),
+                         'must not halt from snapshot reuse blocker')
+        self.assertEqual(r['account']['performance'], 'DETERMINISTIC')
+
+    def test_separate_buy_receipts_use_distinct_evidence(self):
+        """Two BUY fills on the same token must use receipts from different snapshots."""
+        rows = [cycle(i) for i in range(10)]
+        r = self.run_records(records(rows, MVP_HOLDING_PERIOD='1', MVP_MAX_TRADES_PER_WINDOW='4'))
+        buy_execs = [e for e in r['estimated_executions'] if e.get('side') == 'BUY' and e.get('filled')]
+        if len(buy_execs) >= 2:
+            received_times = [e['received_ns'] for e in buy_execs]
+            self.assertEqual(len(received_times), len(set(received_times)),
+                             'each BUY execution must use a distinct receipt timestamp')
+
+    def test_genuine_snapshot_reuse_in_books_list_raises(self):
+        """Passing the same receipt twice within a single Estimator.execute() call raises."""
+        from polymarket_bot.estimated import Estimator, Scenario
+        from tests.test_estimated import book, order
+        from decimal import Decimal as D
+        estimator = Estimator()
+        with self.assertRaises(ValueError):
+            estimator.execute(order(), [book(300), book(300)], Scenario(), cash=D('100'), held=D('0'))
+
+    def test_depth_ledger_still_consumes_lifetime(self):
+        """DepthLedger must continue debiting prior fills; subsequent orders on depleted
+        depth must receive reduced or zero available size."""
+        from polymarket_bot.causal_replay import DepthLedger
+        from decimal import Decimal as D
+        ledger = DepthLedger()
+        from tests.test_estimated import book as mk_book
+        b = mk_book(300)
+        # Charge full depth at the .50 ask level for the book's token_id ('t')
+        ledger.charge(b.token_id, ((D('.50'), D('3')),))
+        adj = ledger.adapt(b, D('1'))
+        # asks started at D('3') at .50; after charging 3, available should be 0
+        level_at_50 = next(l for l in adj.asks if l.price == D('.50'))
+        self.assertEqual(level_at_50.size, D('0'), 'depleted depth must show zero')
+
+    def test_unknown_execution_preserved_after_fix(self):
+        """UNKNOWN outcome must still be recorded when evidence is missing, not suppressed."""
+        # 3 cycles: buy at cycle 1, then archive ends — pending order has no subsequent book
+        r = self.run_records(records([cycle(i) for i in range(3)]))
+        self.assertEqual(r['trade_counts']['unknown'], 1)
+        self.assertIsNone(r['account']['net_pnl'])
+        self.assertEqual(r['account']['performance'], 'UNKNOWN')
+
+    def test_deterministic_replay_produces_identical_reports(self):
+        """Replay of the same records must produce bit-identical JSON regardless of run count."""
+        import json
+        rows = records([cycle(i) for i in range(10)], MVP_HOLDING_PERIOD='1', MVP_MAX_TRADES_PER_WINDOW='4')
+        r1 = self.run_records(rows)
+        r2 = self.run_records(rows)
+        self.assertEqual(json.dumps(r1, sort_keys=True), json.dumps(r2, sort_keys=True))
+
 
 if __name__ == '__main__':
     unittest.main()

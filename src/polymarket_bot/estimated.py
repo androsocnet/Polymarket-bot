@@ -152,14 +152,15 @@ def _fees(book):
 
 
 class Estimator:
-    """One isolated order per session/market/token, including later receipts.
+    """Stateless per-call execution estimator for PAPER_ONLY offline replay.
 
-    ponytail: no replenishment proof; refuse subsequent orders for same identity.
-    Multi-order replay needs event-level consumption/replenishment evidence.
+    Each call to execute() is independent.  The DepthLedger in the replay
+    engine owns lifetime cross-order depth consumption; this class only
+    validates that receipts passed to a single execute() call are strictly
+    increasing and match the order's identity.  Instantiate once and reuse
+    across orders, or create a fresh instance per call — the behaviour is
+    identical.
     """
-
-    def __init__(self):
-        self._used = set()
 
     def execute(self, order, books, scenario, *, cash, held):
         """Estimate one terminal FAK/FOK; no account mutations or risk authorizations.
@@ -218,10 +219,6 @@ class Estimator:
                 result.update(status='CANCELLED', reason='CANCELLED_WITH_EVIDENCE_GAP', terminal_ns=stop)
             return result
         book = selected
-        key = _order_identity(order)
-        if key in self._used:
-            raise ValueError('selected snapshot reused')
-        self._used.add(key)
         result.update(received_ns=book.received_ns, terminal_ns=book.received_ns)
         if not _fees(book):
             result.update(reason='UNVERIFIED_FEE_METADATA')

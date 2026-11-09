@@ -128,17 +128,41 @@ class EstimatedTests(unittest.TestCase):
         self.assertEqual([r['notional'] / r['filled'] for r in results],
                          [D('.508'), D('.518'), D('.54')])
 
-    def test_snapshot_cannot_supply_liquidity_twice(self):
+    def test_snapshot_cannot_supply_liquidity_twice_in_one_call(self):
+        # Duplicate receipt (same received_ns) in a single call is rejected by the
+        # strictly-increasing monotonic check, not by cross-call instance state.
         estimator = Estimator()
-        estimator.execute(order(), [book()], Scenario(), cash=D('100'), held=D('0'))
-        with self.assertRaisesRegex(ValueError, 'reused'):
-            estimator.execute(order(submitted_ns=MS), [book()], Scenario(), cash=D('100'), held=D('0'))
+        with self.assertRaises(ValueError):
+            estimator.execute(order(), [book(300), book(300)], Scenario(), cash=D('100'), held=D('0'))
 
-    def test_review_duplicate_receipt_cannot_prove_replenishment(self):
+    def test_separate_orders_on_same_token_are_allowed(self):
+        # Second BUY on the same token (a legitimate later round-trip) must succeed.
+        # The DepthLedger in CausalReplay tracks consumption; Estimator is stateless.
         estimator = Estimator()
-        estimator.execute(order(), [book()], Scenario(), cash=D('100'), held=D('0'))
-        with self.assertRaisesRegex(ValueError, 'reused'):
-            estimator.execute(order(submitted_ns=MS), [book(600)], Scenario(), cash=D('100'), held=D('0'))
+        r1 = estimator.execute(order(), [book(300)], Scenario(), cash=D('100'), held=D('0'))
+        self.assertEqual(r1['status'], 'FILLED')
+        # Second order uses a later distinct receipt — must not raise.
+        r2 = estimator.execute(order(submitted_ns=1_000_000), [book(600)],
+                               Scenario(), cash=D('100'), held=D('0'))
+        self.assertEqual(r2['status'], 'FILLED')
+        # Both receipts are genuinely different (600 MS vs 300 MS).
+        self.assertNotEqual(r1['received_ns'], r2['received_ns'])
+
+    def test_buy_and_sell_on_same_token_both_allowed(self):
+        # BUY and SELL on the same token in separate calls must both proceed.
+        estimator = Estimator()
+        r_buy = estimator.execute(order(side='BUY', limit=D('.52')), [book(300)],
+                                  Scenario(), cash=D('100'), held=D('0'))
+        self.assertEqual(r_buy['status'], 'FILLED')
+        r_sell = estimator.execute(order(side='SELL', limit=D('.48')), [book(600)],
+                                   Scenario(), cash=D('100'), held=r_buy['filled'])
+        self.assertEqual(r_sell['status'], 'FILLED')
+
+    def test_review_duplicate_receipt_in_same_books_list_raises(self):
+        # Same receipt timestamp appearing twice in books is monotonic-order violation.
+        estimator = Estimator()
+        with self.assertRaises(ValueError):
+            estimator.execute(order(), [book(300), book(300)], Scenario(), cash=D('100'), held=D('0'))
 
     def test_review_observation_deadline_does_not_cancel(self):
         r = self.run_order([], order(cancel_requested_ns=3000 * MS))

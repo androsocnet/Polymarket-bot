@@ -82,7 +82,7 @@ class CausalReplay:
         self.root = Path(db_dir) if db_dir is not None else Path(tempfile.mkdtemp(prefix='causal-replay-'))
         self.db_path = self.root / 'replay.sqlite'
         self.ledger = DepthLedger()
-        self.estimator = Estimator()  # Single instance for identity reuse protection
+        self.estimator = Estimator()  # Stateless; reuse across orders is safe; DepthLedger owns consumption.
         self.executions = []
         self.context = {}
         self.halted = None
@@ -240,7 +240,7 @@ class CausalReplay:
                         tuple(Level(x.price, x.size) for x in obs.book.asks), minimum, tick,
                         fees, ns, obs.timing.finished_wall_us)
             adjusted = self.ledger.adapt(book, self.scenario.depth_fraction)
-            # Single Estimator instance for identity reuse protection; lifetime ledger owns cross-order consumption.
+            # DepthLedger owns lifetime cross-order depth consumption; Estimator is stateless per call.
             result = self.estimator.execute(self.request(pending), [adjusted],
                                         replace(self.scenario, depth_fraction=Decimal(1)),
                                         cash=self.store.cash(self.bot), held=self.store.position(
