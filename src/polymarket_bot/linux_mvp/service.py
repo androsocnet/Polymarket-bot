@@ -11,6 +11,11 @@ from .config import Settings
 from .store import MvpStore
 
 TERMINAL = ('STOPPED', 'RISK_STOPPED', 'FAILED_STOP')
+# Cadence classes: fast tradable statuses use elapsed-time scheduling so cycle
+# processing never stacks onto the poll interval; unavailable-market statuses
+# keep the plain poll interval; everything else keeps bounded error backoff.
+FAST_STATUSES = ('OK', 'DUPLICATE_SLOT', 'SLOT_UNCERTAIN')
+IDLE_STATUSES = ('WINDOW_EXPIRED', 'OUT_OF_WINDOW', 'WINDOW_ABANDONED')
 
 
 class InstanceLockError(RuntimeError):
@@ -58,13 +63,14 @@ def single_instance(state_dir: Path):
 
 class Service:
     def __init__(self, store: MvpStore, collector, settings: Settings, *, run_id: str | None = None,
-                 sleep=time.sleep, now_us=None, log=print, engine_factory=None):
+                 sleep=time.sleep, now_us=None, monotonic_ns=None, log=print, engine_factory=None):
         self.store = store
         self.collector = collector
         self.settings = settings
         self.run_id = run_id or f'{settings.bot_id}:{time.time_ns() // 1000}'
         self._sleep = sleep
         self._now_us = now_us
+        self._monotonic_ns = monotonic_ns or time.monotonic_ns
         self._log = log
         self._engine_factory = engine_factory
         if self._engine_factory is None:
@@ -88,6 +94,7 @@ class Service:
             setter(lambda: self._stop or self.settings.stop_path.exists())
         status = 'COMPLETED'
         while not self._stop:
+            started_ns = self._monotonic_ns()
             try:
                 self.last_result = engine.step()
             except CollectionStopped:
@@ -107,9 +114,14 @@ class Service:
             if max_cycles is not None and engine.cycles >= max_cycles:
                 status = 'CYCLE_LIMIT'
                 break
-            healthy = ('OK', 'DUPLICATE_SLOT', 'WINDOW_EXPIRED', 'OUT_OF_WINDOW', 'WINDOW_ABANDONED')
-            if status in healthy:
+            healthy = FAST_STATUSES + IDLE_STATUSES
+            if status in IDLE_STATUSES:
+                # No tradable market: keep the plain poll interval, do not hammer.
                 delay = float(self.settings.poll_seconds)
+            elif status in healthy:
+                # Elapsed-time scheduling: the interval covers processing time.
+                elapsed = (self._monotonic_ns() - started_ns) / 1e9
+                delay = max(0.0, float(self.settings.poll_seconds) - elapsed)
             else:
                 failures = max(1, getattr(engine, 'consecutive_errors', 1))
                 delay = min(self.settings.backoff_max_seconds,

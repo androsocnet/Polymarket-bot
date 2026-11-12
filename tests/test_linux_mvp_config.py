@@ -86,7 +86,7 @@ class SettingsTests(unittest.TestCase):
             'MVP_SAMPLE_SECONDS': '3',
             'MVP_MAX_SOURCE_AGE_SECONDS': '0',
             'MVP_MAX_CONSECUTIVE_ERRORS': '0',
-            'MVP_POLL_SECONDS': '1',
+            'MVP_POLL_SECONDS': '0',
             'MVP_BACKOFF_BASE_SECONDS': '0',
             'MVP_BACKOFF_MAX_SECONDS': '0',
         }
@@ -113,6 +113,12 @@ class SettingsTests(unittest.TestCase):
                          .poll_seconds, 60)
         with self.assertRaises(ConfigError):
             Settings.from_env({'MVP_POLL_SECONDS': '61'}, base=Path('/tmp/mvp'))
+
+    def test_poll_interval_accepts_one_second_and_refuses_zero(self):
+        self.assertEqual(Settings.from_env({'MVP_POLL_SECONDS': '1'}, base=Path('/tmp/mvp'))
+                         .poll_seconds, 1)
+        with self.assertRaises(ConfigError):
+            Settings.from_env({'MVP_POLL_SECONDS': '0'}, base=Path('/tmp/mvp'))
 
     def test_paths_and_bot_id_are_required_shapes(self):
         with self.assertRaises(ConfigError):

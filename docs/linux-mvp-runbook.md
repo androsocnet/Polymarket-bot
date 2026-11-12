@@ -64,7 +64,7 @@ Useful Phase 1 settings:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `MVP_POLL_SECONDS` | `2` | minimum seconds between ingest cycles (2–60) |
+| `MVP_POLL_SECONDS` | `2` | target seconds between ingest cycle starts (1–60) |
 | `MVP_BACKOFF_BASE_SECONDS` | `2` | first delay after a data error (bounded, >0) |
 | `MVP_BACKOFF_MAX_SECONDS` | `30` | hard cap on the adaptive backoff (1–300) |
 | `MVP_MAX_CONSECUTIVE_ERRORS` | `5` | stop cleanly after this many consecutive failures |
@@ -72,6 +72,14 @@ Useful Phase 1 settings:
 
 Raising `MVP_POLL_SECONDS` reduces public requests but also reduces slot coverage. Raising the
 backoff quickly reduces load during throttling. Success resets the backoff to the poll interval.
+
+`MVP_POLL_SECONDS` is a cycle-start target measured with a monotonic clock: after each cycle the
+service sleeps only the remaining interval, so cycle processing time no longer stacks onto it
+(previously the observed cadence was poll + processing, ~2.895s against 2s slots, which expired
+next-slot order windows). `MVP_POLL_SECONDS=1` is valid for faster slot coverage. `WINDOW_EXPIRED`,
+`OUT_OF_WINDOW` and `WINDOW_ABANDONED` cycles (no tradable market) keep the plain poll interval;
+`SLOT_UNCERTAIN` cycles retry at the target cadence; errors keep bounded exponential backoff.
+Polling cadence stays independent of the fixed 2-second trading slot width (`MVP_SAMPLE_SECONDS`).
 
 ## 4. Start and observe
 

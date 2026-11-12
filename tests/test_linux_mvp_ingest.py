@@ -237,7 +237,9 @@ class IngestTests(unittest.TestCase):
                           engine_factory=IngestEngine, sleep=delays.append,
                           now_us=lambda: us(START))
         self.assertEqual(service.run(max_cycles=3), 'CYCLE_LIMIT')
-        self.assertAlmostEqual(sum(delays), 10.0)
+        # Elapsed-time scheduling subtracts (sub-millisecond here) processing time.
+        self.assertAlmostEqual(sum(delays), 10.0, delta=0.05)
+        self.assertTrue(all(0 < delay <= 5.0 for delay in delays))
 
     def test_throttle_backoff_is_bounded(self):
         self.settings = Settings.from_env({
@@ -269,7 +271,7 @@ class IngestTests(unittest.TestCase):
                           self.settings, run_id='run-reset', engine_factory=IngestEngine,
                           sleep=delays.append, now_us=lambda: us(START))
         self.assertEqual(service.run(max_cycles=4), 'CYCLE_LIMIT')
-        self.assertAlmostEqual(sum(delays), 6.0)
+        self.assertAlmostEqual(sum(delays), 6.0, delta=0.05)
 
     def test_two_windows_450_slots_ingested_without_decisions(self):
         collector = Collector([snap(window, slot) for window in range(2) for slot in range(450)])

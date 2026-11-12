@@ -102,7 +102,7 @@ class Settings:
             max_trades_per_window=_integer(env, 'MVP_MAX_TRADES_PER_WINDOW', 6, low=0, high=450),
             max_daily_loss=_decimal(env, 'MVP_MAX_DAILY_LOSS', '10', low=0, low_open=True),
             sample_seconds=_integer(env, 'MVP_SAMPLE_SECONDS', 2, low=2, high=2),
-            poll_seconds=_integer(env, 'MVP_POLL_SECONDS', 2, low=2, high=60),
+            poll_seconds=_integer(env, 'MVP_POLL_SECONDS', 2, low=1, high=60),
             backoff_base_seconds=float(_decimal(env, 'MVP_BACKOFF_BASE_SECONDS', '2',
                                                 low=0, high=60, low_open=True)),
             backoff_max_seconds=float(_decimal(env, 'MVP_BACKOFF_MAX_SECONDS', '30',
