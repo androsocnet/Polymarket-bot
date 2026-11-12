@@ -20,6 +20,9 @@ class SafetyStopError(sqlite3.IntegrityError):
 WINDOW_STATUSES = ('ACTIVE', 'CLOSED', 'ABORTED', 'UNKNOWN_SETTLEMENT', 'SETTLED')
 
 _SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS execution_evidence(
+    order_id TEXT PRIMARY KEY REFERENCES orders(order_id),
+    evidence_json TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS order_fees(
     order_id TEXT PRIMARY KEY REFERENCES orders(order_id),
     evidence_json TEXT NOT NULL,
@@ -584,12 +587,32 @@ class MvpStore:
             "AND status IN ('FILLED','PARTIAL') ORDER BY updated_us DESC, order_id DESC LIMIT 1",
             (bot_id, market_id, outcome)).fetchone())
 
-    def reject_order(self, order_id: str, reason: str, *, at_us: int) -> bool:
-        cur = self._conn.execute("UPDATE orders SET status='REJECTED', reason=?, updated_us=? "
-                                 "WHERE order_id=? AND status='PENDING'", (reason, at_us, order_id))
-        return cur.rowcount == 1
+    def reject_order(self, order_id: str, reason: str, *, at_us: int,
+                     freshness_event_id=None, slot_index=None) -> bool:
+        def reject(conn):
+            cur = conn.execute("UPDATE orders SET status='REJECTED', reason=?, updated_us=? "
+                               "WHERE order_id=? AND status='PENDING'", (reason, at_us, order_id))
+            if cur.rowcount:
+                conn.execute('INSERT INTO execution_evidence VALUES(?,?)',
+                             (order_id, json.dumps(dict(verification='UNVERIFIED', levels=None,
+                              consumed=[], reason=reason, freshness_event_id=freshness_event_id,
+                              slot_index=slot_index, at_us=at_us))))
+            return cur.rowcount == 1
+        if self._conn.in_transaction:
+            self._conn.execute('SAVEPOINT reject_order')
+            try:
+                result = reject(self._conn)
+            except BaseException:
+                self._conn.execute('ROLLBACK TO SAVEPOINT reject_order')
+                raise
+            finally:
+                self._conn.execute('RELEASE SAVEPOINT reject_order')
+            return result
+        with self.transaction() as conn:
+            return reject(conn)
 
-    def execute_pending(self, bot_id: str, books: dict, fee_bps: Decimal, *, at_us: int) -> dict | None:
+    def execute_pending(self, bot_id: str, books: dict, fee_bps: Decimal, *, at_us: int,
+                        freshness_event_id=None, slot_index=None, depth_captured=False) -> dict | None:
         """Execute the oldest PENDING order exactly once against the supplied books.
 
         Price-time walks visible depth; a short book leaves a terminal PARTIAL (the remainder is
@@ -609,6 +632,15 @@ class MvpStore:
             if book is not None and (book.token_id != order['token_id'] or window is None
                                      or book.condition_id != window['condition_id']):
                 raise sqlite3.IntegrityError('execution book identity mismatch')
+            levels = None if book is None else (book.asks if order['side'] == 'BUY' else book.bids)
+            # CAPTURED records supplied depth, not executable liquidity or independently verified freshness.
+            evidence = dict(verification='CAPTURED' if depth_captured and book is not None else 'UNVERIFIED',
+                            levels=None if levels is None else [dict(price=str(level.price), size=str(level.size))
+                                                                for level in levels],
+                            consumed=[], freshness_event_id=freshness_event_id, slot_index=slot_index,
+                            decision_slot_id=order['decision_slot_id'], at_us=at_us,
+                            side=order['side'], cash_before=str(self._cash_in(conn, bot_id)),
+                            fee_bps=json.loads(json.dumps(fee_bps, default=str)))
             from .fees import STATUS, level_fee, same_schedule
             market_fees = isinstance(fee_bps, dict)
             if market_fees:
@@ -622,7 +654,15 @@ class MvpStore:
                          and fee_bps.get('observed_us', at_us + 1) <= at_us
                          and 0 <= at_us - fee_bps.get('observed_us', 0) <= 5_000_000)
                 if not valid:
-                    self.reject_order(order['order_id'], 'FEE_UNVERIFIED_OR_CHANGED', at_us=at_us)
+                    if saved is not None:
+                        conn.execute('UPDATE order_fees SET execution_evidence_json=?, fills_json=? WHERE order_id=?',
+                                     (json.dumps(evidence['fee_bps'], sort_keys=True), '[]', order['order_id']))
+                    self.reject_order(order['order_id'], 'FEE_UNVERIFIED_OR_CHANGED', at_us=at_us,
+                                      freshness_event_id=freshness_event_id, slot_index=slot_index)
+                    evidence.update(status='REJECTED', reason='FEE_UNVERIFIED_OR_CHANGED',
+                                    cash_after=evidence['cash_before'], filled='0', notional='0', fee='0', realized='0')
+                    conn.execute('UPDATE execution_evidence SET evidence_json=? WHERE order_id=?',
+                                 (json.dumps(evidence, sort_keys=True), order['order_id']))
                     return dict(order_id=order['order_id'], status='REJECTED',
                                 reason='FEE_UNVERIFIED_OR_CHANGED', filled=ZERO, notional=ZERO,
                                 fee=ZERO, realized=ZERO)
@@ -656,7 +696,8 @@ class MvpStore:
                         fee += charge
                         filled += take
                         fills.append(dict(price=str(level.price), quantity=str(take),
-                                          notional=str(take * level.price), fee=str(charge)))
+                                          notional=str(take * level.price),
+                                          fee=str(charge) if market_fees else None))
                 if not market_fees:
                     # Explicit legacy API only; forward engine never passes a flat rate.
                     fee = (notional * fee_bps / Decimal(10000)) if filled > 0 else ZERO
@@ -692,9 +733,17 @@ class MvpStore:
                           order['order_id']))
             if market_fees:
                 conn.execute('UPDATE order_fees SET execution_evidence_json=?, fills_json=? WHERE order_id=?',
-                             (json.dumps(fee_bps, sort_keys=True),
+                             (json.dumps(evidence['fee_bps'], sort_keys=True),
                               json.dumps(fills if filled else [], sort_keys=True), order['order_id']))
             self.reconcile(bot_id)
+            evidence.update(status=status, reason=reason, consumed=fills if filled else [],
+                            filled=str(filled), notional=str(notional), fee=str(fee), realized=str(realized),
+                            cash_after=str(self._cash_in(conn, bot_id)),
+                            position_before=str(ZERO if position is None else _d(position[0])),
+                            basis_before=str(ZERO if position is None else _d(position[1])),
+                            position_after=str(held), basis_after=str(basis))
+            conn.execute('INSERT INTO execution_evidence VALUES(?,?)',
+                         (order['order_id'], json.dumps(evidence, sort_keys=True)))
             return {'order_id': order['order_id'], 'status': status, 'reason': reason,
                     'filled': filled, 'notional': notional, 'fee': fee, 'realized': realized}
 

@@ -52,6 +52,7 @@ class PaperEngine:
 
     # -- cycle ---------------------------------------------------------------
     def step(self) -> StepResult:
+        self.freshness_event_id = None
         at = self.now_us()
         self.cycles += 1
         heartbeat = self.store.safety_state(self.bot_id) or {}
@@ -298,17 +299,19 @@ class PaperEngine:
         if pending is None:
             return
         if pending['market_id'] != market_id:
-            self._reject(pending, 'WINDOW_CLOSED', at)
+            self._reject(pending, 'WINDOW_CLOSED', at, current_market=False)
             return
         decision_slot = self._slot_of(pending['decision_slot_id'])
         if decision_slot is None or slot_index <= decision_slot:
             return
         if slot_index > decision_slot + 1:
-            self._reject(pending, 'EXPIRED_EXECUTION_WINDOW', at)
+            self._reject(pending, 'EXPIRED_EXECUTION_WINDOW', at, slot_index=slot_index)
             return
         if pending['outcome'] not in fresh:
             return
-        result = self.store.execute_pending(self.bot_id, fresh, fees, at_us=at)
+        result = self.store.execute_pending(self.bot_id, fresh, fees, at_us=at,
+                                            freshness_event_id=self.freshness_event_id, slot_index=slot_index,
+                                            depth_captured=True)
         if result is not None:
             detail = {k: str(v) for k, v in result.items()}
             detail.update(signal_to_terminal_us=at - pending['created_us'],
@@ -320,10 +323,12 @@ class PaperEngine:
     def _reject_pending_of(self, market_id: str, at: int) -> None:
         pending = self.store.pending_order(self.bot_id)
         if pending is not None and pending['market_id'] == market_id:
-            self._reject(pending, 'WINDOW_CLOSED', at)
+            self._reject(pending, 'WINDOW_CLOSED', at, current_market=False)
 
-    def _reject(self, pending: dict, reason: str, at: int) -> None:
-        if self.store.reject_order(pending['order_id'], reason, at_us=at):
+    def _reject(self, pending: dict, reason: str, at: int, *, slot_index=None, current_market=True) -> None:
+        if self.store.reject_order(pending['order_id'], reason, at_us=at,
+                                   freshness_event_id=self.freshness_event_id if current_market else None,
+                                   slot_index=slot_index):
             self.store.event(self.bot_id, self.run_id, at_us=at, kind='order_expired',
                              detail=f'{pending["order_id"]}:{reason}')
 
