@@ -135,6 +135,41 @@ class CoinbaseProviderTests(unittest.TestCase):
     def _make_client(self, handler):
         return httpx.Client(transport=httpx.MockTransport(handler), trust_env=False)
 
+    def test_exact_raw_bytes_for_success_rejection_and_retry(self):
+        from polymarket_bot.recorder.free_reference import KrakenRestProvider
+        bodies = [b'{ "price":"10", "bid":"9", "ask":"11", "time":"2020-03-20T00:22:57.833Z" }',
+                  b'not json', b'{"price":"10","bid":"9","ask":"11","time":"2099-01-01T00:00:00Z"}']
+        for body in bodies:
+            with self.subTest(body=body), self._make_client(lambda request: httpx.Response(200, content=body)) as client:
+                obs = CoinbaseRestProvider(client, monotonic_ns=lambda: self.monotonic_ns,
+                    wall_us=lambda: self.wall_us).fetch_ticker()
+                self.assertEqual(obs.raw_response, body)
+                self.assertTrue(obs.raw_complete)
+                self.assertEqual(obs.raw_payload_hash, hashlib.sha256(body).hexdigest())
+        for provider in (CoinbaseRestProvider, KrakenRestProvider):
+            calls = []
+            def handler(request):
+                calls.append(request)
+                return httpx.Response(429 if len(calls) == 1 else 503,
+                                      content=b'first' if len(calls) == 1 else b'final')
+            with self._make_client(handler) as client:
+                obs = provider(client, monotonic_ns=lambda: self.monotonic_ns,
+                    wall_us=lambda: self.wall_us, sleep=lambda _: None).fetch_ticker()
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(obs.raw_response, b'final')
+            self.assertTrue(obs.raw_complete)
+
+    def test_empty_response_and_no_send_are_distinct(self):
+        with self._make_client(lambda request: httpx.Response(503, content=b'')) as client:
+            provider = CoinbaseRestProvider(client, monotonic_ns=lambda: self.monotonic_ns,
+                wall_us=lambda: self.wall_us)
+            captured = provider.fetch_ticker()
+            missing = provider.fetch_ticker(deadline=0)
+        self.assertEqual(captured.raw_response, b'')
+        self.assertTrue(captured.raw_complete)
+        self.assertIsNone(missing.raw_response)
+        self.assertFalse(missing.raw_complete)
+
     def test_raw_stream_cap_deadline_and_no_ambient_secrets(self):
         class Stream(httpx.SyncByteStream):
             def __iter__(self):
@@ -150,6 +185,8 @@ class CoinbaseProviderTests(unittest.TestCase):
             provider = CoinbaseRestProvider(client, monotonic_ns=lambda: self.monotonic_ns,
                                             wall_us=lambda: self.wall_us)
             obs = provider.fetch_ticker(deadline=self.monotonic_ns / 1000000000 + 5)
+        self.assertEqual(obs.raw_response, b'x' * 1048576)
+        self.assertFalse(obs.raw_complete)
         self.assertEqual(obs.error_code, 'PAYLOAD_TOO_LARGE')
         self.assertEqual(obs.raw_payload_size, 1048576)
         self.assertEqual(obs.raw_payload_hash, hashlib.sha256(b'x' * 1048576).hexdigest())
@@ -170,6 +207,8 @@ class CoinbaseProviderTests(unittest.TestCase):
             obs = provider.fetch_ticker(deadline=self.monotonic_ns / 1000000000 + 5)
         self.assertEqual(obs.error_code, 'DEADLINE_EXPIRED')
         self.assertEqual(obs.raw_payload_hash, hashlib.sha256(b'partial').hexdigest())
+        self.assertEqual(obs.raw_response, b'partial')
+        self.assertFalse(obs.raw_complete)
 
     def test_deadline_uses_only_absolute_monotonic_time(self):
         calls = []
@@ -212,6 +251,8 @@ class CoinbaseProviderTests(unittest.TestCase):
             provider = CoinbaseRestProvider(client, monotonic_ns=lambda: self.monotonic_ns,
                                             wall_us=lambda: self.wall_us)
             observation = provider.fetch_ticker(deadline=self.monotonic_ns / 1_000_000_000 + 5)
+        self.assertIsNone(observation.raw_response)
+        self.assertFalse(observation.raw_complete)
         self.assertEqual(observation.raw_payload_hash, hashlib.sha256(b"").hexdigest())
         self.assertIsNone(observation.http_status)
         self.assertIsNone(observation.price)

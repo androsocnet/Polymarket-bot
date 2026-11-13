@@ -42,6 +42,63 @@ class FreePersistenceTests(unittest.TestCase):
                 except PermissionError:
                     time.sleep(0.1)
 
+    def raw_observation(self, **changes):
+        import hashlib
+        from dataclasses import replace
+        body = b'{ "authentic": true }'
+        obs = ApproximateObservation('coinbase', 'BTC/USD', 'USD', Decimal('10'),
+            Decimal('9'), Decimal('11'), NOW_US, NOW_US, NOW_US,
+            hashlib.sha256(body).hexdigest(), len(body), 'rest', 'coinbase-ticker-v1',
+            200, 'success', None, 10, raw_response=body, raw_complete=True)
+        return replace(obs, **changes)
+
+    def test_raw_event_roundtrip_and_missing_legacy_evidence(self):
+        import base64
+        import json
+        from polymarket_bot.recorder.store import decode_evidence
+        for changes in ({}, {'raw_complete': False, 'result': 'error', 'error_code': 'DEADLINE_EXPIRED'},
+                        {'raw_response': None, 'raw_complete': False}):
+            obs = self.raw_observation(**changes)
+            identifier = self.store.save_approximate_observation(self.run_id, obs)
+            events = self.store._rows("SELECT detail_json FROM recorder_events WHERE json_extract(detail_json,'$.type')='APPROXIMATE_RAW_RESPONSE' AND json_extract(detail_json,'$.observation_id')=?", (identifier,))
+            self.assertEqual(len(events), 1)
+            event = json.loads(events[0]['detail_json'])
+            self.assertEqual(event['run_id'], self.run_id)
+            self.assertEqual(event['parser_revision'], obs.parser_revision)
+            self.assertEqual(event['raw_complete'], obs.raw_complete)
+            if obs.raw_response is None:
+                self.assertIsNone(event['raw_z_base64'])
+            else:
+                self.assertEqual(decode_evidence(base64.b64decode(event['raw_z_base64'], validate=True),
+                    event['raw_payload_size'], event['codec_version']), obs.raw_response)
+
+    def test_raw_events_do_not_create_discovery_or_rollover_gaps(self):
+        from polymarket_bot.recorder.metrics import measure
+        from tests.recorder_support import seed_writer_market
+        seed_writer_market(self.store, self.run_id)
+        before = measure(self.store, start_us=NOW_US, end_us=NOW_US + 10_000_000)
+        self.store.save_approximate_observation(self.run_id, self.raw_observation())
+        after = measure(self.store, start_us=NOW_US, end_us=NOW_US + 10_000_000)
+        self.assertEqual(after.diagnostics['discovery_gaps'], before.diagnostics['discovery_gaps'])
+        self.assertEqual(after.rollover_gaps, before.rollover_gaps)
+
+    def test_raw_mismatch_rejected_and_event_failure_rolls_back(self):
+        from unittest.mock import patch
+        for changes in ({'raw_payload_hash': 'bad'}, {'raw_payload_size': 1},
+                        {'raw_response': bytearray(b'x')}, {'raw_complete': 1},
+                        {'raw_response': None, 'raw_complete': True},
+                        {'raw_response': b'x' * (1048576 + 1)}):
+            with self.subTest(changes=list(changes)), self.assertRaises(RecorderStoreError):
+                self.store.save_approximate_observation(self.run_id, self.raw_observation(**changes))
+        original = self.store._insert
+        def fail_event(table, values):
+            if table == 'recorder_events':
+                raise OSError('disk failure')
+            return original(table, values)
+        with patch.object(self.store, '_insert', side_effect=fail_event), self.assertRaises(OSError):
+            self.store.save_approximate_observation(self.run_id, self.raw_observation())
+        self.assertEqual(self.store._rows('SELECT * FROM approximate_observations'), [])
+
     def test_save_approximate_observation(self):
         obs = ApproximateObservation(
             provider='coinbase',

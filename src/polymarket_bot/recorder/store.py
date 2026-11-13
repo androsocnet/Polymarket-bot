@@ -1,5 +1,6 @@
 """One recorder connection and OS writer ownership; no generic SQL interface."""
 import os
+import base64
 from contextlib import contextmanager
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
@@ -18,7 +19,8 @@ from .models import (CHAINLINK_FEED_ID, CHAINLINK_FEED_NAME, ClockAnchor, RunCon
                      MarketRevision, ReferenceFetchDraft, ReferenceReportDraft,
                      ResolutionObservation, SlotCommit, SlotTarget)
 from .metadata import _normalize_clob_numbers, _selected_market
-from .free_reference import ApproximateObservation, ApproximateReferenceReport
+from .free_reference import (ApproximateObservation, ApproximateReferenceReport,
+                             CoinbaseRestProvider, KrakenRestProvider)
 
 
 MAX_EVIDENCE_BYTES = 10 * 1024 * 1024
@@ -1368,13 +1370,25 @@ and (fetch.attempt.path == '/ws/v1' or association.target_us <= fetch.received_s
         if observation.result == "success":
             _require(observation.price is not None and observation.price.is_finite()
                      and observation.price > 0, "Successful observation requires positive finite price.")
+        raw = observation.raw_response
+        _require(type(observation.raw_complete) is bool and (raw is not None or not observation.raw_complete),
+                 "Raw completeness requires captured bytes.")
+        encoded = None
+        codec = None
+        if raw is not None:
+            _require(type(raw) is bytes and len(raw) <= 1_048_576,
+                     "Spot raw evidence must be bytes within 1 MiB.")
+            _require(len(raw) == observation.raw_payload_size and sha256(raw).hexdigest() == observation.raw_payload_hash,
+                     "Spot raw evidence hash/size mismatch.")
+            blob, _, codec = encode_evidence(raw)
+            encoded = base64.b64encode(blob).decode('ascii')
         price_text = decimal_text(observation.price) if observation.price is not None else None
         bid_price_text = decimal_text(observation.bid_price) if observation.bid_price is not None else None
         ask_price_text = decimal_text(observation.ask_price) if observation.ask_price is not None else None
 
         with self._transaction():
             self._run(run_id)
-            return self._insert("approximate_observations", dict(
+            identifier = self._insert("approximate_observations", dict(
                 run_id=run_id,
                 provider=observation.provider,
                 pair=observation.pair,
@@ -1394,6 +1408,20 @@ and (fetch.attempt.path == '/ws/v1' or association.target_us <= fetch.received_s
                 error_code=observation.error_code,
                 receipt_mono_ns=observation.receipt_mono_ns
             ))
+            # ponytail: final-attempt evidence only; per-retry bodies need separate attempt records.
+            self.record_event(run_id, 'DISCOVERY_GAP', started_us=observation.receipt_wall_us,
+                detail=dict(type='APPROXIMATE_RAW_RESPONSE', version=1, diagnostic_only=True,
+                    time_domain='LOCAL_WALL', run_id=run_id,
+                    observation_id=identifier, provider=observation.provider, pair=observation.pair,
+                    endpoint={'coinbase': CoinbaseRestProvider._ENDPOINT,
+                              'kraken': KrakenRestProvider._ENDPOINT}.get(observation.provider),
+                    quote_currency=observation.quote_currency, transport_type=observation.transport_type,
+                    parser_revision=observation.parser_revision, http_status=observation.http_status,
+                    receipt_wall_us=observation.receipt_wall_us, receipt_mono_ns=observation.receipt_mono_ns,
+                    source_timestamp_us=observation.source_timestamp_us,
+                    raw_payload_hash=observation.raw_payload_hash, raw_payload_size=observation.raw_payload_size,
+                    raw_complete=observation.raw_complete, codec_version=codec, raw_z_base64=encoded))
+            return identifier
 
     def save_approximate_reference(
         self, run_id: str, report: ApproximateReferenceReport

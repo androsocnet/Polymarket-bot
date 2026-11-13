@@ -85,7 +85,7 @@ def _replay_rows(observations, references, events, anchors):
             if row is None or row['run_id'] != run or row['provider'] != provider or identifier in seen_observations:
                 raise ValueError('incomplete observation membership')
             fields = {name: row[name] for name in ApproximateObservation.__dataclass_fields__
-                      if name not in ('price', 'bid_price', 'ask_price')}
+                      if name not in ('price', 'bid_price', 'ask_price', 'raw_response', 'raw_complete')}
             for name in ('price', 'bid_price', 'ask_price'):
                 fields[name] = Decimal(row[name + '_text']) if row[name + '_text'] is not None else None
             obs = ApproximateObservation(**fields)
@@ -249,7 +249,7 @@ def _replay_research(detail, event, observations, references, anchors, events, s
         row = observations.get(integer(identifier))
         if row is None or row['run_id'] != run or (identifier not in ids and identifier not in seen_observations):
             fail('observation ownership')
-        fields = {k: row[k] for k in ApproximateObservation.__dataclass_fields__ if k not in ('price', 'bid_price', 'ask_price')}
+        fields = {k: row[k] for k in ApproximateObservation.__dataclass_fields__ if k not in ('price', 'bid_price', 'ask_price', 'raw_response', 'raw_complete')}
         fields.update({k: Decimal(row[k + '_text']) if row[k + '_text'] is not None else None for k in ('price', 'bid_price', 'ask_price')})
         obs = ApproximateObservation(**fields)
         if obs.receipt_mono_ns is None or integer(obs.receipt_mono_ns) > receipt:

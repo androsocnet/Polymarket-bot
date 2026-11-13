@@ -83,6 +83,8 @@ class ApproximateObservation:
     result: str
     error_code: str | None
     receipt_mono_ns: int | None = None
+    raw_response: bytes | None = None
+    raw_complete: bool = False
 
 
 def source_time_status(observation: ApproximateObservation, context: AcquisitionContext | None) -> str:
@@ -145,6 +147,7 @@ class CoinbaseRestProvider:
         self.request_attempts = []
         body = bytearray()
         status = None
+        raw_complete = False
         error = "DEADLINE_EXPIRED"
         last_attempt_ns = None
         chronology_invalid = False
@@ -162,6 +165,7 @@ class CoinbaseRestProvider:
             last_attempt_ns = send_ns
             body = bytearray()
             status = None
+            raw_complete = False
             def admit():
                 before_attempt = getattr(self, 'before_attempt', None)
                 if before_attempt is not None:
@@ -188,6 +192,7 @@ class CoinbaseRestProvider:
                             error = "PAYLOAD_TOO_LARGE"
                             break
                     else:
+                        raw_complete = True
                         error = None if status == 200 else "HTTP_ERROR"
                     if self._monotonic_ns() >= end_ns:
                         error = "DEADLINE_EXPIRED"
@@ -276,7 +281,8 @@ class CoinbaseRestProvider:
                 source = None
         return ApproximateObservation(self.provider_name, self.pair, self.quote_currency,
             price, bid, ask, source, wall, server, hashlib.sha256(body).hexdigest(), len(body),
-            "rest", self._PARSER_REVISION, status, "error" if error else "success", error, mono)
+            "rest", self._PARSER_REVISION, status, "error" if error else "success", error, mono,
+            bytes(body) if status is not None else None, raw_complete)
 
 
 class KrakenRestProvider(CoinbaseRestProvider):

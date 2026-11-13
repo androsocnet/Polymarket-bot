@@ -35,7 +35,7 @@ def reconstruct(path):
         for provider, queue in history.items():
             accepted, excluded, inputs = [], [], []
             for row in queue:
-                fields = {name: row[name] for name in ApproximateObservation.__dataclass_fields__ if name not in ('price', 'bid_price', 'ask_price')}
+                fields = {name: row[name] for name in ApproximateObservation.__dataclass_fields__ if name not in ('price', 'bid_price', 'ask_price', 'raw_response', 'raw_complete')}
                 fields.update({name: Decimal(row[name + '_text']) if row[name + '_text'] is not None else None for name in ('price', 'bid_price', 'ask_price')})
                 obs = ApproximateObservation(**fields)
                 inputs.append(obs)
